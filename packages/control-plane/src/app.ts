@@ -351,7 +351,19 @@ export function createApp(): Hono<AppEnv> {
   app.post('/api/computers/:id/wake', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
-    const res = await stubFor(c.env, row.id).wake(row.id);
+    const stub = stubFor(c.env, row.id);
+    let res;
+    try {
+      res = await stub.wake(row.id);
+    } catch {
+      // A wake can fail for reasons the control plane does not control (no
+      // capacity, image pull, daemon down). The DO has already rolled itself out
+      // of WAKING; report the failure and the state it actually landed in, so
+      // the interface shows a computer the user can act on rather than a
+      // spinner that never resolves (spec 8.3).
+      const after = await stub.describe(row.id);
+      return c.json({ error: 'wake_failed', state: after.state, epoch: after.epoch }, 503);
+    }
     return c.json({ state: res.state, epoch: res.epoch });
   });
 

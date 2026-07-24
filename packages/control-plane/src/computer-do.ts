@@ -59,6 +59,50 @@ type EmitEvent =
 /** Journal coalescing window (decisions.md: DO flushes the live tail <=100ms). */
 const FLUSH_MS = 25;
 
+/**
+ * A wake that fails (no capacity, image pull error, daemon down) with a run
+ * still queued behind it is retried on an alarm, with a bounded backoff. Bounded
+ * because a substrate that is out of capacity must not be hammered forever; once
+ * the budget is spent the computer sits COLD with its run still queued (spec 5.1
+ * — a run is never lost) and the next request or user action retries.
+ */
+const WAKE_RETRY_MS = [5_000, 20_000, 60_000];
+
+/** Journal bytes buffered for one run, and the offset they start at. The start
+ *  is the durable head at the moment the buffer opened, so `start + len` is the
+ *  next journal offset this DO expects — the dedup baseline for a replay. */
+interface PendingJournal {
+  start: number;
+  len: number;
+  parts: Uint8Array[];
+}
+
+/** What went wrong at the journal ingest gate. `duplicate`: a re-sent frame
+ *  whose bytes matched what we already hold (benign, deduped). `divergent`: a
+ *  re-sent frame whose bytes DIFFER at the same offset — two writers disagree
+ *  about the truth (spec 4.1/4.2). `gap`: bytes below the frame's offset never
+ *  reached this control plane. */
+type JournalAnomalyKind = 'duplicate' | 'divergent' | 'gap';
+
+/** One recorded ingest anomaly (offsets and lengths only — never content). */
+export interface JournalAnomaly {
+  id: number;
+  run: string;
+  kind: JournalAnomalyKind;
+  atOffset: number;
+  len: number;
+  at: number;
+}
+
+/** How many anomaly rows a computer keeps (newest win). */
+const JOURNAL_ANOMALY_KEEP = 200;
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /** Base image ref handed to `materialize` (spec §2 "Base image"), overridable
  *  per deployment via `env.BASE_IMAGE`. The delta is restored by marid from the
  *  manifest passed in the materialize env. */
@@ -169,6 +213,12 @@ interface Meta {
   idleSince: number;
   armedIdleSince: number | null;
   coldPending: boolean;
+  /** When a failed wake is to be retried by the alarm, or null when none is
+   *  pending. The alarm slot is only claimed for this while the computer is
+   *  COLD, where the tier policy has nothing scheduled. */
+  wakeRetryAt: number | null;
+  /** Consecutive failed wakes; reset by any successful one. Bounds the retry. */
+  wakeFailures: number;
   /** Owning user id, cached from the D1 fleet row for event fan-out. */
   ownerId: string | null;
   /** Lifetime AWAKE milliseconds, closed out on each exit from AWAKE. */
@@ -192,6 +242,8 @@ function initialMeta(): Meta {
     idleSince: 0,
     armedIdleSince: null,
     coldPending: false,
+    wakeRetryAt: null,
+    wakeFailures: 0,
     ownerId: null,
     awakeMs: 0,
     awakeSince: null,
@@ -246,7 +298,7 @@ export class ComputerDO extends DurableObject<Env> {
   #clients = new Map<WebSocket, Set<string>>();
 
   // Pending journal bytes per run, coalesced until the flush timer fires.
-  #pending = new Map<string, Uint8Array[]>();
+  #pending = new Map<string, PendingJournal>();
   #flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Per-run grid engines (server-side render for attach snapshots).
@@ -292,6 +344,20 @@ export class ComputerDO extends DurableObject<Env> {
          startOffset INTEGER NOT NULL,
          len INTEGER NOT NULL,
          PRIMARY KEY (run, seq)
+       )`,
+    );
+    // Journal ingest anomalies (spec 4.2: the journal here is the TRUTH, so a
+    // frame that did not land exactly where it claimed is recorded, never
+    // silently absorbed). Offsets and lengths ONLY — this table must stay
+    // content-free (spec 6.3).
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS journal_anomaly (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         run TEXT NOT NULL,
+         kind TEXT NOT NULL,
+         atOffset INTEGER NOT NULL,
+         len INTEGER NOT NULL,
+         at INTEGER NOT NULL
        )`,
     );
     sql.exec(
@@ -421,7 +487,11 @@ export class ComputerDO extends DurableObject<Env> {
     sql.exec(`DELETE FROM attention`);
     sql.exec(`DELETE FROM journal`);
     sql.exec(`DELETE FROM journal_head`);
+    sql.exec(`DELETE FROM journal_anomaly`);
     sql.exec(`DELETE FROM segments`);
+    // The coalescing buffer holds pre-reset offsets; keeping it would make the
+    // next frame look like a replay of bytes the reset just deleted.
+    this.#pending.clear();
     this.#meta.prevHead = null;
     this.#meta.awakeMs = 0;
     this.#meta.awakeSince = null;
@@ -500,20 +570,27 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.token = token;
     const computer = this.#meta.computerId ?? 'unknown';
 
-    if (wasWarm && this.#meta.handle) {
-      // WARM -> AWAKE: resume the slept resource in place (returns void).
-      await this.substrate.wake(this.#meta.handle);
-    } else {
-      // COLD -> AWAKE: materialize from the base image; marid restores the delta
-      // from the manifest head using the injected config env.
-      this.#meta.handle = await this.substrate.materialize({
-        computer,
-        image: this.env.BASE_IMAGE ?? BASE_IMAGE,
-        env: this.#maridEnv(computer, token),
-        ports: [],
-      });
+    try {
+      if (wasWarm && this.#meta.handle) {
+        // WARM -> AWAKE: resume the slept resource in place (returns void).
+        await this.substrate.wake(this.#meta.handle);
+      } else {
+        // COLD -> AWAKE: materialize from the base image; marid restores the
+        // delta from the manifest head using the injected config env.
+        this.#meta.handle = await this.substrate.materialize({
+          computer,
+          image: this.env.BASE_IMAGE ?? BASE_IMAGE,
+          env: this.#maridEnv(computer, token),
+          ports: [],
+        });
+      }
+    } catch (err) {
+      await this.#failWake(wasWarm);
+      throw err;
     }
     this.#meta.state = 'awake';
+    this.#meta.wakeFailures = 0;
+    this.#meta.wakeRetryAt = null;
     // Open a new AWAKE stretch for the cost meter (spec 8.2). Only compute time
     // accrues; WARM and COLD are storage, not compute.
     if (this.#meta.awakeSince === null) this.#meta.awakeSince = Date.now();
@@ -522,6 +599,70 @@ export class ComputerDO extends DurableObject<Env> {
     await this.#syncFleetState();
     this.#emit({ type: 'state', state: 'awake' });
     return { state: 'awake', epoch: this.#meta.epoch, token };
+  }
+
+  /**
+   * A wake failed (no capacity, image pull error, daemon down). Leave WAKING.
+   *
+   * WAKING is a transition, not a resting place: nothing else moves a computer
+   * out of it. The tier alarm acts on AWAKE and WARM only, and no alarm is armed
+   * during a wake — so a computer left in WAKING is a permanent spinner in the
+   * fleet view (spec 8.3 forbids exactly that), with a `state: waking` already
+   * on `/api/events` and no event after it. Worse, a WARM computer whose resume
+   * threw would, on the next attempt, no longer look WARM and would MATERIALIZE
+   * a second resource beside the one it still holds — two writable copies of one
+   * computer (spec 4.1).
+   *
+   * So: fall back to the state the substrate is actually in, tell the fleet and
+   * the event stream, and let the caller see the error (`wake()` rethrows).
+   * The epoch stays where it is — it is monotonic by contract (contracts.md §6);
+   * a wake that failed still burned one, which costs nothing but a number.
+   */
+  async #failWake(wasWarm: boolean): Promise<void> {
+    // WARM is only truthful while the slept resource exists; a failed
+    // materialize left none, so the computer is COLD — in the chunk store only.
+    const resumable = wasWarm && this.#meta.handle !== null;
+    const state: ComputerState = resumable ? 'warm' : 'cold';
+    this.#meta.state = state;
+    if (!resumable) {
+      this.#meta.handle = null;
+      // A supervisor that somehow booted from the failed materialize is an
+      // orphan this DO cannot manage: without the token it cannot handshake, so
+      // it can neither write the journal nor advance the head (spec 4.1).
+      this.#meta.token = null;
+    }
+    this.#closeAwakeStretch();
+    this.#meta.wakeFailures += 1;
+    this.#meta.wakeRetryAt = null;
+
+    // A run queued behind this wake must not sit there because the substrate
+    // hiccuped once (spec 5.1: a run is never lost). Retry on the alarm, with a
+    // bounded backoff, and only while COLD — a WARM computer's alarm slot
+    // belongs to the tier policy's WARM->COLD deadline.
+    const attempt = this.#meta.wakeFailures - 1;
+    if (state === 'cold' && attempt < WAKE_RETRY_MS.length && this.#hasQueuedRuns()) {
+      this.#meta.wakeRetryAt = Date.now() + (WAKE_RETRY_MS[attempt] as number);
+      await this.ctx.storage.setAlarm(this.#meta.wakeRetryAt);
+    } else if (state === 'warm') {
+      // Back to WARM with its deadline restored: the tier policy (spec 4.4) must
+      // still be able to take this computer COLD, even though the alarm that was
+      // pending may have fired (to no effect) while the state read WAKING.
+      await this.#armTier(this.#coldIdleMs());
+    }
+
+    await this.#persist();
+    await this.#syncFleetState();
+    this.#emit({ type: 'state', state });
+  }
+
+  /** True while at least one run is waiting for a supervisor. */
+  #hasQueuedRuns(): boolean {
+    const row = [
+      ...this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM runs WHERE dispatched = 0 AND status = 'queued'`,
+      ),
+    ][0];
+    return Number(row?.n ?? 0) > 0;
   }
 
   /**
@@ -1058,7 +1199,15 @@ export class ComputerDO extends DurableObject<Env> {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       return new Response('bad port', { status: 400 });
     }
-    const woken = await this.wake();
+    let woken: WakeResult;
+    try {
+      woken = await this.wake();
+    } catch {
+      // The substrate refused (capacity, image, daemon). The computer has been
+      // rolled back out of WAKING; tell the requester plainly rather than
+      // leaving a hung preview request behind a permanent spinner (spec 8.3).
+      return new Response('wake failed', { status: 503 });
+    }
     if (!this.#meta.handle) return new Response('no substrate handle', { status: 502 });
     const exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
     const target = exposedUrl.replace(/\/$/, '') + url.pathname + url.search;
@@ -1219,11 +1368,160 @@ export class ComputerDO extends DurableObject<Env> {
 
   // ---- journal ----
 
-  #onJournalFrame(run: string, _offset: number, bytes: Uint8Array): void {
-    const list = this.#pending.get(run);
-    if (list) list.push(bytes);
-    else this.#pending.set(run, [bytes]);
+  /**
+   * Ingest one `journal_frame` AT THE OFFSET IT CLAIMS (contracts.md §5.1).
+   *
+   * The journal in the control plane is the truth (spec 4.2), so a frame the
+   * supervisor re-sends must not be able to write the same bytes twice. A replay
+   * needs no supervisor bug to occur:
+   *
+   *  - `hello_ack` reports the DURABLE head (`journal_head`), which excludes
+   *    whatever is still sitting in this coalescing buffer, and marid resumes
+   *    from exactly that offset (`crates/marid/src/supervisor.rs`, `HelloAck`
+   *    resets its per-connection `sent` mark);
+   *  - a reconnecting supervisor of the SAME wake generation re-authenticates on
+   *    a second socket (the fencing token stays valid until COLD), so the epoch
+   *    ingest gate does not close on the first one — frames still in flight from
+   *    it arrive AFTER the new socket has resumed.
+   *
+   * Blind appending then writes those bytes twice, shifts every later offset,
+   * and — because the next `journal_ack` would name an offset above what the
+   * supervisor actually sent — makes the supervisor SKIP real output on its next
+   * resume. Duplication now, silent loss later, in what spec 4.2 calls truth.
+   */
+  #onJournalFrame(run: string, offset: number, bytes: Uint8Array): void {
+    if (bytes.length === 0) return;
+    const pending = this.#pendingFor(run);
+    const next = pending.start + pending.len; // the offset we expect next
+    let slice = bytes;
+
+    if (offset < next) {
+      // REPLAY: this range is already held (durable or buffered). Compare before
+      // discarding — identical bytes are a benign re-send, but DIFFERENT bytes
+      // at the same offset mean two writers disagree about the truth (spec 4.1
+      // single-writer), which is an integrity signal, not a no-op.
+      const overlap = Math.min(bytes.length, next - offset);
+      const held = this.#journalHeld(run, offset, offset + overlap, pending);
+      const diverged = held !== null && !bytesEqual(held, bytes.subarray(0, overlap));
+      this.#recordJournalAnomaly(run, diverged ? 'divergent' : 'duplicate', offset, overlap);
+      // What is durable wins; only the part beyond our head is new.
+      if (overlap >= bytes.length) return;
+      slice = bytes.subarray(overlap);
+    } else if (offset > next) {
+      // GAP: the bytes below this frame never reached us — a resumed run whose
+      // earlier life this control plane never saw (spec 5.6), or a buffer lost
+      // with the DO. They cannot be invented, and dropping the frame would stall
+      // the run's journal forever (the supervisor only ever streams forward), so
+      // the bytes are taken at the head we do have and the hole is RECORDED.
+      this.#recordJournalAnomaly(run, 'gap', next, offset - next);
+    }
+
+    pending.parts.push(slice);
+    pending.len += slice.length;
     this.#scheduleFlush();
+  }
+
+  /** The open coalescing buffer for `run`, anchored at the durable head. */
+  #pendingFor(run: string): PendingJournal {
+    let p = this.#pending.get(run);
+    if (!p) {
+      p = { start: this.#runHead(run).nextOffset, len: 0, parts: [] };
+      this.#pending.set(run, p);
+    }
+    return p;
+  }
+
+  /** The bytes this DO already holds for `[from, to)` — durable segments plus
+   *  the coalescing buffer — or `null` if the range is not fully covered (then
+   *  no divergence claim can honestly be made). */
+  #journalHeld(
+    run: string,
+    from: number,
+    to: number,
+    pending: PendingJournal,
+  ): Uint8Array | null {
+    if (to <= from) return new Uint8Array(0);
+    const out = new Uint8Array(to - from);
+    const covered = new Uint8Array(to - from);
+    const put = (start: number, src: Uint8Array): void => {
+      const lo = Math.max(from, start);
+      const hi = Math.min(to, start + src.length);
+      if (hi <= lo) return;
+      out.set(src.subarray(lo - start, hi - start), lo - from);
+      covered.fill(1, lo - from, hi - from);
+    };
+    for (const row of this.ctx.storage.sql.exec<{ startOffset: number; bytes: ArrayBuffer }>(
+      `SELECT startOffset, bytes FROM journal
+        WHERE run = ? AND startOffset < ? AND startOffset + length(bytes) > ?
+        ORDER BY seq`,
+      run,
+      to,
+      from,
+    )) {
+      put(Number(row.startOffset), new Uint8Array(row.bytes));
+    }
+    let cursor = pending.start;
+    for (const part of pending.parts) {
+      put(cursor, part);
+      cursor += part.length;
+    }
+    for (const c of covered) if (c === 0) return null;
+    return out;
+  }
+
+  /** Record an ingest anomaly (metadata only — a journal byte must never reach
+   *  a log or this table, spec 6.3). */
+  #recordJournalAnomaly(
+    run: string,
+    kind: JournalAnomalyKind,
+    atOffset: number,
+    len: number,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO journal_anomaly (run, kind, atOffset, len, at) VALUES (?, ?, ?, ?, ?)`,
+      run,
+      kind,
+      atOffset,
+      len,
+      Date.now(),
+    );
+    this.ctx.storage.sql.exec(
+      `DELETE FROM journal_anomaly
+        WHERE id NOT IN (SELECT id FROM journal_anomaly ORDER BY id DESC LIMIT ?)`,
+      JOURNAL_ANOMALY_KEEP,
+    );
+    if (kind === 'divergent') {
+      // Two writers claim different bytes at one offset: surface it. A duplicate
+      // or a gap is recorded but not shouted about — both are normal outcomes of
+      // a resume, this is not.
+      console.warn(
+        `mari: journal divergence computer=${this.#meta.computerId ?? 'unknown'} run=${run} offset=${atOffset} len=${len}`,
+      );
+    }
+  }
+
+  /** Recorded journal ingest anomalies, newest first (ops + tests). */
+  async journalAnomalies(run?: string): Promise<JournalAnomaly[]> {
+    const rows = run
+      ? [
+          ...this.ctx.storage.sql.exec<JournalAnomaly>(
+            `SELECT id, run, kind, atOffset, len, at FROM journal_anomaly WHERE run = ? ORDER BY id DESC`,
+            run,
+          ),
+        ]
+      : [
+          ...this.ctx.storage.sql.exec<JournalAnomaly>(
+            `SELECT id, run, kind, atOffset, len, at FROM journal_anomaly ORDER BY id DESC`,
+          ),
+        ];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      run: String(r.run),
+      kind: String(r.kind) as JournalAnomalyKind,
+      atOffset: Number(r.atOffset),
+      len: Number(r.len),
+      at: Number(r.at),
+    }));
   }
 
   #scheduleFlush(): void {
@@ -1242,15 +1540,13 @@ export class ComputerDO extends DurableObject<Env> {
   }
 
   #flushRun(run: string): void {
-    const parts = this.#pending.get(run);
+    const pending = this.#pending.get(run);
     this.#pending.delete(run);
-    if (!parts || parts.length === 0) return;
+    if (!pending || pending.len === 0) return;
 
-    let total = 0;
-    for (const p of parts) total += p.length;
-    const seg = new Uint8Array(total);
+    const seg = new Uint8Array(pending.len);
     let cursor = 0;
-    for (const p of parts) {
+    for (const p of pending.parts) {
       seg.set(p, cursor);
       cursor += p.length;
     }
@@ -1569,6 +1865,16 @@ export class ComputerDO extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    // A failed wake with a run still queued owns this alarm (armed only while
+    // COLD, where the tier policy has nothing scheduled). Retry the wake behind
+    // the request, exactly as the original trigger did (spec 8.3).
+    if (this.#meta.wakeRetryAt !== null) {
+      this.#meta.wakeRetryAt = null;
+      await this.#persist();
+      if (this.#meta.state !== 'awake' && this.#hasQueuedRuns()) this.#wakeInBackground();
+      return;
+    }
+
     // Only progress if no activity happened since the alarm was armed. Under the
     // test harness `runDurableObjectAlarm` fires this regardless of wall-clock,
     // which is exactly how idle-time passage is simulated.

@@ -259,7 +259,8 @@ account or local Docker.
 11.3 The hosted instance adds: accounts, metering, payment, the wake-proxy
 fleet, and the iOS application.
 
-11.4 License: AGPL-3.0 or FSL. Decision open.
+11.4 License: AGPL-3.0-only. Decided 2026-07-24. FSL was rejected because it is
+not open source, and 1.4 is load-bearing.
 
 ## 12. iOS Application (v2)
 
@@ -277,5 +278,5 @@ notifications and open the terminal.
 - Durable Object write throughput as the ceiling for concurrent runs; estimate
   before v1.
 - Model provider terms for subscription authentication on cloud computers.
-- License decision (11.4).
-- The supervisor binary name (`marid` is the candidate).
+- ~~License decision (11.4).~~ Settled: AGPL-3.0-only.
+- ~~The supervisor binary name.~~ Settled: `marid`.
