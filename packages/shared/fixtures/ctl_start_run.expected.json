@@ -1,0 +1,16 @@
+{
+  "t": "start_run",
+  "c": {
+    "run": "run-0001",
+    "argv": [
+      "bash",
+      "-lc",
+      "echo hi"
+    ],
+    "env_names": [
+      "OPENAI_API_KEY",
+      "PATH"
+    ],
+    "cwd": "/home/agent"
+  }
+}

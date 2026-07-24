@@ -1,0 +1,18 @@
+{
+  "t": "run_completed",
+  "c": {
+    "run": "run-0001",
+    "exit": {
+      "t": "exited",
+      "c": {
+        "code": 0
+      }
+    },
+    "post_run_manifest": "0202020202020202020202020202020202020202020202020202020202020202",
+    "diff": {
+      "added": 3,
+      "modified": 1,
+      "removed": 0
+    }
+  }
+}

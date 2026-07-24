@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "parent": "0101010101010101010101010101010101010101010101010101010101010101",
+  "created_at": 1700000000,
+  "entries": [
+    {
+      "path": "/",
+      "kind": "dir",
+      "mode": 16877,
+      "size": 0,
+      "symlink_target": null,
+      "chunks": []
+    },
+    {
+      "path": "/bin/sh",
+      "kind": "symlink",
+      "mode": 41471,
+      "size": 4,
+      "symlink_target": "bash",
+      "chunks": []
+    },
+    {
+      "path": "/etc/hostname",
+      "kind": "file",
+      "mode": 33188,
+      "size": 12,
+      "symlink_target": null,
+      "chunks": [
+        {
+          "chunk": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "len": 12
+        }
+      ]
+    },
+    {
+      "path": "/var/log/big.log",
+      "kind": "file",
+      "mode": 33188,
+      "size": 300,
+      "symlink_target": null,
+      "chunks": [
+        {
+          "chunk": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "len": 128
+        },
+        {
+          "chunk": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "len": 128
+        },
+        {
+          "chunk": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "len": 44
+        }
+      ]
+    }
+  ]
+}

@@ -5,3 +5,24 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mari-proto = { path = "../mari-proto" }
+opendal = { version = "0.57", default-features = false, features = ["services-fs"] }
+blake3 = "1"
+zstd = "0.13"
+fastcdc = "4"
+thiserror = "2"
+walkdir = "2"
+glob = "0.3"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tempfile = "3"
+proptest = "1"
+filetime = "0.2"
+
+[features]
+default = []
+# services-s3 is compiled in behind this flag; its integration test only runs
+# when live S3 credentials are present in the environment.
+s3 = ["opendal/services-s3"]

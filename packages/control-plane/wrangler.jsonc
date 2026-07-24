@@ -1,0 +1,51 @@
+{
+  // Mari control plane — Cloudflare Workers deployment config (spec 3.1).
+  // Bindings: one Durable Object per computer (SQLite), D1 for fleet data, R2
+  // for chunks + manifests + journal segments. Compatible with
+  // @cloudflare/vitest-pool-workers (real bindings in tests, no platform mocks).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mari-control-plane",
+  "main": "src/worker.ts",
+  "compatibility_date": "2024-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COMPUTER",
+        "class_name": "ComputerDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      // SQLite-backed DO storage (spec 3.2): ctx.storage.sql + KV.
+      "new_sqlite_classes": ["ComputerDO"]
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mari",
+      "database_id": "mari-control-plane-dev"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "STORE",
+      "bucket_name": "mari-store"
+    }
+  ],
+
+  "vars": {
+    "PREVIEW_ZONE": "mari.sh",
+    "DEV_AUTH": "0",
+    "DEV_SEED": "0",
+    "SUBSTRATE_MODE": "fake",
+    "AUTH_SECRET": "change-me-in-production",
+    "BASE_URL": "http://localhost"
+  }
+}

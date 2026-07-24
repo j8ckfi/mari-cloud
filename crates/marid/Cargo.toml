@@ -4,6 +4,43 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "marid"
+path = "src/lib.rs"
+
+[[bin]]
+name = "marid"
+path = "src/main.rs"
+
 [dependencies]
 mari-core = { path = "../mari-core" }
 mari-proto = { path = "../mari-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "fs", "signal"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+portable-pty = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+serde = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+
+[features]
+default = []
+# Reusable fake control-plane server and test harness. Enabled for marid's own
+# tests (via the `test` cfg) and by the e2e suite (which turns this feature on).
+test-support = []
+# Forward S3 store support to mari-core's `s3` feature (fs is always available).
+s3 = ["mari-core/s3"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "fs", "process"] }
+# e2e_docker harness (tests/common): a control plane bound on 0.0.0.0 speaking the
+# real framed-CBOR wire, plus manifest/store access to seed and verify snapshots.
+mari-proto = { path = "../mari-proto" }
+mari-core = { path = "../mari-core" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.30"

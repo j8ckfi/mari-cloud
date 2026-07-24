@@ -1,0 +1,7 @@
+{
+  "paths": [
+    "/etc/hostname",
+    "/bin/sh",
+    "/var/log/big.log"
+  ]
+}

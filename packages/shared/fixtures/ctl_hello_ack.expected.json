@@ -1,0 +1,15 @@
+{
+  "t": "hello_ack",
+  "c": {
+    "acked": [
+      {
+        "run": "run-0001",
+        "offset": 1024
+      },
+      {
+        "run": "run-0002",
+        "offset": 0
+      }
+    ]
+  }
+}
