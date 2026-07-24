@@ -595,6 +595,97 @@ async fn ws_reconnect_resumes_journal_from_acked_offset() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Terminal input/resize: a first-class ControlMessage::Input reaches the
+//     run's PTY (proven by the PTY echoing it into the journal), and a Resize
+//     does not tear down the session — input after a resize still flows.
+// ---------------------------------------------------------------------------
+
+/// True if the run's reassembled journal contains `needle`. `s` is the
+/// already-locked state passed into a `wait_until` predicate (do not re-lock).
+fn journal_has(s: &crate::testkit::FakeState, run: &RunId, needle: &[u8]) -> bool {
+    s.journals
+        .get(run)
+        .map(|r| r.buf.windows(needle.len()).any(|w| w == needle))
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_client_input_reaches_the_pty_and_resize_does_not_tear_down() {
+    let cp = FakeControlPlane::start().await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let config = ws_config(&cp, root.path(), store_dir.path());
+    let sup = tokio::spawn(crate::run(config));
+
+    assert!(
+        cp.wait_until(Duration::from_secs(5), |s| !s.hellos.is_empty())
+            .await,
+        "supervisor must connect and handshake"
+    );
+
+    // An interactive `cat`: it (and the PTY line discipline) echo typed input.
+    let run = RunId::new("run-input");
+    cp.queue_control(ControlMessage::StartRun {
+        run: run.clone(),
+        argv: vec!["cat".into()],
+        env_names: vec![],
+        cwd: root.path().to_str().unwrap().to_string(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(5), |s| s
+            .run_started
+            .iter()
+            .any(|(r, _)| *r == run))
+            .await,
+        "the run must start before we type"
+    );
+
+    // Type a line as a first-class ControlMessage::Input.
+    cp.queue_control(ControlMessage::Input {
+        run: run.clone(),
+        bytes: b"mari-typed\n".to_vec(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(8), |s| journal_has(s, &run, b"mari-typed"))
+            .await,
+        "typed input must reach the PTY and echo into the journal"
+    );
+
+    // Resize the PTY, then type again: if the Resize frame had torn the session
+    // down (the pre-fix undecodable-frame bug), this second line would never
+    // arrive.
+    cp.queue_control(ControlMessage::Resize {
+        run: run.clone(),
+        cols: 100,
+        rows: 30,
+    });
+    cp.queue_control(ControlMessage::Input {
+        run: run.clone(),
+        bytes: b"after-resize\n".to_vec(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(8), |s| journal_has(s, &run, b"after-resize"))
+            .await,
+        "input after a resize must still reach the PTY"
+    );
+
+    cp.with_state(|s| assert!(s.errors.is_empty(), "journal errors: {:?}", s.errors));
+
+    // Stop the interactive `cat` and wait for it to actually finish, so its
+    // blocking PTY reader thread ends before the runtime tears down.
+    cp.queue_control(ControlMessage::StopRun { run: run.clone() });
+    assert!(
+        cp.wait_until(Duration::from_secs(5), |s| s
+            .run_completed
+            .iter()
+            .any(|(r, ..)| *r == run))
+            .await,
+        "the run must stop cleanly after StopRun"
+    );
+    sup.abort();
+}
+
+// ---------------------------------------------------------------------------
 // 6. Cold-wake restore: MARI_RESTORE_MANIFEST reconstructs the tree into
 //    MARI_ROOT, ordered by the stored heat profile, and records the read order
 //    for the next wake.

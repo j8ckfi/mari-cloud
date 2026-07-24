@@ -6,16 +6,14 @@
 // would, says `hello`, and then acts as a trivial PTY that ECHOES whatever the
 // user types — so a keystroke round-trips to output through the whole stack:
 //
-//   browser xterm --(attach ClientInput)--> DO --(input)--> [this] --(journal_frame)--> DO --(DoFrame)--> xterm
+//   browser xterm --(attach ClientInput)--> DO --(Input)--> [this] --(journal_frame)--> DO --(DoFrame)--> xterm
 //
-// NOTE ON THE INPUT HOP: the frozen SupervisorMessage/ControlMessage set in
-// @mari/shared has no client-input variant (input reaches marid via the PTY in
-// production; the DO->supervisor forwarding is a control-plane detail not yet in
-// contracts.md). This fake therefore accepts a forward-compatible control frame
-// `{ t: 'input', c: { run, bytes } }` — the shape the control plane forwards a
-// keystroke as — decoding with the raw @mari/shared codec (not the strict
-// ControlMessage validator) so the extension is tolerated. The integration
-// agent aligns the control plane's forwarding with this shape.
+// THE INPUT HOP: terminal input/resize are first-class ControlMessages now
+// (`ControlMessage::Input { run, bytes }` / `Resize { run, cols, rows }`,
+// contracts §5.2). The DO forwards a keystroke as `{ t: 'input', c: { run,
+// bytes } }` and a viewport change as `{ t: 'resize', c: { run, cols, rows } }`.
+// This fake decodes with the raw @mari/shared codec and echoes input back as PTY
+// output; resize is accepted and ignored (a PTY echo has nothing to reflow).
 
 import {
   FrameReader,
@@ -76,7 +74,8 @@ export async function startFakeSupervisor(opts = {}) {
         break;
       }
       case 'input': {
-        // Control-plane-forwarded keystrokes: echo them back as PTY output.
+        // Control-plane-forwarded keystrokes (ControlMessage::Input): echo them
+        // back as PTY output.
         const run = msg.c.run;
         const raw = msg.c.bytes;
         const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
@@ -84,6 +83,10 @@ export async function startFakeSupervisor(opts = {}) {
         journal(run, bytes);
         break;
       }
+      case 'resize':
+        // ControlMessage::Resize: a real supervisor sets the PTY window size; a
+        // PTY-echo fake has nothing to reflow, so accept and ignore it.
+        break;
       case 'stop_run': {
         const run = msg.c.run;
         send({

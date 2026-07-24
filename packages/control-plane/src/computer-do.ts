@@ -126,6 +126,16 @@ export class ComputerDO extends DurableObject<Env> {
   #meta: Meta = initialMeta();
   #supervisor: WebSocket | null = null;
 
+  // Sockets that completed the `hello` handshake, mapped to the epoch they
+  // authenticated with. This gates every non-`hello` supervisor message: an
+  // un-helloed socket is absent from the map (rejected outright — it cannot
+  // write the journal, raise attention, hold the computer AWAKE, or even learn
+  // the current epoch), and a socket whose epoch is no longer current is a
+  // fenced-out generation (its data mutations are dropped; only its
+  // head-advance still receives the CAS rejection so it learns it lost).
+  // Cleared on socket close (contracts.md §6, Appendix B).
+  #authEpoch = new Map<WebSocket, number>();
+
   // Attached client sockets and the runs each is watching.
   #clients = new Map<WebSocket, Set<string>>();
 
@@ -263,6 +273,12 @@ export class ComputerDO extends DurableObject<Env> {
     // the booting supervisor receives them (in its env) and echoes the epoch in
     // `hello` (contracts.md §6).
     this.#meta.epoch += 1;
+    // A wake supersedes any in-flight WARM->COLD finalize: the machine is coming
+    // UP, not going down. Without this reset, a stale `snapshot_written{final}`
+    // from the pre-wake generation would tear down the computer the user just
+    // woke (CP-COLDRACE-1). The epoch bump additionally fences that stale
+    // snapshot at the #onSupervisorMessage gate; this keeps the flag honest too.
+    this.#meta.coldPending = false;
     const token = crypto.randomUUID().replace(/-/g, '');
     this.#meta.token = token;
     const computer = this.#meta.computerId ?? 'unknown';
@@ -443,6 +459,7 @@ export class ComputerDO extends DurableObject<Env> {
       }
     });
     server.addEventListener('close', () => {
+      this.#authEpoch.delete(server);
       if (this.#supervisor === server) this.#supervisor = null;
     });
     return new Response(null, { status: 101, webSocket: client });
@@ -467,13 +484,32 @@ export class ComputerDO extends DurableObject<Env> {
     } catch {
       return; // ignore undecodable frames
     }
+
+    // `hello` is the ONLY message accepted before authentication: it performs
+    // the token+epoch handshake (contracts.md Appendix B) and marks this socket
+    // authenticated. Every other frame requires a completed handshake on THIS
+    // socket — an un-helloed peer must not advance the head, write the journal,
+    // raise attention, hold the computer AWAKE, or even learn the current epoch
+    // (SEC-01, CP-FENCE-INGEST-2).
+    if (msg.t === 'hello') return this.#onHello(msg.c, socket);
+    if (!this.#authEpoch.has(socket)) return;
+
+    // `head_advance_request` is fenced by the CAS itself (contracts.md §6): an
+    // authenticated-but-stale supervisor still receives `accepted:false` +
+    // current_epoch so it learns it lost and stops writing. Authentication (not
+    // current-epoch) is the bar here, so the rejection reply still flows.
+    if (msg.t === 'head_advance_request') {
+      return this.#onHeadAdvance(msg.c.manifest, msg.c.epoch, socket);
+    }
+
+    // Every remaining message mutates live run state (journal/attention/
+    // heartbeat/snapshot/run status). Honor it ONLY from the current-epoch
+    // generation; a fenced-out supervisor whose wake was superseded must not
+    // inject into the current run (spec 4.1/4.2 single-writer).
+    if (!this.#isCurrentSupervisor(socket)) return;
     switch (msg.t) {
-      case 'hello':
-        return this.#onHello(msg.c, socket);
       case 'journal_frame':
         return this.#onJournalFrame(msg.c.run, msg.c.offset, msg.c.bytes);
-      case 'head_advance_request':
-        return this.#onHeadAdvance(msg.c.manifest, msg.c.epoch, socket);
       case 'attention':
         return this.#onAttention(msg.c.run, msg.c.kind);
       case 'snapshot_written':
@@ -493,6 +529,12 @@ export class ComputerDO extends DurableObject<Env> {
     }
   }
 
+  /** True once `socket` completed `hello` AND its wake epoch is still current
+   *  (the active supervisor generation). A fenced-out socket returns false. */
+  #isCurrentSupervisor(socket: WebSocket): boolean {
+    return this.#authEpoch.get(socket) === this.#meta.epoch;
+  }
+
   async #onHello(c: Hello, socket: WebSocket): Promise<void> {
     this.#setComputerId(c.computer);
     const ok =
@@ -505,8 +547,11 @@ export class ComputerDO extends DurableObject<Env> {
       socket.close(1008, 'handshake rejected');
       return;
     }
-    // This becomes the active supervisor channel.
+    // This becomes the active supervisor channel; record the epoch it
+    // authenticated with so its later data messages pass the current-epoch gate
+    // (and a future generation's wake fences it out automatically).
     this.#supervisor = socket;
+    this.#authEpoch.set(socket, this.#meta.epoch);
     await this.#persist();
     // Reply with the durably-acked offset per run so it resumes correctly.
     const acked: RunOffset[] = this.#allRunHeads();
@@ -749,21 +794,14 @@ export class ComputerDO extends DurableObject<Env> {
         return;
       }
       case 'input':
-        // Forward terminal input supervisor-ward. NOTE (v0 protocol gap): the
-        // ControlMessage enum has no input variant; v0 forwards an out-of-band
-        // framed `input` message — the shape marid (and the e2e fake
-        // supervisor) consumes to drive the PTY. Flagged for the contracts
-        // owner to add a first-class input message to mari-proto.
-        if (this.#supervisor) {
-          this.#supervisor.send(encodeFrame({ t: 'input', c: { run: msg.run, bytes: msg.bytes } }));
-        }
+        // Forward terminal input supervisor-ward as the first-class
+        // ControlMessage::Input; marid writes the bytes to the run's PTY
+        // (contracts §5.2). Dropped if no supervisor is attached.
+        this.#sendControl({ t: 'input', c: { run: msg.run, bytes: msg.bytes } });
         return;
       case 'resize':
-        if (this.#supervisor) {
-          this.#supervisor.send(
-            encodeFrame({ t: 'client_resize', c: { run: msg.run, cols: msg.cols, rows: msg.rows } }),
-          );
-        }
+        // First-class ControlMessage::Resize -> PTY window size (spec 7.5).
+        this.#sendControl({ t: 'resize', c: { run: msg.run, cols: msg.cols, rows: msg.rows } });
         return;
       case 'detach': {
         const watched = this.#clients.get(sock);

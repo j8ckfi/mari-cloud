@@ -191,6 +191,27 @@ pub enum ControlMessage {
         /// The run to stop.
         run: RunId,
     },
+    /// Terminal input for a run's PTY: the raw bytes an attached client typed
+    /// (keystrokes, paste). The Durable Object forwards these supervisor-ward
+    /// from the client<->DO attach protocol (contracts §7.1); the supervisor
+    /// writes them to the run's PTY. `bytes` is a CBOR byte string.
+    Input {
+        /// The run whose PTY receives the bytes.
+        run: RunId,
+        /// Raw bytes to write to the run's PTY.
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// Viewport resize for a run's PTY: set the terminal window size (spec 7.5).
+    /// Forwarded by the Durable Object from the client<->DO attach protocol.
+    Resize {
+        /// The run whose PTY window size changes.
+        run: RunId,
+        /// New column count.
+        cols: u16,
+        /// New row count.
+        rows: u16,
+    },
     /// Take a snapshot now, tagging it with `reason` (spec 4.3).
     SnapshotNow {
         /// Why the snapshot is being requested.

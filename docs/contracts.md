@@ -33,10 +33,16 @@ byte-for-byte (`packages/shared/src/cbor.ts`).
   always present, `null` when absent).
 - **Byte payloads are CBOR byte strings** (major type 2), decoded to
   `Uint8Array` in TypeScript. Only `JournalFrame.bytes` is a byte string today.
-- **Integers use shortest-form encoding.** All `u64` values MUST be
-  `<= 2^53 - 1` (`MAX_SAFE_INTEGER`) so the TypeScript side decodes them as
-  `number`, not `BigInt`. `Epoch` and `JournalOffset` `debug_assert!` this when
-  serialized; `assertJsSafe` enforces it on the TS side.
+- **Integers use shortest-form encoding** and are always CBOR **integers**
+  (major type 0/1), never floats. All `u64` values MUST be `<= 2^53 - 1`
+  (`MAX_SAFE_INTEGER`) so the TypeScript side decodes them as `number`, not
+  `BigInt`. `Epoch` and `JournalOffset` `debug_assert!` this when serialized. On
+  the TS side `packages/shared/src/cbor.ts` decodes 8-byte uints with
+  `int64AsNumber` and rewrites any integer-valued `Number >= 2^32` to a CBOR
+  integer before encoding — calling `assertJsSafe` so an out-of-contract value
+  fails loudly — because `cbor-x` would otherwise emit a CBOR float64 for such
+  values, which `ciborium` (marid) refuses to decode into a `u64`. Fixtures with
+  offsets/epochs at `2^32` and `2^53 - 1` (`*_large`, §8) pin this parity.
 - Maps and arrays are definite-length. No CBOR tags, no self-describe header, no
   indefinite-length items are emitted.
 
@@ -155,6 +161,8 @@ the `c` key is omitted.
 | `journal_ack` | `run: RunId, offset: JournalOffset` | Bytes durably received up to (exclusive) `offset`. |
 | `start_run` | `run: RunId, argv: string[], env_names: string[], cwd: string` | Start a run. `env_names` are the vault variables to inject at run start (spec 10.1); **values never travel in this message**. |
 | `stop_run` | `run: RunId` | Stop a run's process. |
+| `input` | `run: RunId, bytes: byte string` | Terminal input for a run's PTY: the raw bytes an attached client typed. The DO forwards these from the client↔DO attach protocol (§7.1); the supervisor writes them to the run's PTY (spec 7). |
+| `resize` | `run: RunId, cols: u16, rows: u16` | Viewport resize for a run's PTY window (spec 7.5). Forwarded by the DO from the attach protocol. |
 | `snapshot_now` | `reason: SnapshotReason` | Take a snapshot now, tagged with `reason`. |
 | `prepare_for_cold` | — | Stop each agent session cleanly ahead of WARM→COLD (spec 4.5). |
 | `head_advance_result` | `accepted: bool, current_epoch: Epoch` | Reply to `head_advance_request`: whether the head advanced, plus the DO's authoritative epoch so a fenced-out supervisor learns it lost. |
@@ -242,6 +250,11 @@ every message plus `Manifest`, `HeatProfile`, `ComputerState`, and a `signaled`
 - `sup_hello.frame`, `sup_journal_frame.frame` — the length-prefixed wire frame,
   for cross-language framing checks.
 
+The `*_large` exemplars (`ctl_journal_ack_large`, `ctl_hello_ack_large`,
+`sup_hello_large`) carry `JournalOffset`/`Epoch` values at `2^32` and at
+`2^53 - 1`, so the re-encode check catches any regression to the integer-encoding
+parity described in §1.
+
 Regeneration is deterministic (fixed values, no timestamps, no randomness): run
 `cargo test -p mari-proto`. The `packages/shared` vitest suite loads every
 `.cbor`, decodes it, deep-equals it against the `.expected.json`, and re-encodes
@@ -311,13 +324,14 @@ _Appended by the control-plane builder._
   messages (`journal_ack`, `prepare_for_cold`) go to the active (last-handshook)
   supervisor. The handshake validates `proto_version`, the current `epoch`, and
   the one-time `token` minted at wake; a mismatch closes that socket (`1008`).
-- **Client terminal input.** The §5.2 `ControlMessage` enum has **no terminal
-  input variant**, but the client→DO attach protocol (§7.1) carries `input`/
-  `resize`. v0 forwards these supervisor-ward as out-of-band framed messages
-  `{ "t": "client_input", "c": { run, bytes } }` and
-  `{ "t": "client_resize", "c": { run, cols, rows } }`. **This is a v0 gap** —
-  the contracts owner should add first-class input/resize messages to
-  `mari-proto`'s `ControlMessage`, after which the DO switches to them.
+- **Client terminal input.** Terminal input/resize are first-class
+  `ControlMessage`s (§5.2 `input` / `resize`). The client→DO attach protocol
+  (§7.1) carries `input`/`resize` as discrete CBOR; the DO re-frames each as the
+  matching length-framed `ControlMessage` (`{ "t": "input", "c": { run, bytes } }`
+  / `{ "t": "resize", "c": { run, cols, rows } }`) and forwards it to the
+  supervisor, which writes the bytes to the run's PTY and applies the window
+  size. (This closes the earlier v0 gap: the ad-hoc `client_input` /
+  `client_resize` frames no longer exist.)
 - **Attach snapshot (v0).** Because v0 `marid` keeps no grid (decisions.md
   deviation 1), on attach the DO sends an empty `grid` then replays the exact
   prior journal tail as a `frame` at offset 0 (byte-identical), and streams live

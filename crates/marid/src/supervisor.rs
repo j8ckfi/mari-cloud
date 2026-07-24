@@ -15,14 +15,15 @@
 //! and re-reads — so a resumed stream has no gap and no duplicate bytes.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
 use mari_core::{
-    ChunkStore, HeatRecorder, RestoreOptions, SnapshotOptions, default_credential_excludes,
-    load_heat, restore, snapshot, store_heat,
+    ChunkStore, EntryKind, HeatRecorder, Manifest, RestoreOptions, SnapshotOptions,
+    default_credential_excludes, load_heat, restore, snapshot, store_heat,
 };
 use mari_proto::{
     ComputerId, ControlMessage, Epoch, JournalOffset, ManifestId, PROTO_VERSION, RunId,
@@ -60,12 +61,20 @@ struct Shared {
     acked: Mutex<HashMap<RunId, u64>>,
 }
 
+/// The manifest exclusions the supervisor uses (spec 10.1): credential paths,
+/// plus the supervisor's own `.mari` state directory and its subtree. A snapshot
+/// omits these, and — critically — a revert ([`prune_to_manifest`]) preserves
+/// exactly these on disk, so the two never drift.
+pub(crate) fn mari_excludes() -> Vec<String> {
+    let mut e = default_credential_excludes();
+    e.push("*/.mari".to_string());
+    e.push("*/.mari/*".to_string());
+    e
+}
+
 impl Shared {
     fn excludes(&self) -> Vec<String> {
-        let mut e = default_credential_excludes();
-        e.push("*/.mari".to_string());
-        e.push("*/.mari/*".to_string());
-        e
+        mari_excludes()
     }
 
     fn snapshot_opts(&self) -> SnapshotOptions {
@@ -155,7 +164,13 @@ async fn connect_and_serve(
     backoff: &mut Backoff,
 ) -> Result<SessionOutcome> {
     let (ws, _resp) = connect_async(shared.config.control_url.as_str()).await?;
-    backoff.reset();
+    // NB: do NOT reset the backoff here. A successful TCP/WS connect is not a
+    // successful session: the DO still validates proto_version, epoch, and the
+    // one-time token in the handshake and closes the socket (1008) on a
+    // mismatch (contracts Appendix B). A fenced-out supervisor whose epoch is
+    // stale connects fine every time but is rejected every time; resetting on
+    // connect would defeat the backoff and storm the edge with reconnects. The
+    // backoff is reset only once the DO acks our `Hello` (see `HelloAck` below).
     info!(url = %shared.config.control_url, "connected to control plane");
     let (mut write, mut read) = ws.split();
 
@@ -188,6 +203,12 @@ async fn connect_and_serve(
                             if matches!(cm, ControlMessage::PrepareForCold) {
                                 cold_shutdown(shared, &mut write, outbox_rx, &mut sent).await?;
                                 return Ok(SessionOutcome::ColdExit);
+                            }
+                            // The handshake succeeded: the DO accepted our epoch/token
+                            // and replied. Only now is the session truly established, so
+                            // this is where the reconnect backoff resets (not on connect).
+                            if matches!(cm, ControlMessage::HelloAck { .. }) {
+                                backoff.reset();
                             }
                             handle_control(shared, cm, &mut sent).await;
                         }
@@ -252,29 +273,20 @@ async fn handle_control(shared: &Arc<Shared>, msg: ControlMessage, sent: &mut Ha
             info!(%run, "stop_run");
             shared.run_manager.stop_run(&run);
         }
+        ControlMessage::Input { run, bytes } => {
+            shared.run_manager.write_input(&run, &bytes);
+        }
+        ControlMessage::Resize { run, cols, rows } => {
+            shared.run_manager.resize_run(&run, cols, rows);
+        }
         ControlMessage::SnapshotNow { reason } => {
             spawn_snapshot(shared.clone(), reason);
         }
         ControlMessage::RestoreToManifest { manifest } => {
             let shared = shared.clone();
             tokio::spawn(async move {
-                let heat = load_heat(&shared.store, &shared.computer)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                match shared.store.get_manifest(&manifest).await {
-                    Ok(m) => {
-                        let opts = RestoreOptions {
-                            priority: heat.paths,
-                        };
-                        if let Err(e) =
-                            restore(&shared.store, &m, &shared.config.root, &opts).await
-                        {
-                            warn!(%manifest, "restore failed: {e:#}");
-                        }
-                    }
-                    Err(e) => warn!(%manifest, "restore: manifest load failed: {e:#}"),
+                if let Err(e) = revert_to_manifest(&shared, &manifest).await {
+                    warn!(%manifest, "restore_to_manifest failed: {e:#}");
                 }
             });
         }
@@ -458,6 +470,110 @@ fn spawn_heartbeat(shared: Arc<Shared>) {
     });
 }
 
+/// Authoritative revert (spec 5.3): make the live root byte-identical to
+/// `manifest_id`, discarding a run's changes.
+///
+/// [`restore`] only *writes* the entries a manifest names; it never removes an
+/// on-disk entry the manifest omits. Restoring straight into the live root would
+/// therefore leave every file a run *added* in place, so the "reverted" tree
+/// would be a hybrid, not the pre-run tree. This first prunes those extraneous
+/// entries — preserving the supervisor's own `.mari` state and the excluded
+/// credential paths (spec 10.1), which are legitimately on disk but absent from
+/// the manifest — and only then restores the manifest over the top.
+async fn revert_to_manifest(shared: &Arc<Shared>, manifest_id: &ManifestId) -> Result<()> {
+    let manifest = shared.store.get_manifest(manifest_id).await?;
+    let heat = load_heat(&shared.store, &shared.computer)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    // Prune first, so the following restore lands on a tree that contains nothing
+    // the manifest does not (except the preserved excludes).
+    prune_to_manifest(&shared.config.root, &manifest, &shared.excludes());
+    let opts = RestoreOptions {
+        priority: heat.paths,
+    };
+    restore(&shared.store, &manifest, &shared.config.root, &opts).await?;
+    Ok(())
+}
+
+/// Remove every on-disk entry under `root` that `manifest` does not contain and
+/// that is not matched by an `exclude` glob (the supervisor's `.mari` tree and
+/// credential paths, which are deliberately absent from manifests). An entry the
+/// manifest *does* contain but whose on-disk kind conflicts with it (a stale
+/// symlink where the manifest has a file, a directory where it has a file, …) is
+/// also removed, so the following [`restore`] recreates it correctly and never
+/// writes *through* a stale symlink. Best-effort: a removal error is logged, not
+/// fatal — the restore still runs.
+fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
+    let patterns: Vec<glob::Pattern> = excludes
+        .iter()
+        .filter_map(|g| glob::Pattern::new(g).ok())
+        .collect();
+    let in_manifest: HashMap<&str, EntryKind> = manifest
+        .entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.kind))
+        .collect();
+
+    // `contents_first` yields children before their parent, so a directory is
+    // only visited once its extraneous children have already been removed.
+    for entry in walkdir::WalkDir::new(root).contents_first(true) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("revert prune: walk error: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        // Map the on-disk path to its in-manifest form (`/a/b`); the root is `/`.
+        let mpath = match path.strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => continue, // the root itself
+            Ok(rel) => match rel.to_str() {
+                Some(s) => format!("/{s}"),
+                // A non-UTF-8 name can never be a manifest path nor a credential
+                // /`.mari` path; leave it untouched rather than risk a bad match.
+                None => continue,
+            },
+            Err(_) => continue,
+        };
+        // Preserve excluded paths (`.mari`, credentials): they are on disk on
+        // purpose and never appear in a manifest.
+        if patterns.iter().any(|p| p.matches(&mpath)) {
+            continue;
+        }
+        let ft = entry.file_type();
+        let on_disk = if ft.is_symlink() {
+            EntryKind::Symlink
+        } else if ft.is_dir() {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+        // Keep it only if the manifest has this exact path with the same kind;
+        // the restore that follows overwrites its content and mode.
+        if in_manifest.get(mpath.as_str()) == Some(&on_disk) {
+            continue;
+        }
+        // Extraneous, or a kind conflict: remove it.
+        let result = if on_disk == EntryKind::Dir {
+            std::fs::remove_dir(path)
+        } else {
+            // Removes the symlink itself, not its target (no follow).
+            std::fs::remove_file(path)
+        };
+        if let Err(e) = result {
+            // A directory that still has a *preserved* (excluded) child inside it
+            // cannot be removed, and should not be — that is expected.
+            if on_disk == EntryKind::Dir && e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                continue;
+            }
+            warn!(path = %path.display(), "revert prune: remove failed: {e}");
+        }
+    }
+}
+
 /// Cold-wake restore: reconstruct `root` from `manifest`, ordered by the stored
 /// heat profile, and record the read order for the next wake (spec 4.6(d)).
 async fn restore_cold(
@@ -493,4 +609,269 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    //! Unit tests for the two behaviors that only exist in this module: the
+    //! authoritative revert (`revert_to_manifest` must not leave a run's added
+    //! files behind, yet must preserve `.mari`/credential state), and the
+    //! reconnect backoff (reset on a successful `HelloAck`, never on a bare TCP
+    //! connect — so a fenced-out supervisor cannot storm the edge).
+
+    use super::*;
+    use futures_util::SinkExt;
+    use mari_core::{SnapshotOptions, snapshot};
+    use std::path::Path;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    /// Build a minimal `Shared` around a live `root` and a `store`, pointed at
+    /// `control_url`. Returns the outbox receiver too (needed by the WS tests).
+    fn test_shared(
+        root: &Path,
+        store: ChunkStore,
+        control_url: &str,
+    ) -> (Arc<Shared>, UnboundedReceiver<SupervisorMessage>) {
+        let (tx, rx) = unbounded_channel();
+        let notify = Arc::new(Notify::new());
+        let computer = ComputerId::new("comp-test");
+        let epoch = Epoch::new(1);
+        let journal_dir = root.join(".mari").join("journal");
+        let run_manager = Arc::new(RunManager::new(
+            store.clone(),
+            root.to_path_buf(),
+            journal_dir,
+            computer.clone(),
+            epoch,
+            tx.clone(),
+            notify.clone(),
+            Duration::from_secs(30),
+            4096,
+        ));
+        let config = Config {
+            computer_id: "comp-test".into(),
+            control_url: control_url.into(),
+            token: "tok".into(),
+            epoch: 1,
+            root: root.to_path_buf(),
+            store: "fs:///unused".into(),
+            snapshot_interval_secs: 3600,
+            attention_silence_ms: 600_000,
+            restore_manifest: None,
+            segment_bytes: 4 * 1024 * 1024,
+        };
+        let shared = Arc::new(Shared {
+            config,
+            store,
+            computer,
+            epoch,
+            run_manager,
+            outbox_tx: tx,
+            journal_notify: notify,
+            acked: Mutex::new(HashMap::new()),
+        });
+        (shared, rx)
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding RESTORE-REVERT-002: reverting to the pre-run manifest must remove
+    // the files a run added — and must NOT wipe the supervisor's `.mari` state
+    // or the excluded credential paths (both legitimately absent from manifests).
+    // -----------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revert_removes_run_added_files_and_preserves_mari_and_credentials() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+
+        // Pre-run state, plus supervisor state (`.mari`) and a credential
+        // (`.ssh`) that a snapshot deliberately excludes.
+        std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+        std::fs::write(root.join("mod.txt"), b"before").unwrap();
+        std::fs::write(root.join("del.txt"), b"delete-me").unwrap();
+        std::fs::create_dir_all(root.join(".mari/journal")).unwrap();
+        std::fs::write(root.join(".mari/journal/0.seg"), b"journal-bytes").unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_rsa"), b"PRIVATE-KEY").unwrap();
+
+        // The pre-run manifest (the revert target): excludes `.mari`/credentials.
+        let opts = SnapshotOptions {
+            exclude: mari_excludes(),
+            created_at: 1,
+            ..SnapshotOptions::default()
+        };
+        let pre = snapshot(&store, root, &opts).await.unwrap();
+
+        // A run mutates the live tree: adds a file and a whole directory, edits
+        // one file, deletes another. `.mari`/`.ssh` are left in place.
+        std::fs::write(root.join("new.txt"), b"created by the run").unwrap();
+        std::fs::create_dir_all(root.join("junkdir")).unwrap();
+        std::fs::write(root.join("junkdir/inner.txt"), b"junk").unwrap();
+        std::fs::write(root.join("mod.txt"), b"AFTER").unwrap();
+        std::fs::remove_file(root.join("del.txt")).unwrap();
+
+        // Revert into the LIVE root (the production path, spec 5.3).
+        let (shared, _rx) = test_shared(root, store, "ws://unused");
+        revert_to_manifest(&shared, &pre.manifest_id).await.unwrap();
+
+        // The run's additions are gone: the reverted tree is the pre-run tree.
+        assert!(
+            !root.join("new.txt").exists(),
+            "a run-added file must not survive the revert"
+        );
+        assert!(
+            !root.join("junkdir").exists(),
+            "a run-added directory must not survive the revert"
+        );
+        // Edits and deletions are undone.
+        assert_eq!(std::fs::read(root.join("mod.txt")).unwrap(), b"before");
+        assert_eq!(std::fs::read(root.join("del.txt")).unwrap(), b"delete-me");
+        assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), b"keep");
+        // Critically, the supervisor's own state and the credentials survive —
+        // the revert must never wipe an excluded path.
+        assert_eq!(
+            std::fs::read(root.join(".mari/journal/0.seg")).unwrap(),
+            b"journal-bytes",
+            "revert must preserve the supervisor's .mari state"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".ssh/id_rsa")).unwrap(),
+            b"PRIVATE-KEY",
+            "revert must preserve excluded credential paths (spec 10.1)"
+        );
+    }
+
+    /// A revert into a path where a run replaced a file with a symlink must
+    /// remove the stale symlink and rewrite the real file — never write through
+    /// the symlink to whatever it points at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revert_replaces_a_stale_symlink_with_the_manifest_file() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+
+        std::fs::write(root.join("f.txt"), b"real-contents").unwrap();
+        let opts = SnapshotOptions {
+            exclude: mari_excludes(),
+            created_at: 1,
+            ..SnapshotOptions::default()
+        };
+        let pre = snapshot(&store, root, &opts).await.unwrap();
+
+        // A run replaces the file with a symlink pointing outside the root.
+        let sentinel = outside_dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"DO-NOT-TOUCH").unwrap();
+        std::fs::remove_file(root.join("f.txt")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, root.join("f.txt")).unwrap();
+
+        let (shared, _rx) = test_shared(root, store, "ws://unused");
+        revert_to_manifest(&shared, &pre.manifest_id).await.unwrap();
+
+        // f.txt is a real file again with the manifest bytes, and the symlink's
+        // target outside the root was never written through.
+        let meta = std::fs::symlink_metadata(root.join("f.txt")).unwrap();
+        assert!(meta.file_type().is_file(), "f.txt must be a regular file");
+        assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"real-contents");
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"DO-NOT-TOUCH",
+            "revert must not write through a stale symlink"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding MARID-BACKOFF-RESET-5: the reconnect backoff resets on a
+    // successful session (HelloAck), not on a bare TCP connect.
+    // -----------------------------------------------------------------------
+
+    /// Bind a listener, hand the first connection to `f`, and return its URL.
+    /// Bound before returning, so the client's connect never races the accept.
+    async fn spawn_ws<F, Fut>(f: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(ws) = accept_async(stream).await
+            {
+                f(ws).await;
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_preserved_when_handshake_is_rejected() {
+        // Server reads the Hello, then closes WITHOUT a HelloAck — the DO
+        // rejecting a fenced-out / mismatched supervisor (contracts Appendix B).
+        let url = spawn_ws(|mut ws| async move {
+            let _ = ws.next().await; // the Hello frame
+            let _ = ws.send(Message::Close(None)).await;
+        })
+        .await;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (shared, mut rx) = test_shared(root_dir.path(), store, &url);
+
+        // Simulate a couple of prior failed attempts, so the backoff has climbed
+        // above its initial delay: 50ms -> current 100ms -> current 200ms.
+        let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
+        let _ = backoff.next_delay();
+        let _ = backoff.next_delay();
+
+        let outcome = connect_and_serve(&shared, &mut rx, &mut backoff).await;
+        assert!(
+            matches!(outcome, Ok(SessionOutcome::Disconnected) | Err(_)),
+            "a rejected handshake must end the session"
+        );
+
+        // No HelloAck arrived, so the backoff must be untouched. If it reset on
+        // the bare TCP connect (the bug), this would be the 50ms initial delay
+        // and the supervisor would storm reconnects.
+        assert_eq!(
+            backoff.next_delay(),
+            Duration::from_millis(200),
+            "backoff must NOT reset on a handshake that was rejected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_resets_after_hello_ack() {
+        // Server completes the handshake (HelloAck), then closes.
+        let url = spawn_ws(|mut ws| async move {
+            let _ = ws.next().await; // the Hello frame
+            let _ = send_framed(&mut ws, &ControlMessage::HelloAck { acked: vec![] }).await;
+            let _ = ws.send(Message::Close(None)).await;
+        })
+        .await;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (shared, mut rx) = test_shared(root_dir.path(), store, &url);
+
+        let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
+        let _ = backoff.next_delay();
+        let _ = backoff.next_delay(); // current now 200ms
+
+        let _ = connect_and_serve(&shared, &mut rx, &mut backoff).await;
+
+        // The session was established, so the backoff resets to its initial delay.
+        assert_eq!(
+            backoff.next_delay(),
+            Duration::from_millis(50),
+            "a successful hello_ack must reset the backoff"
+        );
+    }
 }

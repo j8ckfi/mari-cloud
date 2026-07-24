@@ -14,7 +14,7 @@
 //! is what makes reconnect-resume gap-free.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -72,17 +72,44 @@ pub struct RunState {
     silence_fired: AtomicBool,
     /// Notified once to stop the housekeeping loop at completion.
     done: Arc<Notify>,
-    // Held open for the run's lifetime: the pty master (keeps the pty alive) and
-    // its writer (keeps the child's stdin open so a blocked read stays blocked
-    // rather than seeing EOF).
-    _master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    _writer: Mutex<Option<Box<dyn std::io::Write + Send>>>,
+    // Held open for the run's lifetime: the pty master (keeps the pty alive and
+    // carries window-size changes) and its writer (client input to the child's
+    // stdin; also keeps stdin open so a blocked read stays blocked rather than
+    // seeing EOF).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn std::io::Write + Send>>>,
 }
 
 impl RunState {
     /// Whether the run's child is still alive.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Write client terminal input to the run's PTY (spec 7: input flows to the
+    /// PTY the supervisor owns). A no-op once the writer has been dropped at
+    /// completion.
+    pub fn write_input(&self, bytes: &[u8]) {
+        if let Some(writer) = self.writer.lock().unwrap().as_mut() {
+            if let Err(e) = writer.write_all(bytes).and_then(|()| writer.flush()) {
+                debug!(run = %self.id, "pty input write failed: {e}");
+            }
+        }
+    }
+
+    /// Resize the run's PTY window (spec 7.5). A no-op once the master has been
+    /// dropped at completion.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(master) = self.master.lock().unwrap().as_ref() {
+            if let Err(e) = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                debug!(run = %self.id, "pty resize failed: {e}");
+            }
+        }
     }
 }
 
@@ -257,8 +284,8 @@ impl RunManager {
             last_output: Mutex::new(Instant::now()),
             silence_fired: AtomicBool::new(false),
             done: done.clone(),
-            _master: Mutex::new(Some(pair.master)),
-            _writer: Mutex::new(Some(writer)),
+            master: Mutex::new(Some(pair.master)),
+            writer: Mutex::new(Some(writer)),
         });
         self.ctx
             .runs
@@ -298,6 +325,23 @@ impl RunManager {
         );
 
         Ok(state)
+    }
+
+    /// Write client terminal input to a run's PTY. Unknown or already-finished
+    /// runs are ignored (the input has nowhere to go).
+    pub fn write_input(&self, run: &RunId, bytes: &[u8]) {
+        let state = self.ctx.runs.lock().unwrap().get(run).cloned();
+        if let Some(state) = state {
+            state.write_input(bytes);
+        }
+    }
+
+    /// Resize a run's PTY window (spec 7.5). Unknown or finished runs are ignored.
+    pub fn resize_run(&self, run: &RunId, cols: u16, rows: u16) {
+        let state = self.ctx.runs.lock().unwrap().get(run).cloned();
+        if let Some(state) = state {
+            state.resize(cols, rows);
+        }
     }
 
     /// Stop a run's process cleanly (SIGHUP via the pty). The completion task

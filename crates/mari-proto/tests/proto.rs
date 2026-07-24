@@ -41,6 +41,29 @@ fn every_message_round_trips_through_a_frame() {
         let back: SupervisorMessage = decode_frame(&framed).unwrap();
         assert_eq!(back, msg);
     }
+
+    // Control-plane -> supervisor, including the first-class terminal
+    // input/resize messages.
+    let control: Vec<ControlMessage> = vec![
+        ControlMessage::Input {
+            run: RunId::new("run-0001"),
+            bytes: b"echo hi\r".to_vec(),
+        },
+        ControlMessage::Resize {
+            run: RunId::new("run-0001"),
+            cols: 200,
+            rows: 50,
+        },
+        ControlMessage::JournalAck {
+            run: RunId::new("run-0001"),
+            offset: JournalOffset::new(1 << 40),
+        },
+    ];
+    for msg in control {
+        let framed = encode_frame(&msg).unwrap();
+        let back: ControlMessage = decode_frame(&framed).unwrap();
+        assert_eq!(back, msg);
+    }
 }
 
 #[test]

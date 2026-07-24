@@ -4,6 +4,8 @@
 
 import { createApp } from './app';
 import { parsePreviewHost } from './host';
+import { makeAuth } from './auth';
+import { getOwnedComputer } from './db/fleet';
 import type { Env } from './types';
 
 const app = createApp();
@@ -26,6 +28,21 @@ async function tryWsRoute(request: Request, env: Env): Promise<Response | null> 
   }
   const kind = match[1] as 'attach' | 'supervisor';
   const id = decodeURIComponent(match[2] as string);
+
+  // The client terminal attach (spec 7.3) is a privileged per-computer channel:
+  // it replays the run's journal (terminal output — spec 6.3, "the user's
+  // business", routinely secret-bearing) and forwards `input` keystrokes to the
+  // PTY. It MUST be authenticated to a session that OWNS this computer, or it is
+  // a cross-tenant read + keystroke-injection hole (SEC-02). The supervisor
+  // channel authenticates by its one-time fencing token via `hello`
+  // (contracts.md Appendix B), so this session gate applies to `attach` ONLY.
+  if (kind === 'attach') {
+    const session = await makeAuth(env).api.getSession({ headers: request.headers });
+    if (!session?.user) return new Response('unauthorized', { status: 401 });
+    const owned = await getOwnedComputer(env.DB, id, session.user.id);
+    if (!owned) return new Response('forbidden', { status: 403 });
+  }
+
   const stub = env.COMPUTER.get(env.COMPUTER.idFromName(id));
 
   // DEV-ONLY: prime the DO with the fencing epoch/token the fake supervisor

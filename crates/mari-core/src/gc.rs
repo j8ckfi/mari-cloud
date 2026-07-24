@@ -10,13 +10,31 @@
 //! **errors** rather than proceed on an incomplete live set.
 //!
 //! **Sweep.** A chunk is deleted only if it is (1) absent from the live set AND
-//! (2) older than the safety window. The window protects in-flight snapshots: a
-//! just-written chunk not yet referenced by any manifest must not be swept out
-//! from under the snapshot that is about to reference it. A chunk with an
-//! unknown store timestamp is treated as protected.
+//! (2) older than the safety window. The window is keyed on the chunk's *store
+//! mtime*, so it protects a **freshly-uploaded** chunk: bytes just written but
+//! not yet named by any manifest must not be swept out from under the snapshot
+//! that is about to reference them. A chunk with an unknown store timestamp is
+//! treated as protected.
 //!
-//! Both invariants are re-checked at the deletion site in [`execute`], not only
-//! at plan time. Every deletion is recorded in an audit log.
+//! The mtime window does **not**, on its own, protect a *resurrected* chunk: one
+//! that is old and unreferenced at plan time but is referenced again before the
+//! sweep runs. Because chunks are content-addressed, a snapshot on any computer
+//! that dedups against the store reuses an already-present chunk and advances a
+//! manifest head **without rewriting the chunk** — its store-mtime stays old, so
+//! the window sees nothing. The fleet-wide, shared chunk store means some
+//! computer is nearly always snapshotting, so this race window is effectively
+//! always open. Guarding it is [`execute`]'s job: it re-collects the live set
+//! from the *current* retained set at execution time and refuses to delete any
+//! candidate that has become live again — it never trusts the plan's frozen
+//! `live` set for a deletion decision.
+//!
+//! This narrows the race to the interval between that execution-time live-set
+//! collection and each delete. Fully closing it requires coordination the caller
+//! owns and mari-core cannot provide alone: run the sweep under a quiesce, or
+//! gate it on the fencing epoch (decisions.md) so any manifest-head advance
+//! after planning aborts the sweep. `execute` assumes the `retained` set it is
+//! given names every manifest that could be referenced for the duration of the
+//! call. Every deletion is recorded in an audit log.
 
 use std::collections::{BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,6 +113,9 @@ pub enum GcAction {
     WouldDelete,
     /// Held back by the safety window.
     ProtectedByWindow,
+    /// Dead when the plan was built, but live again against the current retained
+    /// set at execution time — a resurrection caught and skipped, never deleted.
+    Resurrected,
 }
 
 /// One line of the sweep's audit log.
@@ -214,18 +235,51 @@ pub async fn plan_at(
     })
 }
 
-/// Execute a sweep plan. In [`GcMode::DryRun`] nothing is deleted. In
-/// [`GcMode::Delete`] every eligible dead chunk is deleted, with the two
-/// invariants — not live, past the window — re-checked at the deletion site.
-/// Returns an audit log covering every dead chunk considered.
-pub async fn execute(store: &ChunkStore, plan: &GcPlan, mode: GcMode) -> Result<GcReport> {
+/// Execute a sweep plan, re-verifying safety against the **current** retained
+/// set rather than trusting the plan's frozen live set.
+///
+/// The plan supplies the candidate list and each candidate's plan-time age. But
+/// between planning and execution a dead chunk can be *resurrected*: a snapshot
+/// on any computer dedups against the store, references the already-present
+/// chunk, and advances a manifest head — all without rewriting the chunk, so its
+/// store-mtime (the window's only signal) stays old (see the module docs). To
+/// catch that, `execute` re-collects the live set from `retained` — the
+/// retention set as of *now* — and deletes a candidate only if it is still
+/// absent from that current live set. `retained` must therefore be re-read fresh
+/// at call time, not reused from planning.
+///
+/// In [`GcMode::DryRun`] nothing is deleted; the same current-state checks run,
+/// so the report is an honest preview. In [`GcMode::Delete`] every still-dead,
+/// still-aged-out candidate is deleted. Returns an audit log covering every dead
+/// chunk considered. This narrows but does not by itself eliminate the
+/// resurrection window (module docs): the caller must run the sweep under
+/// coordination for full safety.
+pub async fn execute(
+    store: &ChunkStore,
+    plan: &GcPlan,
+    retained: &[ManifestId],
+    mode: GcMode,
+) -> Result<GcReport> {
+    // Re-verify against the live set as of *now*, never the plan's frozen one:
+    // a chunk dead at plan time may have been referenced again since.
+    let current_live = collect_live_set(store, retained).await?;
+
     let mut deleted = Vec::new();
     let mut audit = Vec::with_capacity(plan.dead.len());
 
     for d in &plan.dead {
-        // Invariant 1: never touch a chunk reachable from a retained manifest.
-        // (dead is already the non-live set; this is defense in depth.)
-        if plan.live.contains(&d.chunk) {
+        // Invariant 1 (resurrection guard): never delete a chunk that is live
+        // against the CURRENT retained set, even if it was dead when the plan
+        // was built. A snapshot that dedup-references an already-present chunk
+        // between plan and execute revives it without refreshing its mtime, so
+        // only this fresh live-set check — not the plan's `live` and not the
+        // mtime window — catches it.
+        if current_live.contains(&d.chunk) {
+            audit.push(GcAuditEntry {
+                chunk: d.chunk.clone(),
+                age_secs: d.age_secs,
+                action: GcAction::Resurrected,
+            });
             continue;
         }
         // Invariant 2: never delete a chunk younger than the safety window.

@@ -78,7 +78,7 @@ async fn window_and_reachability_are_respected() {
     let retained = store_manifest(&store, &[live.clone()], &[0], None).await;
 
     let window = 100;
-    let plan = plan_at(&store, &[retained], window, NOW).await.unwrap();
+    let plan = plan_at(&store, std::slice::from_ref(&retained), window, NOW).await.unwrap();
 
     assert_eq!(plan.live_count(), 1);
     assert!(plan.live.contains(&live));
@@ -92,14 +92,14 @@ async fn window_and_reachability_are_respected() {
     assert_eq!(old_d.age_secs, 10_000);
 
     // Dry-run changes nothing on disk.
-    let dry = execute(&store, &plan, GcMode::DryRun).await.unwrap();
+    let dry = execute(&store, &plan, std::slice::from_ref(&retained), GcMode::DryRun).await.unwrap();
     assert!(dry.deleted.is_empty());
     assert!(store.has_chunk(&old).await.unwrap());
     assert!(dry.audit.iter().any(|a| a.chunk == old && a.action == GcAction::WouldDelete));
     assert!(dry.audit.iter().any(|a| a.chunk == young && a.action == GcAction::ProtectedByWindow));
 
     // Delete: only the old orphan is swept.
-    let rep = execute(&store, &plan, GcMode::Delete).await.unwrap();
+    let rep = execute(&store, &plan, std::slice::from_ref(&retained), GcMode::Delete).await.unwrap();
     assert_eq!(rep.deleted, vec![old.clone()]);
     assert!(!store.has_chunk(&old).await.unwrap(), "old orphan should be gone");
     assert!(store.has_chunk(&young).await.unwrap(), "young orphan must survive the window");
@@ -219,7 +219,7 @@ proptest! {
             }
 
             // Dry run mutates nothing.
-            let dry = execute(&store, &plan, GcMode::DryRun).await.unwrap();
+            let dry = execute(&store, &plan, &retained_ids, GcMode::DryRun).await.unwrap();
             prop_assert!(dry.deleted.is_empty());
             let after_dry: BTreeSet<ChunkId> =
                 store.list_chunk_ids().await.unwrap().into_iter().collect();
@@ -227,7 +227,7 @@ proptest! {
             prop_assert_eq!(&after_dry, &all_ids);
 
             // Delete sweeps exactly the deletable set.
-            let rep = execute(&store, &plan, GcMode::Delete).await.unwrap();
+            let rep = execute(&store, &plan, &retained_ids, GcMode::Delete).await.unwrap();
             let deleted: BTreeSet<ChunkId> = rep.deleted.iter().cloned().collect();
             prop_assert_eq!(&deleted, &expected_deletable);
 

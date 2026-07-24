@@ -55,6 +55,41 @@ describe('journal persistence + attach replay', () => {
     client.close();
   });
 
+  it('forwards client input/resize to the supervisor as first-class ControlMessages', async () => {
+    const id = 'journalcomp-input';
+    const run = 'run-input';
+    const stub = computerStub(id);
+    const w = await stub.wake(id);
+
+    const sup = await FakeSupervisor.connect(id);
+    await sup.handshake(id, w.epoch, w.token);
+
+    const client = await FakeClient.connect(id);
+    client.attach(run, 80, 24);
+    await client.recv.waitForTag('grid');
+
+    // A keystroke sequence and a viewport resize from the client...
+    const typed = bytes(0x6c, 0x73, 0x0d); // "ls\r"
+    client.input(run, typed);
+    client.resize(run, 120, 40);
+
+    // ...arrive supervisor-ward as ControlMessage::Input / ::Resize (framed CBOR),
+    // NOT the removed ad-hoc `client_input` / `client_resize` shapes.
+    const input = await sup.recv.waitForTag('input');
+    expect(input.c.run).toBe(run);
+    expect(eqBytes(new Uint8Array(input.c.bytes), typed)).toBe(true);
+
+    const resize = await sup.recv.waitForTag('resize');
+    expect(resize.c).toEqual({ run, cols: 120, rows: 40 });
+
+    // The stale tag must never appear on the wire.
+    expect(sup.recv.countTag('client_resize')).toBe(0);
+    expect(sup.recv.countTag('client_input')).toBe(0);
+
+    client.close();
+    sup.close();
+  });
+
   it('streams live frames to an already-attached client', async () => {
     const id = 'journalcomp2';
     const run = 'run-live';

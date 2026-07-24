@@ -32,8 +32,11 @@ export default defineConfig({
   use: {
     baseURL: WEB,
     trace: 'retain-on-failure',
-    // A COLD render must never depend on WebGL; the DOM renderer keeps terminal
-    // text assertable. (WebGL is typically unavailable in headless CI anyway.)
+    // A COLD render must never depend on WebGL. `--disable-gpu` reduces GPU use
+    // but does NOT by itself force xterm onto its DOM renderer in headless
+    // Chromium (software WebGL is still present); the terminal spec neutralizes
+    // WebGL in-page so xterm falls back to the DOM renderer and its authoritative
+    // buffer becomes assertable text (see e2e/terminal.spec.ts).
     launchOptions: { args: ['--disable-gpu'] },
   },
   projects: [

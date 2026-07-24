@@ -1,0 +1,9 @@
+{
+  "t": "hello",
+  "c": {
+    "computer": "computer-alpha",
+    "epoch": 9007199254740991,
+    "token": "supervisor-token-large",
+    "proto_version": 1
+  }
+}

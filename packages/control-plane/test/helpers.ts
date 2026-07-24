@@ -196,6 +196,10 @@ export class FakeClient {
     this.send({ t: 'input', run, bytes: data });
   }
 
+  resize(run: string, cols: number, rows: number): void {
+    this.send({ t: 'resize', run, cols, rows });
+  }
+
   close(): void {
     try {
       this.ws.close();

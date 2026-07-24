@@ -264,6 +264,23 @@ fn generate_and_verify_fixtures() {
     );
     write_fixture(
         &dir,
+        "ctl_input",
+        &ControlMessage::Input {
+            run: run.clone(),
+            bytes: b"ls -la\r".to_vec(),
+        },
+    );
+    write_fixture(
+        &dir,
+        "ctl_resize",
+        &ControlMessage::Resize {
+            run: run.clone(),
+            cols: 120,
+            rows: 40,
+        },
+    );
+    write_fixture(
+        &dir,
         "ctl_snapshot_now",
         &ControlMessage::SnapshotNow {
             reason: SnapshotReason::Command,
@@ -283,6 +300,51 @@ fn generate_and_verify_fixtures() {
         "ctl_restore_to_manifest",
         &ControlMessage::RestoreToManifest {
             manifest: head_manifest,
+        },
+    );
+
+    // ---- large-u64 regression fixtures (protocol review PROTO-02) ----
+    // Every wire `u64` may range up to 2^53-1 (contracts §1). ciborium always
+    // emits a shortest-form major-type-0 integer; `cbor-x` used to switch to a
+    // CBOR float64 for any integer-valued Number >= 2^32, so a run whose journal
+    // crossed 4 GiB produced offsets/epochs the supervisor could not decode.
+    // These exemplars carry offsets and epochs at exactly 2^32 and at the JS
+    // safe-integer ceiling so the TS re-encode conformance test catches any such
+    // drift for good.
+    let offset_2pow32 = JournalOffset::new(4_294_967_296); // 2^32
+    let offset_max = JournalOffset::new(mari_proto::MAX_SAFE_INTEGER); // 2^53 - 1
+    write_fixture(
+        &dir,
+        "ctl_journal_ack_large",
+        &ControlMessage::JournalAck {
+            run: run.clone(),
+            offset: offset_2pow32,
+        },
+    );
+    write_fixture(
+        &dir,
+        "ctl_hello_ack_large",
+        &ControlMessage::HelloAck {
+            acked: vec![
+                RunOffset {
+                    run: run.clone(),
+                    offset: offset_2pow32,
+                },
+                RunOffset {
+                    run: RunId::new("run-0002"),
+                    offset: offset_max,
+                },
+            ],
+        },
+    );
+    write_fixture(
+        &dir,
+        "sup_hello_large",
+        &SupervisorMessage::Hello {
+            computer: computer.clone(),
+            epoch: Epoch::new(mari_proto::MAX_SAFE_INTEGER),
+            token: "supervisor-token-large".into(),
+            proto_version: PROTO_VERSION,
         },
     );
 

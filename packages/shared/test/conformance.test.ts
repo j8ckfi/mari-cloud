@@ -40,8 +40,8 @@ function readExpected(name: string): unknown {
 
 describe('conformance fixtures', () => {
   it('there is a fixture set to check', () => {
-    // The Rust generator emits 19 exemplars; guard against an empty run.
-    expect(names.length).toBeGreaterThanOrEqual(19);
+    // The Rust generator emits 25 exemplars; guard against an empty run.
+    expect(names.length).toBeGreaterThanOrEqual(25);
   });
 
   it('every .cbor has a matching .expected.json', () => {

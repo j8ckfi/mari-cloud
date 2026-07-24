@@ -78,6 +78,8 @@ const CONTROL_TAGS: ReadonlySet<string> = new Set<ControlMessageTag>([
   'journal_ack',
   'start_run',
   'stop_run',
+  'input',
+  'resize',
   'snapshot_now',
   'prepare_for_cold',
   'head_advance_result',
@@ -115,6 +117,18 @@ export function asControlMessage(value: unknown): ControlMessage {
   }
   if (t !== 'prepare_for_cold') {
     record(env['c'], `ControlMessage(${t}).c`);
+  }
+  if (t === 'input') {
+    const c = env['c'] as Record<string, unknown>;
+    str(c['run'], 'input.run');
+    if (!ArrayBuffer.isView(c['bytes'])) {
+      throw new ValidationError('input.bytes: expected byte string (Uint8Array)');
+    }
+  } else if (t === 'resize') {
+    const c = env['c'] as Record<string, unknown>;
+    str(c['run'], 'resize.run');
+    u53(c['cols'], 'resize.cols');
+    u53(c['rows'], 'resize.rows');
   }
   return value as ControlMessage;
 }

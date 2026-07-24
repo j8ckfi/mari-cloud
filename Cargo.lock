@@ -1009,6 +1009,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "glob",
  "mari-core",
  "mari-proto",
  "portable-pty",
@@ -1019,6 +1020,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

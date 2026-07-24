@@ -106,6 +106,20 @@ export interface StopRun {
   run: RunId;
 }
 
+/** Terminal input for a run's PTY, forwarded by the DO from the attach protocol. */
+export interface Input {
+  run: RunId;
+  /** Raw bytes to write to the run's PTY; a CBOR byte string / `Uint8Array`. */
+  bytes: Uint8Array;
+}
+
+/** Viewport resize for a run's PTY window (spec 7.5). */
+export interface Resize {
+  run: RunId;
+  cols: number;
+  rows: number;
+}
+
 export interface SnapshotNow {
   reason: SnapshotReason;
 }
@@ -125,6 +139,8 @@ export type ControlMessage =
   | { t: 'journal_ack'; c: JournalAck }
   | { t: 'start_run'; c: StartRun }
   | { t: 'stop_run'; c: StopRun }
+  | { t: 'input'; c: Input }
+  | { t: 'resize'; c: Resize }
   | { t: 'snapshot_now'; c: SnapshotNow }
   | { t: 'prepare_for_cold' }
   | { t: 'head_advance_result'; c: HeadAdvanceResult }
