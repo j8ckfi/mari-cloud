@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+  - better-sqlite3
+  - sharp
+  - '@cloudflare/workerd-darwin-arm64'

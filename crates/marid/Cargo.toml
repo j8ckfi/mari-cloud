@@ -1,0 +1,9 @@
+[package]
+name = "marid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mari-core = { path = "../mari-core" }
+mari-proto = { path = "../mari-proto" }
