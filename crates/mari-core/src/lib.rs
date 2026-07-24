@@ -14,6 +14,10 @@
 //!   [`mari_proto::Manifest`]; `parent` links a base image for delta accounting.
 //! - [`restore`] — reconstruct a byte-identical tree (modes, symlinks), heat
 //!   priority first, path-traversal safe.
+//! - [`rootfs`] — root-anchored (`openat`/`O_NOFOLLOW`) filesystem access. Every
+//!   write, directory creation, removal and mode change in this crate goes
+//!   through it, so no on-disk symlink can redirect an operation outside the
+//!   root it was aimed at.
 //! - [`diff`] — added / modified / removed with mode-only vs content detail.
 //! - [`heat`] — the boot/run-start read-order profile and its recorder.
 //! - [`gc`] — mark-and-sweep over the live set, with a safety window and an
@@ -28,6 +32,7 @@ pub mod error;
 pub mod gc;
 pub mod heat;
 pub mod restore;
+pub mod rootfs;
 pub mod snapshot;
 pub mod store;
 
@@ -40,6 +45,7 @@ pub use gc::{
 };
 pub use heat::{load_heat, store_heat, HeatRecorder};
 pub use restore::{restore, RestoreOptions, RestoreStats};
+pub use rootfs::{manifest_components, RootDir};
 pub use snapshot::{
     default_credential_excludes, delta_chunks, manifest_chunks, snapshot, SnapshotOptions,
     SnapshotResult,

@@ -421,3 +421,29 @@ It is latent today because nothing reads segments back — the DO replays its
 SQLite journal — and contracts §9 pins neither the width nor the writer.
 Deciding who owns that prefix is a cross-lane call and is deliberately NOT
 patched here.
+
+## WARM is a fast cold wake (decided 2026-07-24)
+
+Spec 2 previously defined WARM as native substrate sleep (checkpoint or pause)
+with memory intact. That promise cannot be kept uniformly: Sprites suspends,
+local Docker `pause` holds RAM on the host, and Cloudflare Containers stop
+outright. Rather than let state fidelity vary per substrate — which would make
+"my computer" mean something different depending on where it woke — WARM is now
+defined fleet-wide as: substrate resources retained, disk cache intact, no
+process, no compute billing, **memory gone**.
+
+Consequences, all of them simplifications except the last:
+
+- One state machine for every substrate. `sleep` in the provider interface is
+  now "stop the processes and keep the disk", which every substrate can honour.
+- Memory never survives any transition, so spec 4.5's clean-stop rule applies to
+  AWAKE→WARM as well as WARM→COLD. There is exactly one continuation mechanism
+  (journal + agent adapter resume, spec 5.6) instead of two.
+- The measured cold wake (~118 ms to supervisor-connected, ~266 ms to files
+  byte-identical, small deltas over a warm base image) is what makes this
+  affordable. WARM's remaining value is avoiding the chunk-store transfer, not
+  avoiding the restart.
+- **New requirement**: Mari writes a manifest before AWAKE→WARM. With no live
+  process holding the disk, a substrate that reclaims storage would otherwise
+  lose everything since the last snapshot. This is cheap (delta only) and closes
+  the window.

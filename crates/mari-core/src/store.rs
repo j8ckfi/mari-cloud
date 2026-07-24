@@ -77,6 +77,45 @@ impl ChunkStore {
 
     // ---- keys ----------------------------------------------------------
 
+    /// A content address is 64 lowercase hex characters (contracts §3). Ids
+    /// arrive from **manifests**, which are untrusted input: a `parent` of
+    /// `"../../etc/passwd"` would otherwise compose a key that walks out of the
+    /// store root inside the backend. Verification-on-read means such a probe
+    /// could never return usable bytes, but it must not reach the backend at
+    /// all. Ids this crate mints (blake3 hex) and ids recovered from a listing
+    /// always pass.
+    fn check_content_address(kind: &str, id: &str) -> Result<()> {
+        let well_formed = id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if well_formed {
+            Ok(())
+        } else {
+            Err(Error::InvalidManifest(format!(
+                "malformed {kind} id {id:?}: expected 64 lowercase hex characters"
+            )))
+        }
+    }
+
+    /// A computer id becomes a store key segment (`heat/{computer}.cbor`), so it
+    /// must name exactly one segment: no separator, no `.`/`..`, not empty.
+    fn check_computer_id(computer: &str) -> Result<()> {
+        let ok = !computer.is_empty()
+            && computer != "."
+            && computer != ".."
+            && !computer.contains('/')
+            && !computer.contains('\\')
+            && !computer.contains('\0');
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::InvalidManifest(format!(
+                "computer id {computer:?} is not a single store key segment"
+            )))
+        }
+    }
+
     /// `chunks/{id[0..2]}/{id}` — the sharded chunk key (contracts §9).
     pub fn chunk_key(id: &ChunkId) -> String {
         let s = id.as_str();
@@ -99,6 +138,7 @@ impl ChunkStore {
 
     /// Does the store already hold this chunk?
     pub async fn has_chunk(&self, id: &ChunkId) -> Result<bool> {
+        Self::check_content_address("chunk", id.as_str())?;
         Ok(self.op.exists(&Self::chunk_key(id)).await?)
     }
 
@@ -148,6 +188,7 @@ impl ChunkStore {
     /// requested id. A decompression failure or a hash mismatch is a typed
     /// error naming the chunk; the bytes are never returned unverified.
     pub async fn get_chunk(&self, id: &ChunkId) -> Result<Vec<u8>> {
+        Self::check_content_address("chunk", id.as_str())?;
         let key = Self::chunk_key(id);
         let compressed = match self.op.read(&key).await {
             Ok(buf) => buf.to_vec(),
@@ -170,6 +211,7 @@ impl ChunkStore {
 
     /// Delete a chunk. Used only by GC's sweep, under its own guards.
     pub async fn delete_chunk(&self, id: &ChunkId) -> Result<()> {
+        Self::check_content_address("chunk", id.as_str())?;
         self.op.delete(&Self::chunk_key(id)).await?;
         Ok(())
     }
@@ -220,6 +262,7 @@ impl ChunkStore {
     /// Load and decode a manifest by id. `NotFound` maps to
     /// [`Error::ManifestNotFound`] so GC can fail safe on a missing parent.
     pub async fn get_manifest(&self, id: &ManifestId) -> Result<Manifest> {
+        Self::check_content_address("manifest", id.as_str())?;
         let key = Self::manifest_key(id);
         let bytes = match self.op.read(&key).await {
             Ok(buf) => buf.to_vec(),
@@ -233,6 +276,7 @@ impl ChunkStore {
 
     /// Is this manifest present?
     pub async fn has_manifest(&self, id: &ManifestId) -> Result<bool> {
+        Self::check_content_address("manifest", id.as_str())?;
         Ok(self.op.exists(&Self::manifest_key(id)).await?)
     }
 

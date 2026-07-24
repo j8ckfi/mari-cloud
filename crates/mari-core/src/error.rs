@@ -69,6 +69,18 @@ pub enum Error {
         path: String,
     },
 
+    /// A path under a root could not be resolved or realized without following
+    /// a symlink out of that root, or without destroying something the caller
+    /// must not destroy. Raised by the root-anchored filesystem layer
+    /// ([`crate::rootfs`]) — nothing outside the root was touched.
+    #[error("unsafe path {path:?} under the root: {detail}")]
+    UnsafePath {
+        /// The composed on-disk path the operation was against.
+        path: String,
+        /// What made it unsafe.
+        detail: String,
+    },
+
     /// A manifest is internally inconsistent (e.g. a parent chain cycle, or a
     /// chunk-length sum that disagrees with the entry size).
     #[error("invalid manifest: {0}")]

@@ -39,6 +39,27 @@
 // mirror must not be stricter than the format it mirrors. Ignoring them also
 // keeps validation allocation-free and key-enumeration-free on the journal hot
 // path.
+//
+// **Cost on the journal hot path.** `journal_frame` is the only per-frame
+// message, so validation must be cheap enough to run on every one. It is:
+// validating a decoded frame is a fixed handful of `typeof` checks that never
+// touch the payload bytes, so it is O(1) in frame size. Measured with
+// `process.hrtime` over 200k iterations per size (Node 22, M-series laptop):
+//
+// | journal_frame payload | `decodeCbor` | `+ asSupervisorMessage` | validate alone |
+// |---|---|---|---|
+// | 64 B    | 231 ns | 248 ns | 18 ns |
+// | 4 KiB   | 283 ns | 307 ns | 29 ns |
+// | 64 KiB  | 277 ns | 306 ns | 29 ns |
+//
+// ~8% on top of the CBOR decode the frame already pays, flat in payload size.
+// No `journal_frame` fast path is needed or wanted: full field validation IS
+// the fast path, and a partial one would reopen exactly the gap this module
+// closed. The wider variants stay off the per-frame path (`rollback_detected`
+// with 8 runs: ~243 ns, once per connect). `review_repro_validate_gap.test.ts`
+// pins the structural half of this claim — the validator is asserted not to
+// read a single element of the byte string — since a timing assertion in a
+// test suite would only be flaky.
 
 import { decodeCbor } from './cbor';
 import { MAX_SAFE_INTEGER } from './ids';

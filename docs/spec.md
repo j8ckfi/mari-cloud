@@ -26,8 +26,11 @@ Use each term with one meaning only.
 - **State**: a computer is AWAKE, WARM, COLD, or WAKING.
   - **AWAKE**: materialized on a substrate, processes active, compute billing
     active.
-  - **WARM**: on a substrate in native sleep (checkpoint or pause). Wake is
-    immediate. Cost is near zero.
+  - **WARM**: substrate resources are retained and the substrate disk still
+    holds the computer, but no process runs and no compute is billed. Memory
+    does not survive. Wake is a fast cold wake: the supervisor restarts and
+    reads the local disk cache, with no chunk-store transfer. Cost is idle
+    resource cost only.
   - **COLD**: in the chunk store only. No substrate resources exist. Cost is
     object storage only.
   - **WAKING**: in transition to AWAKE.
@@ -101,9 +104,16 @@ After a configured longer idle time, Mari writes a final manifest, destroys the
 substrate resources, and the computer becomes COLD. The user-visible name for
 COLD is deep sleep. A COLD computer must cost only its delta in object storage.
 
-4.5 Before the WARM-to-COLD transition, the supervisor stops each agent session
-in a clean state. Memory does not survive COLD. The journal and the agent
-resume function cover continuation (see 5.6).
+4.5 Before the AWAKE-to-WARM transition and before the WARM-to-COLD
+transition, the supervisor stops each agent session in a clean state and Mari
+writes a manifest. Memory does not survive either transition. The journal and
+the agent resume function cover continuation (see 5.6).
+
+Rationale (decided 2026-07-24): Mari does not depend on any substrate's
+checkpoint or pause. One state machine holds fleet-wide, so a computer behaves
+identically on every substrate. The manifest before WARM is what makes this
+safe: with no live process, a substrate that reclaims its disk must not be able
+to lose work.
 
 4.6 Cold wake uses streaming restore:
 
@@ -114,9 +124,9 @@ resume function cover continuation (see 5.6).
 - (e) The target for the first shell prompt is seconds, not the full transfer
   time.
 
-4.7 If a substrate restores an old checkpoint (a WARM rollback), the supervisor
-must compare the disk with the journal head, report the difference, and replay
-the run if replay is safe.
+4.7 If a substrate returns a stale disk (a rollback), the supervisor must
+compare the disk with the journal head, report the difference, and replay the
+run if replay is safe.
 
 4.8 Chunk garbage collection uses reference counts across all manifests. A
 chunk with zero references is deleted after a safety delay. Treat this code as

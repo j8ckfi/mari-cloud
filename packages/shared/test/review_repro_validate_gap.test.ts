@@ -13,8 +13,22 @@
 //
 // These `it`s assert the CORRECT behavior. They failed before validate.ts was
 // rewritten to validate payload fields; the block is no longer skipped.
+//
+// Beyond the original repro this file also pins, at the bottom:
+//   - the journal HOT PATH cost: validation never reads a payload byte, so it
+//     is O(1) in frame size (validate.ts records the measured ns);
+//   - BigInt NORMALIZATION on every u64 field, not just rejection past 2^53;
+//   - both `ExitStatus` variants, byte fields across realms, and the u64 guard
+//     inside a `Manifest`;
+//   - LOCKSTEP with mari-proto: the accepted tag/enum sets are derived from the
+//     Rust source, so a variant added there cannot silently become a frame this
+//     validator rejects (the failure mode restricting enums introduces).
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { encodeCbor, decodeCbor } from '../src/cbor';
 import { MAX_SAFE_INTEGER } from '../src/ids';
 import {
@@ -22,10 +36,12 @@ import {
   asClientToDo,
   asControlMessage,
   asDoToClient,
+  asManifest,
   asSupervisorMessage,
   decodeClientToDo,
   decodeControlMessage,
   decodeDoToClient,
+  decodeManifest,
   decodeSupervisorMessage,
 } from '../src/validate';
 
@@ -326,6 +342,15 @@ function withField(base: Rec, path: string, value: unknown): Rec {
   return clone;
 }
 
+/** Read a dotted path (array indices included) out of a decoded message. */
+function readField(base: Rec, path: string): unknown {
+  let cursor: unknown = base;
+  for (const part of path.split('.')) {
+    cursor = (cursor as Rec)[part];
+  }
+  return cursor;
+}
+
 /** Delete a dotted path on a deep clone of `base`. */
 function withoutField(base: Rec, path: string): Rec {
   const clone = structuredClone(base);
@@ -339,6 +364,22 @@ function withoutField(base: Rec, path: string): Rec {
 }
 
 const names = Object.keys(CASES);
+
+/** Every `u64`-typed field on the wire (contracts.md §3), as a case + path.
+ *  These are the fields the fencing epoch and journal offsets travel in. */
+const U64_FIELDS: ReadonlyArray<readonly [string, string]> = [
+  ['hello', 'c.epoch'],
+  ['journal_frame', 'c.offset'],
+  ['snapshot_written', 'c.epoch'],
+  ['head_advance_request', 'c.epoch'],
+  ['rollback_detected', 'c.runs.0.control_offset'],
+  ['rollback_detected', 'c.runs.0.disk_offset'],
+  ['hello_ack', 'c.acked.0.offset'],
+  ['journal_ack', 'c.offset'],
+  ['head_advance_result', 'c.current_epoch'],
+  ['do_frame', 'offset'],
+  ['do_grid', 'baseOffset'],
+];
 
 describe('every message variant is structurally validated', () => {
   it('covers every variant of both wire envelopes and both attach directions', () => {
@@ -361,7 +402,10 @@ describe('every message variant is structurally validated', () => {
     it(`${name}: accepts the valid exemplar and returns it unchanged`, () => {
       const bytes = encodeCbor(testCase.valid);
       const decoded = decodeCbor(bytes) as Rec;
-      const before = structuredClone(decoded);
+      // An independent decode of the same bytes is the reference: a structured
+      // clone would swap Node's `Buffer` for a plain `Uint8Array` and the
+      // comparison would fail on the clone, not on the validator.
+      const before = decodeCbor(bytes) as Rec;
       const narrowed = narrowers[testCase.envelope](decoded);
       // No reallocation: the validator narrows in place, which is what keeps it
       // affordable on the per-frame journal path.
@@ -440,20 +484,7 @@ describe('required fields must be present, not merely well-typed when present', 
 // ---------------------------------------------------------------------------
 
 describe('u64 fields: a 2^53-crossing value is rejected loudly on every variant', () => {
-  const u64Fields: ReadonlyArray<readonly [string, string]> = [
-    ['hello', 'c.epoch'],
-    ['journal_frame', 'c.offset'],
-    ['snapshot_written', 'c.epoch'],
-    ['head_advance_request', 'c.epoch'],
-    ['rollback_detected', 'c.runs.0.control_offset'],
-    ['hello_ack', 'c.acked.0.offset'],
-    ['journal_ack', 'c.offset'],
-    ['head_advance_result', 'c.current_epoch'],
-    ['do_frame', 'offset'],
-    ['do_grid', 'baseOffset'],
-  ];
-
-  for (const [name, path] of u64Fields) {
+  for (const [name, path] of U64_FIELDS) {
     it(`${name}.${path} past 2^53 throws instead of silently rounding`, () => {
       const testCase = CASES[name]!;
       // Only a BigInt can put this on the wire: cbor.ts's encode-side
@@ -517,5 +548,254 @@ describe('unknown map keys follow the Rust side', () => {
       c: { manifest: 7, epoch: 3, future_field: 'from a newer marid' },
     });
     expect(() => decodeSupervisorMessage(bad)).toThrow(ValidationError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Normalization: the other half of the fencing guard
+// ---------------------------------------------------------------------------
+
+describe('an in-range BigInt is normalized to a Number on EVERY u64 field', () => {
+  // Rejecting the out-of-range case is only half the job. cbor.ts asks cbor-x
+  // for `int64AsNumber`, but a peer, a future codec option, or a hand-built
+  // message can still put a `bigint` in one of these fields — and a `bigint` is
+  // never `===` a `number`, which is precisely how a legitimate supervisor gets
+  // fenced out of its own computer (contracts.md §6). Normalizing in place is
+  // what makes the comparison hold.
+  for (const [name, path] of U64_FIELDS) {
+    it(`${name}.${path}`, () => {
+      const testCase = CASES[name]!;
+      const raw = withField(testCase.valid, path, 5n);
+      expect(readField(raw, path) === 5).toBe(false); // bigint in, `===` broken
+      const narrowed = narrowers[testCase.envelope](raw);
+      expect(narrowed).toBe(raw); // repaired in place, not reallocated
+      expect(typeof readField(raw, path)).toBe('number');
+      expect(readField(raw, path) === 5).toBe(true); // `===` restored
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The journal hot path
+// ---------------------------------------------------------------------------
+
+describe('journal_frame validation is O(1) in payload size', () => {
+  it('never reads a single byte of the payload, whatever its size', () => {
+    // Per-frame cost matters: `journal_frame` is the only message on the hot
+    // path. validate.ts records the measured ns/op (~29 ns on a 64 KiB frame,
+    // ~8% of the CBOR decode it follows, flat in size). This is the part of
+    // that claim a test can pin without timing: a Proxy over the byte string
+    // records every property read, and validation must make none of them —
+    // `instanceof` is a prototype check, not a read.
+    const touched: string[] = [];
+    const spy = new Proxy(new Uint8Array(1 << 20), {
+      get(target, key, receiver) {
+        touched.push(String(key));
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const msg = { t: 'journal_frame', c: { run: 'r1', offset: 4096, bytes: spy } };
+    expect(asSupervisorMessage(msg)).toBe(msg);
+    expect(touched).toEqual([]);
+  });
+
+  it('hands back the very same byte string, never a copy', () => {
+    const decoded = decodeCbor(encodeCbor(CASES['journal_frame']!.valid)) as Rec;
+    const bytesIn = (decoded['c'] as Rec)['bytes'];
+    const msg = asSupervisorMessage(decoded);
+    expect(msg.t).toBe('journal_frame');
+    if (msg.t === 'journal_frame') expect(msg.c.bytes).toBe(bytesIn);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Corners the per-variant table cannot reach
+// ---------------------------------------------------------------------------
+
+describe('ExitStatus: the signaled variant is validated too, not just exited', () => {
+  const completed = (exit: unknown) =>
+    encodeCbor({
+      t: 'run_completed',
+      c: { run: 'r1', exit, post_run_manifest: M('b'), diff: DIFF },
+    });
+
+  it('accepts a signaled exit unchanged', () => {
+    const msg = decodeSupervisorMessage(completed({ t: 'signaled', c: { signal: 9 } }));
+    expect(msg.t).toBe('run_completed');
+    if (msg.t === 'run_completed') {
+      expect(msg.c.exit).toEqual({ t: 'signaled', c: { signal: 9 } });
+    }
+  });
+
+  it('rejects a wrong-typed signal', () => {
+    expect(() => decodeSupervisorMessage(completed({ t: 'signaled', c: { signal: 'KILL' } }))).toThrow(
+      /run_completed\.exit\.c\.signal: expected an integer/,
+    );
+  });
+
+  it('rejects an exit whose payload is missing entirely', () => {
+    expect(() => decodeSupervisorMessage(completed({ t: 'exited' }))).toThrow(
+      /run_completed\.exit\.c: expected payload object/,
+    );
+  });
+
+  it('accepts a negative exit code but not one past i32', () => {
+    expect(decodeSupervisorMessage(completed({ t: 'exited', c: { code: -1 } })).t).toBe(
+      'run_completed',
+    );
+    expect(() =>
+      decodeSupervisorMessage(completed({ t: 'exited', c: { code: 2_147_483_648 } })),
+    ).toThrow(/run_completed\.exit\.c\.code: 2147483648 is outside the allowed range/);
+  });
+});
+
+describe('byte fields accept a Uint8Array from any realm, and nothing else', () => {
+  it('accepts a cross-realm Uint8Array (a Worker/Node boundary keeps the tag, not the identity)', () => {
+    const foreign = runInNewContext('new Uint8Array([1, 2, 3])') as Uint8Array;
+    expect(foreign instanceof Uint8Array).toBe(false);
+    const msg = { t: 'journal_frame', c: { run: 'r1', offset: 0, bytes: foreign } };
+    expect(asSupervisorMessage(msg)).toBe(msg);
+  });
+
+  it('rejects other views over the same buffer', () => {
+    const buf = new ArrayBuffer(4);
+    for (const view of [new DataView(buf), new Int8Array(buf), new Uint16Array(buf)]) {
+      expect(() => asControlMessage({ t: 'input', c: { run: 'r1', bytes: view } })).toThrow(
+        /input\.bytes: expected a CBOR byte string/,
+      );
+    }
+  });
+});
+
+describe('the u64 guard covers the manifest too, not only the wire envelopes', () => {
+  const ENTRY: Rec = {
+    path: '/a',
+    kind: 'file',
+    mode: 33188,
+    size: 12,
+    symlink_target: null,
+    chunks: [{ chunk: M('a'), len: 12 }],
+  };
+  const manifest = (over: Rec) =>
+    encodeCbor({ version: 1, parent: null, created_at: 1, entries: [{ ...ENTRY, ...over }] });
+
+  it('rejects an entry size past 2^53', () => {
+    expect(() => decodeManifest(manifest({ size: PAST_U53 }))).toThrow(
+      /Manifest\.entries\[0\]\.size: u64 .*2\^53/,
+    );
+  });
+
+  it('rejects a chunk len past 2^53', () => {
+    expect(() => decodeManifest(manifest({ chunks: [{ chunk: M('a'), len: PAST_U53 }] }))).toThrow(
+      /Manifest\.entries\[0\]\.chunks\[0\]\.len: u64 .*2\^53/,
+    );
+  });
+
+  it('rejects a created_at past 2^53', () => {
+    expect(() =>
+      decodeManifest(encodeCbor({ version: 1, parent: null, created_at: PAST_U53, entries: [] })),
+    ).toThrow(/Manifest\.created_at: u64 .*2\^53/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lockstep with mari-proto: the accepted sets come from the Rust source
+// ---------------------------------------------------------------------------
+
+// Restricting a field to a known set introduces a failure mode of its own: if
+// `marid` grows a variant this mirror has not learned, a perfectly conformant
+// frame is rejected — and on the supervisor ingest path that means the frame is
+// DROPPED (computer-do.ts ignores an undecodable frame). contracts.md §8 keeps
+// the two sides in lockstep with fixtures; these tests extend that to the tag
+// and enum SETS by reading them out of `crates/mari-proto` directly, so adding
+// a Rust variant fails here until the TypeScript side learns it.
+
+const PROTO_SRC = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  '..',
+  'crates',
+  'mari-proto',
+  'src',
+);
+
+/** Wire tags of a `#[serde(rename_all = "snake_case")]` Rust enum. */
+function rustTags(file: string, enumName: string): string[] {
+  const src = readFileSync(join(PROTO_SRC, file), 'utf8');
+  const head = src.indexOf(`pub enum ${enumName} {`);
+  expect(head, `pub enum ${enumName} in ${file}`).toBeGreaterThan(-1);
+  // The casing map (contracts.md §1) only holds because of this attribute, and
+  // it must be THIS enum's (the last one before the declaration), not an
+  // earlier type's.
+  const preamble = src.slice(0, head);
+  expect(preamble.slice(preamble.lastIndexOf('#[serde('))).toMatch(
+    /^#\[serde\([^\n]*rename_all = "snake_case"[^\n]*\)\]\n$/,
+  );
+  const body = src.slice(head, src.indexOf('\n}', head)).split('\n').slice(1);
+  const variants = body
+    .map((line) => /^ {4}([A-Z][A-Za-z0-9]*)\s*[{(,]/.exec(line)?.[1])
+    .filter((v): v is string => v !== undefined);
+  expect(variants.length).toBeGreaterThan(0);
+  return variants.map((v) => v.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase());
+}
+
+describe('the accepted tag and enum sets match mari-proto exactly', () => {
+  it('SupervisorMessage: every Rust variant is a known tag here, and is covered above', () => {
+    const tags = rustTags('messages.rs', 'SupervisorMessage');
+    expect([...tags].sort()).toEqual(
+      names.filter((n) => CASES[n]!.envelope === 'supervisor').sort(),
+    );
+    for (const t of tags) {
+      // A KNOWN tag fails on its payload; an unknown one fails on the tag.
+      expect(() => asSupervisorMessage({ t })).toThrow(
+        new RegExp(`^${t}\\.c: expected payload object`),
+      );
+    }
+  });
+
+  it('ControlMessage: same, with prepare_for_cold payload-free', () => {
+    const tags = rustTags('messages.rs', 'ControlMessage');
+    expect([...tags].sort()).toEqual(
+      [...names.filter((n) => CASES[n]!.envelope === 'control'), 'prepare_for_cold'].sort(),
+    );
+    for (const t of tags) {
+      if (t === 'prepare_for_cold') {
+        expect(asControlMessage({ t })).toEqual({ t });
+        continue;
+      }
+      expect(() => asControlMessage({ t })).toThrow(
+        new RegExp(`^${t}\\.c: expected payload object`),
+      );
+    }
+  });
+
+  it('AttentionKind / SnapshotReason / EntryKind / ExitStatus values are all accepted', () => {
+    for (const kind of rustTags('messages.rs', 'AttentionKind')) {
+      expect(asSupervisorMessage({ t: 'attention', c: { run: 'r1', kind } }).t).toBe('attention');
+    }
+    for (const reason of rustTags('manifest.rs', 'SnapshotReason')) {
+      expect(asControlMessage({ t: 'snapshot_now', c: { reason } }).t).toBe('snapshot_now');
+      expect(
+        asSupervisorMessage({ t: 'snapshot_written', c: { manifest: M('c'), epoch: 1, reason } }).t,
+      ).toBe('snapshot_written');
+    }
+    for (const kind of rustTags('manifest.rs', 'EntryKind')) {
+      const entry = { path: '/a', kind, mode: 0, size: 0, symlink_target: null, chunks: [] };
+      expect(
+        asManifest({ version: 1, parent: null, created_at: 0, entries: [entry] }).entries[0]?.kind,
+      ).toBe(kind);
+    }
+    for (const t of rustTags('messages.rs', 'ExitStatus')) {
+      // Both payload keys are supplied; each variant must accept its own and
+      // ignore the other (unknown keys are ignored, as above).
+      const exit = { t, c: { code: 0, signal: 0 } };
+      expect(
+        asSupervisorMessage({
+          t: 'run_completed',
+          c: { run: 'r1', exit, post_run_manifest: M('b'), diff: DIFF },
+        }).t,
+      ).toBe('run_completed');
+    }
   });
 });

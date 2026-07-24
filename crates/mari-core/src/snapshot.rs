@@ -20,6 +20,7 @@ use walkdir::WalkDir;
 
 use crate::chunker::{self, ChunkerConfig};
 use crate::error::{Error, Result};
+use crate::rootfs::{manifest_components, RootDir};
 use crate::store::ChunkStore;
 
 /// Options controlling a snapshot.
@@ -142,6 +143,11 @@ pub async fn snapshot(
         .map_err(|m| Error::InvalidManifest(format!("chunker config: {m}")))?;
     let root = dir.as_ref();
     let excludes = Excludes::compile(&opts.exclude)?;
+    // `walkdir` enumerates without following symlinks, but it re-resolves each
+    // path it hands back, so a component swapped under it mid-walk would make a
+    // plain `std::fs::read` read a file outside the root into the manifest.
+    // Every read below is therefore anchored to this descriptor instead.
+    let mut rootfs = RootDir::open(root)?;
 
     let mut entries: Vec<ManifestEntry> = Vec::new();
     let mut unique: HashMap<ChunkId, Vec<u8>> = HashMap::new();
@@ -184,9 +190,9 @@ pub async fn snapshot(
                 chunks: Vec::new(),
             });
         } else if ft.is_symlink() {
-            let target = std::fs::read_link(entry.path())
-                .map_err(|e| Error::io(entry.path().display().to_string(), e))?;
-            let target = target.to_str().ok_or_else(|| {
+            let comps = manifest_components(&mpath)?;
+            let raw = rootfs.read_link(&comps)?;
+            let target = String::from_utf8(raw).map_err(|_| {
                 Error::InvalidManifest(format!("non-utf8 symlink target at {mpath}"))
             })?;
             entries.push(ManifestEntry {
@@ -194,12 +200,15 @@ pub async fn snapshot(
                 kind: EntryKind::Symlink,
                 mode,
                 size: target.len() as u64,
-                symlink_target: Some(target.to_string()),
+                symlink_target: Some(target),
                 chunks: Vec::new(),
             });
         } else if ft.is_file() {
-            let data = std::fs::read(entry.path())
-                .map_err(|e| Error::io(entry.path().display().to_string(), e))?;
+            let comps = manifest_components(&mpath)?;
+            // Root-anchored read: refuses a symlink in any position, and takes
+            // the mode from the very descriptor the bytes came out of, so the
+            // recorded mode always belongs to the recorded content.
+            let (data, mode) = rootfs.read_file(&comps)?;
             let mut chunks = Vec::new();
             for c in chunker::cut(&data, &opts.chunker) {
                 let slice = &data[c.offset..c.offset + c.len];

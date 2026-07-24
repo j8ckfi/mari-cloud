@@ -983,6 +983,7 @@ dependencies = [
  "mari-proto",
  "opendal",
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures_util::StreamExt;
 use mari_core::{
-    ChunkStore, EntryKind, HeatRecorder, Manifest, RestoreOptions, SnapshotOptions,
+    ChunkStore, EntryKind, HeatRecorder, Manifest, RestoreOptions, RootDir, SnapshotOptions,
     default_credential_excludes, load_heat, restore, snapshot, store_heat,
 };
 use mari_proto::{
@@ -572,6 +572,19 @@ async fn revert_to_manifest(shared: &Arc<Shared>, manifest_id: &ManifestId) -> R
 /// also removed, so the following [`restore`] recreates it correctly and never
 /// writes *through* a stale symlink. Best-effort: a removal error is logged, not
 /// fatal — the restore still runs.
+///
+/// # Deleting cannot escape the root either
+///
+/// Every removal goes through [`RootDir`], not through the path `walkdir`
+/// composed. `walkdir` does not *follow* symlinks while it enumerates, so it
+/// never descends into one — but each path it hands back is re-resolved from
+/// scratch by `std::fs::remove_file`, and this prune runs against a **live**
+/// root whose processes are not necessarily gone. A run that swaps a directory
+/// for a symlink to `/etc` between the walk and the removal would turn the
+/// prune into `unlink("/etc/…")`: the restore-side write primitive, pointed the
+/// other way. [`RootDir::remove_path`] walks each component `O_NOFOLLOW` from a
+/// descriptor it already holds, so such a swap makes the removal *fail* (a
+/// logged [`mari_core::Error::UnsafePath`]) instead of landing outside.
 fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
     let patterns: Vec<glob::Pattern> = excludes
         .iter()
@@ -582,6 +595,17 @@ fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
         .iter()
         .map(|e| (e.path.as_str(), e.kind))
         .collect();
+
+    // The anchor every removal below is resolved against. It caches the
+    // descriptors of the prefix it last walked, and `contents_first` groups
+    // siblings, so this costs about one `openat` per directory.
+    let mut rootfs = match RootDir::open(root) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(path = %root.display(), "revert prune: cannot open root: {e}");
+            return;
+        }
+    };
 
     // `contents_first` yields children before their parent, so a directory is
     // only visited once its extraneous children have already been removed.
@@ -623,20 +647,16 @@ fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
         if in_manifest.get(mpath.as_str()) == Some(&on_disk) {
             continue;
         }
-        // Extraneous, or a kind conflict: remove it.
-        let result = if on_disk == EntryKind::Dir {
-            std::fs::remove_dir(path)
-        } else {
-            // Removes the symlink itself, not its target (no follow).
-            std::fs::remove_file(path)
-        };
-        if let Err(e) = result {
+        // Extraneous, or a kind conflict: remove it. Root-anchored — a symlink
+        // is unlinked, never followed, and a directory only when it is empty.
+        match rootfs.remove_path(&mpath) {
+            Ok(_) => {}
             // A directory that still has a *preserved* (excluded) child inside it
             // cannot be removed, and should not be — that is expected.
-            if on_disk == EntryKind::Dir && e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
-                continue;
-            }
-            warn!(path = %path.display(), "revert prune: remove failed: {e}");
+            Err(mari_core::Error::Io { ref source, .. })
+                if on_disk == EntryKind::Dir
+                    && source.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => warn!(path = %path.display(), "revert prune: remove failed: {e}"),
         }
     }
 }
@@ -852,6 +872,79 @@ mod supervisor_tests {
             std::fs::read(&sentinel).unwrap(),
             b"DO-NOT-TOUCH",
             "revert must not write through a stale symlink"
+        );
+    }
+
+    /// The prune half of the revert must not escape either. A run that leaves a
+    /// directory symlink pointing outside the root — both at a path the manifest
+    /// does not know, and at a path the manifest declares a *directory* — must
+    /// have the link itself unlinked. Nothing at the link's target may be read,
+    /// removed, or written, in the prune or in the restore that follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revert_prune_unlinks_an_escaping_symlink_and_never_deletes_its_target() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        let outside = outside_dir.path();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+
+        // Files outside the root that the revert must leave completely alone.
+        std::fs::write(outside.join("keep.txt"), b"OUTSIDE-KEEP").unwrap();
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        std::fs::write(outside.join("nested/deep.txt"), b"OUTSIDE-DEEP").unwrap();
+
+        // Pre-run tree: a file and a real directory with a child.
+        std::fs::write(root.join("f.txt"), b"real-contents").unwrap();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/inner.txt"), b"inner").unwrap();
+        let opts = SnapshotOptions {
+            exclude: mari_excludes(),
+            created_at: 1,
+            ..SnapshotOptions::default()
+        };
+        let pre = snapshot(&store, root, &opts).await.unwrap();
+
+        // The run leaves two escaping symlinks behind:
+        //  - `/escape`, a path the manifest has never heard of;
+        //  - `/d`, a path the manifest declares a directory.
+        std::fs::remove_file(root.join("d/inner.txt")).unwrap();
+        std::fs::remove_dir(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside, root.join("d")).unwrap();
+
+        let (shared, _rx) = test_shared(root, store, "ws://unused");
+        revert_to_manifest(&shared, &pre.manifest_id).await.unwrap();
+
+        // Both links are gone — unlinked, not followed.
+        assert!(
+            std::fs::symlink_metadata(root.join("escape")).is_err(),
+            "the extraneous symlink must be pruned"
+        );
+        // And `/d` is the manifest's real directory again, with its child.
+        let d_meta = std::fs::symlink_metadata(root.join("d")).unwrap();
+        assert!(
+            d_meta.file_type().is_dir(),
+            "/d must be a real directory again, not a symlink"
+        );
+        assert_eq!(std::fs::read(root.join("d/inner.txt")).unwrap(), b"inner");
+        assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"real-contents");
+
+        // Nothing outside the root was touched: same entries, same bytes.
+        let mut names: Vec<String> = std::fs::read_dir(outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["keep.txt".to_string(), "nested".to_string()],
+            "the revert added to or removed from a directory outside the root"
+        );
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"OUTSIDE-KEEP");
+        assert_eq!(
+            std::fs::read(outside.join("nested/deep.txt")).unwrap(),
+            b"OUTSIDE-DEEP"
         );
     }
 

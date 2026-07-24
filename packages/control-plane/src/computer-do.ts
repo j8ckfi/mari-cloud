@@ -16,7 +16,7 @@ import {
   encodeFrame,
   FrameReader,
   encodeCbor,
-  decodeCbor,
+  decodeClientToDo,
   decodeSupervisorMessage,
   type ComputerState,
   type ControlMessage,
@@ -194,8 +194,16 @@ export interface SnapshotCommandResult {
 
 /** Result of a wake (materialize/resume): the fencing token the supervisor must
  *  echo in `hello`. The supervisor connects INBOUND to the DO, so no outbound
- *  address is needed here; exposed ports are resolved lazily via exposePort. */
+ *  address is needed here; exposed ports are resolved lazily via exposePort.
+ *
+ *  A substrate that refuses is a RESULT, not a rejection — the same convention
+ *  the other DO decisions use (`DispositionResult`, `SnapshotCommandResult`).
+ *  `ok: false` carries the state the computer actually landed in; `token` is
+ *  then empty and must not be used. */
 export interface WakeResult {
+  ok: boolean;
+  /** `wake_failed` when the substrate refused, else `null`. */
+  error: string | null;
   state: ComputerState;
   epoch: number;
   token: string;
@@ -516,7 +524,9 @@ export class ComputerDO extends DurableObject<Env> {
   }
 
   /** Ensure the computer is AWAKE, minting a new fencing epoch on each COLD/WARM
-   *  -> AWAKE transition (contracts.md §6). Returns the fencing token.
+   *  -> AWAKE transition (contracts.md §6). Returns the fencing token, or
+   *  `ok: false` and the state the computer landed in when the substrate refused
+   *  (see `#failWake`) — CHECK IT before using `token`.
    *
    *  Concurrent callers share ONE wake: a queued run, a file write and a proxy
    *  request arriving together must not materialize the computer three times. */
@@ -546,7 +556,13 @@ export class ComputerDO extends DurableObject<Env> {
     if (this.#meta.state === 'awake' && this.#meta.token && this.#meta.handle) {
       await this.#touch();
       await this.#persist();
-      return { state: 'awake', epoch: this.#meta.epoch, token: this.#meta.token };
+      return {
+        ok: true,
+        error: null,
+        state: 'awake',
+        epoch: this.#meta.epoch,
+        token: this.#meta.token,
+      };
     }
 
     const wasWarm = this.#meta.state === 'warm' && this.#meta.handle !== null;
@@ -585,8 +601,25 @@ export class ComputerDO extends DurableObject<Env> {
         });
       }
     } catch (err) {
+      // A substrate that refuses is an OUTCOME of a wake, not an exception in
+      // the control plane: it is reported as a result so every caller has to
+      // look at it, and so a failed wake cannot become an unhandled rejection
+      // crossing the DO's RPC boundary. A client learns `wake_failed` and the
+      // state it landed in, never a provider's internals — but the operator has
+      // to learn WHY, and no substrate driver logs on its own, so the reason is
+      // recorded here and nowhere else.
+      console.warn(
+        `mari: wake failed computer=${computer} epoch=${this.#meta.epoch} ` +
+          `path=${wasWarm ? 'resume' : 'materialize'}: ${err instanceof Error ? err.message : String(err)}`,
+      );
       await this.#failWake(wasWarm);
-      throw err;
+      return {
+        ok: false,
+        error: 'wake_failed',
+        state: this.#meta.state,
+        epoch: this.#meta.epoch,
+        token: '',
+      };
     }
     this.#meta.state = 'awake';
     this.#meta.wakeFailures = 0;
@@ -598,7 +631,7 @@ export class ComputerDO extends DurableObject<Env> {
     await this.#persist();
     await this.#syncFleetState();
     this.#emit({ type: 'state', state: 'awake' });
-    return { state: 'awake', epoch: this.#meta.epoch, token };
+    return { ok: true, error: null, state: 'awake', epoch: this.#meta.epoch, token };
   }
 
   /**
@@ -614,7 +647,7 @@ export class ComputerDO extends DurableObject<Env> {
    * computer (spec 4.1).
    *
    * So: fall back to the state the substrate is actually in, tell the fleet and
-   * the event stream, and let the caller see the error (`wake()` rethrows).
+   * the event stream, and hand the caller `ok: false` (see `WakeResult`).
    * The epoch stays where it is — it is monotonic by contract (contracts.md §6);
    * a wake that failed still burned one, which costs nothing but a number.
    */
@@ -1199,15 +1232,11 @@ export class ComputerDO extends DurableObject<Env> {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       return new Response('bad port', { status: 400 });
     }
-    let woken: WakeResult;
-    try {
-      woken = await this.wake();
-    } catch {
-      // The substrate refused (capacity, image, daemon). The computer has been
-      // rolled back out of WAKING; tell the requester plainly rather than
-      // leaving a hung preview request behind a permanent spinner (spec 8.3).
-      return new Response('wake failed', { status: 503 });
-    }
+    const woken = await this.wake();
+    // The substrate refused (capacity, image, daemon). The computer has been
+    // rolled back out of WAKING; tell the requester plainly rather than leaving
+    // a preview request hanging behind a spinner that never resolves (spec 8.3).
+    if (!woken.ok) return new Response('wake failed', { status: 503 });
     if (!this.#meta.handle) return new Response('no substrate handle', { status: 502 });
     const exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
     const target = exposedUrl.replace(/\/$/, '') + url.pathname + url.search;
@@ -1502,15 +1531,25 @@ export class ComputerDO extends DurableObject<Env> {
 
   /** Recorded journal ingest anomalies, newest first (ops + tests). */
   async journalAnomalies(run?: string): Promise<JournalAnomaly[]> {
+    // The row shape is what SQLite hands back (`kind` is a bare string there);
+    // the narrowing to `JournalAnomalyKind` happens in the mapping below.
+    type AnomalyRow = {
+      id: number;
+      run: string;
+      kind: string;
+      atOffset: number;
+      len: number;
+      at: number;
+    };
     const rows = run
       ? [
-          ...this.ctx.storage.sql.exec<JournalAnomaly>(
+          ...this.ctx.storage.sql.exec<AnomalyRow>(
             `SELECT id, run, kind, atOffset, len, at FROM journal_anomaly WHERE run = ? ORDER BY id DESC`,
             run,
           ),
         ]
       : [
-          ...this.ctx.storage.sql.exec<JournalAnomaly>(
+          ...this.ctx.storage.sql.exec<AnomalyRow>(
             `SELECT id, run, kind, atOffset, len, at FROM journal_anomaly ORDER BY id DESC`,
           ),
         ];
@@ -1777,7 +1816,11 @@ export class ComputerDO extends DurableObject<Env> {
     server.addEventListener('message', (event: MessageEvent) => {
       let msg: ClientToDo;
       try {
-        msg = decodeCbor(toBytes(event.data as ArrayBuffer)) as ClientToDo;
+        // Validated, not cast: this is browser-supplied input. `cols`/`rows`
+        // in particular are re-framed as `ControlMessage::Resize { cols: u16,
+        // rows: u16 }` for the supervisor, and an unbounded number there would
+        // put a frame on the wire that ciborium cannot decode.
+        msg = decodeClientToDo(toBytes(event.data as ArrayBuffer));
       } catch {
         return;
       }

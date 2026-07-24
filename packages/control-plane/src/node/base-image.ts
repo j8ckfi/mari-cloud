@@ -85,7 +85,11 @@ export async function ensureBaseManifest(
   log(`base image ${image}: snapshotting its computer root once (spec §2)`);
 
   try {
-    await stub.wake(id);
+    const woken = await stub.wake(id);
+    // The bootstrap has nothing to fall back on: without this computer there is
+    // no base manifest, so a refused wake must fail loudly, not silently poll a
+    // computer that was never materialized.
+    if (!woken.ok) throw new Error(`base image ${image}: wake failed (${woken.state})`);
 
     // `snapshotNow` is refused until a supervisor has completed its handshake,
     // so polling it is both "is marid up?" and the snapshot request itself.
