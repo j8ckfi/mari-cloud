@@ -45,7 +45,7 @@ pub use gc::{
 };
 pub use heat::{load_heat, store_heat, HeatRecorder};
 pub use restore::{restore, RestoreOptions, RestoreStats};
-pub use rootfs::{manifest_components, RootDir};
+pub use rootfs::{manifest_components, RootDir, RootWalk, WalkEntry};
 pub use snapshot::{
     default_credential_excludes, delta_chunks, manifest_chunks, snapshot, SnapshotOptions,
     SnapshotResult,

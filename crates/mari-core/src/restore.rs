@@ -30,6 +30,19 @@
 //! stale symlink behind would be a denial of service on the recovery path. Only
 //! the conflicting node is removed — a symlink is unlinked, never followed, and
 //! a directory only when it is empty.
+//!
+//! # Declared sizes are claims, not facts
+//!
+//! Every number in a manifest is untrusted for the same reason its paths are:
+//! restore runs on the supervisor's cold-wake path, against a manifest a run
+//! may have influenced. A file entry's `size` is therefore never handed to the
+//! allocator on the entry's own say-so — an entry declaring `u64::MAX` would
+//! abort the process with "capacity overflow" long before any chunk was read,
+//! turning a hostile manifest into a crash of a daemon. Sizes are cross-checked
+//! against the chunk-length sum up front (pass 0, before a single byte is
+//! written), and the reassembly buffer past [`MAX_PREALLOC`] grows only as
+//! verified chunk bytes actually arrive from the store. Nothing in this module
+//! panics on manifest content: every inconsistency is an [`Error`].
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -39,8 +52,15 @@ use std::path::Path;
 use mari_proto::{EntryKind, Manifest, ManifestEntry};
 
 use crate::error::{Error, Result};
-use crate::rootfs::{manifest_components, RootDir};
+use crate::rootfs::{manifest_components_under, RootDir};
 use crate::store::ChunkStore;
+
+/// The most a restore will reserve for a file *before* it has read the
+/// corresponding bytes back from the store. A file smaller than this gets its
+/// buffer in one allocation, as before; anything larger grows incrementally, so
+/// the peak reservation an untrusted `size` can command is bounded by the bytes
+/// the store really produced, not by the number in the manifest.
+pub const MAX_PREALLOC: usize = 8 * 1024 * 1024;
 
 /// Options controlling a restore.
 #[derive(Clone, Debug, Default)]
@@ -76,17 +96,21 @@ pub async fn restore(
     let root = dir.as_ref();
     std::fs::create_dir_all(root).map_err(|e| Error::io(root.display().to_string(), e))?;
 
-    // Validate every path up front so a traversal attempt aborts before any
-    // write happens. The components are what every later pass operates on: the
-    // composed path string is never handed to the kernel.
+    // Validate every path — and every declared file size — up front, so a
+    // traversal attempt or a hostile size aborts before any write happens. The
+    // components are what every later pass operates on: the composed path
+    // string is never handed to the kernel.
     let mut targets: Vec<Vec<String>> = Vec::with_capacity(manifest.entries.len());
     for e in &manifest.entries {
-        let comps = manifest_components(&e.path)?;
+        let comps = manifest_components_under(root, &e.path)?;
         if comps.is_empty() && e.kind != EntryKind::Dir {
             return Err(Error::InvalidManifest(format!(
                 "entry {:?} names the restore root but is a {:?}, not a directory",
                 e.path, e.kind
             )));
+        }
+        if e.kind == EntryKind::File {
+            check_declared_size(e)?;
         }
         targets.push(comps);
     }
@@ -164,6 +188,33 @@ pub async fn restore(
     Ok(stats)
 }
 
+/// Cross-check a file entry's declared `size` against the length its own chunk
+/// list accounts for. This is what makes `size` safe to size an allocation
+/// with: on its own it is an arbitrary `u64` an adversary chose, and reserving
+/// against it aborts the process rather than failing the restore.
+///
+/// The sum itself is computed with `checked_add` — chunk lengths are equally
+/// untrusted, and a list engineered to wrap `u64` would otherwise "agree" with
+/// a small declared size.
+fn check_declared_size(entry: &ManifestEntry) -> Result<()> {
+    let mut sum: u64 = 0;
+    for cref in &entry.chunks {
+        sum = sum.checked_add(cref.len).ok_or_else(|| {
+            Error::InvalidManifest(format!("chunk lengths of {} sum past u64::MAX", entry.path))
+        })?;
+    }
+    if sum != entry.size {
+        return Err(Error::InvalidManifest(format!(
+            "file {} declares size {} but its {} chunk(s) account for {} bytes",
+            entry.path,
+            entry.size,
+            entry.chunks.len(),
+            sum
+        )));
+    }
+    Ok(())
+}
+
 /// Reassemble one file from its chunks (each verified on read), write it, and
 /// set its mode. The file is created through the root-anchored resolver, so a
 /// symlink at the target — or at any parent component — is replaced rather than
@@ -175,7 +226,21 @@ async fn write_file(
     comps: &[String],
     stats: &mut RestoreStats,
 ) -> Result<()> {
-    let mut content: Vec<u8> = Vec::with_capacity(entry.size as usize);
+    // `restore` already vetted this size, but the check is cheap and this
+    // function must not depend on its caller for memory safety.
+    check_declared_size(entry)?;
+
+    // Reserve a bounded amount up front and let the rest follow the bytes that
+    // actually arrive; `try_reserve` turns an allocation failure into a typed
+    // error instead of an abort, which matters because marid awaits this on the
+    // cold-wake path.
+    let prealloc = usize::try_from(entry.size)
+        .unwrap_or(usize::MAX)
+        .min(MAX_PREALLOC);
+    let mut content: Vec<u8> = Vec::new();
+    content
+        .try_reserve(prealloc)
+        .map_err(|_| out_of_memory(entry, prealloc))?;
     for cref in &entry.chunks {
         let bytes = store.get_chunk(&cref.chunk).await?;
         if bytes.len() as u64 != cref.len {
@@ -187,6 +252,9 @@ async fn write_file(
                 cref.len
             )));
         }
+        content
+            .try_reserve(bytes.len())
+            .map_err(|_| out_of_memory(entry, bytes.len()))?;
         content.extend_from_slice(&bytes);
     }
     if content.len() as u64 != entry.size {
@@ -211,4 +279,66 @@ async fn write_file(
     stats.bytes += entry.size;
     stats.file_order.push(entry.path.clone());
     Ok(())
+}
+
+/// The reassembly buffer could not be grown. Reported as an I/O error naming
+/// the entry, so a caller sees which file exhausted memory rather than losing
+/// the daemon to an allocation abort.
+fn out_of_memory(entry: &ManifestEntry, wanted: usize) -> Error {
+    Error::io(
+        entry.path.clone(),
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("cannot reserve {wanted} more bytes to reassemble this file"),
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mari_proto::{ChunkId, ChunkRef};
+
+    fn entry(size: u64, lens: &[u64]) -> ManifestEntry {
+        ManifestEntry {
+            path: "/f".to_string(),
+            kind: EntryKind::File,
+            mode: 0o100644,
+            size,
+            symlink_target: None,
+            chunks: lens
+                .iter()
+                .map(|&len| ChunkRef {
+                    chunk: ChunkId::new("0".repeat(64)),
+                    len,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_size_its_chunks_account_for_is_accepted() {
+        check_declared_size(&entry(7, &[3, 4])).unwrap();
+        check_declared_size(&entry(0, &[])).unwrap();
+    }
+
+    #[test]
+    fn a_declared_size_no_chunk_backs_is_rejected() {
+        // The allocation an unvalidated manifest used to command.
+        let err = check_declared_size(&entry(u64::MAX, &[])).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidManifest(_)),
+            "expected InvalidManifest, got {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_lengths_that_wrap_u64_are_rejected_not_wrapped() {
+        // Summing with `+` would wrap to 3 and "agree" with the declared size.
+        let err = check_declared_size(&entry(3, &[u64::MAX, 4])).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidManifest(_)),
+            "expected InvalidManifest, got {err}"
+        );
+    }
 }

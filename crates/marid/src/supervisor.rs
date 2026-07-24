@@ -547,6 +547,17 @@ fn spawn_heartbeat(shared: Arc<Shared>) {
 /// entries — preserving the supervisor's own `.mari` state and the excluded
 /// credential paths (spec 10.1), which are legitimately on disk but absent from
 /// the manifest — and only then restores the manifest over the top.
+///
+/// # Why an unaccounted-for entry fails the whole revert
+///
+/// "Authoritative" is a claim about the *whole* tree, and the prune is the only
+/// pass that can make it: [`restore`] writes what the manifest names and looks at
+/// nothing else. So an entry the prune could not enumerate is not a lost log
+/// line — it is a piece of the run still on disk, in a tree this function is
+/// about to report as the pre-run tree. The restore still runs first (a tree
+/// closer to the manifest beats a half-pruned one), and then the error goes back
+/// to the caller, which is the only place that can tell the user the revert did
+/// not fully take.
 async fn revert_to_manifest(shared: &Arc<Shared>, manifest_id: &ManifestId) -> Result<()> {
     let manifest = shared.store.get_manifest(manifest_id).await?;
     let heat = load_heat(&shared.store, &shared.computer)
@@ -556,12 +567,38 @@ async fn revert_to_manifest(shared: &Arc<Shared>, manifest_id: &ManifestId) -> R
         .unwrap_or_default();
     // Prune first, so the following restore lands on a tree that contains nothing
     // the manifest does not (except the preserved excludes).
-    prune_to_manifest(&shared.config.root, &manifest, &shared.excludes());
+    let pruned = prune_to_manifest(&shared.config.root, &manifest, &shared.excludes());
     let opts = RestoreOptions {
         priority: heat.paths,
     };
     restore(&shared.store, &manifest, &shared.config.root, &opts).await?;
+    if pruned.walk_errors > 0 {
+        anyhow::bail!(
+            "revert to {manifest_id} is not authoritative: the prune could not account for \
+             {} entr{} under {} (see the warnings above); the restored tree may still hold \
+             files the run added",
+            pruned.walk_errors,
+            if pruned.walk_errors == 1 { "y" } else { "ies" },
+            shared.config.root.display()
+        );
+    }
     Ok(())
+}
+
+/// What one [`prune_to_manifest`] pass did. Returned rather than only logged:
+/// `walk_errors` is what separates "the prune left exactly what it decided to
+/// leave" from "the prune does not know what it left", and only the caller can
+/// act on that difference.
+#[derive(Debug, Default)]
+pub(crate) struct PruneOutcome {
+    /// Extraneous or wrong-kind nodes actually removed.
+    removed: usize,
+    /// Removals that failed with something other than "directory not empty".
+    refused: usize,
+    /// Entries the anchored walk could not account for: a directory it could not
+    /// open or read, or a name with no manifest form. Each one is an unknown
+    /// amount of the run's tree left standing.
+    walk_errors: usize,
 }
 
 /// Remove every on-disk entry under `root` that `manifest` does not contain and
@@ -570,22 +607,34 @@ async fn revert_to_manifest(shared: &Arc<Shared>, manifest_id: &ManifestId) -> R
 /// manifest *does* contain but whose on-disk kind conflicts with it (a stale
 /// symlink where the manifest has a file, a directory where it has a file, …) is
 /// also removed, so the following [`restore`] recreates it correctly and never
-/// writes *through* a stale symlink. Best-effort: a removal error is logged, not
-/// fatal — the restore still runs.
+/// writes *through* a stale symlink. A removal error is logged and the pass
+/// continues — but it is also counted, and the counts go back to the caller.
 ///
-/// # Deleting cannot escape the root either
+/// # Enumerating has to be as anchored as removing
 ///
-/// Every removal goes through [`RootDir`], not through the path `walkdir`
-/// composed. `walkdir` does not *follow* symlinks while it enumerates, so it
-/// never descends into one — but each path it hands back is re-resolved from
-/// scratch by `std::fs::remove_file`, and this prune runs against a **live**
-/// root whose processes are not necessarily gone. A run that swaps a directory
-/// for a symlink to `/etc` between the walk and the removal would turn the
+/// Every removal goes through [`RootDir`], and so does every step of the walk.
+/// Both matter, for different reasons.
+///
+/// *Removal:* this prune runs against a **live** root whose processes are not
+/// necessarily gone. A run that swaps a directory for a symlink to `/etc`
+/// between the walk and the removal would, with a re-resolved path, turn the
 /// prune into `unlink("/etc/…")`: the restore-side write primitive, pointed the
 /// other way. [`RootDir::remove_path`] walks each component `O_NOFOLLOW` from a
 /// descriptor it already holds, so such a swap makes the removal *fail* (a
 /// logged [`mari_core::Error::UnsafePath`]) instead of landing outside.
-fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
+///
+/// *Enumeration:* this used to be `walkdir`, which composes a full path for
+/// every entry. A run can build a subtree deeper than `PATH_MAX` with nothing
+/// but relative `mkdir`s, and `walkdir` hands back one error instead of the
+/// entries below that depth. The prune then removed nothing there, every
+/// ancestor above it failed with the "directory not empty" this function treats
+/// as *expected*, and the whole subtree survived the revert without a word.
+/// [`RootDir::walk`] reads each directory through the descriptor its parent
+/// handed over — the kernel never resolves more than one component — so depth
+/// costs a descriptor and nothing else, and what it still cannot account for
+/// arrives as an `Err` this function counts instead of discarding.
+fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) -> PruneOutcome {
+    let mut out = PruneOutcome::default();
     let patterns: Vec<glob::Pattern> = excludes
         .iter()
         .filter_map(|g| glob::Pattern::new(g).ok())
@@ -597,68 +646,68 @@ fn prune_to_manifest(root: &Path, manifest: &Manifest, excludes: &[String]) {
         .collect();
 
     // The anchor every removal below is resolved against. It caches the
-    // descriptors of the prefix it last walked, and `contents_first` groups
-    // siblings, so this costs about one `openat` per directory.
+    // descriptors of the prefix it last walked, and the walk's contents-first
+    // order groups siblings, so this costs about one `openat` per directory.
     let mut rootfs = match RootDir::open(root) {
         Ok(r) => r,
         Err(e) => {
             warn!(path = %root.display(), "revert prune: cannot open root: {e}");
-            return;
+            // Not one entry was examined: the tree is entirely unaccounted for.
+            out.walk_errors += 1;
+            return out;
+        }
+    };
+    // The walk owns its own descriptors, so `rootfs` stays free to remove while
+    // it iterates. Children come before their parent, so a directory is only
+    // reached once its extraneous children have already been removed.
+    let walk = match rootfs.walk() {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(path = %root.display(), "revert prune: cannot enumerate root: {e}");
+            out.walk_errors += 1;
+            return out;
         }
     };
 
-    // `contents_first` yields children before their parent, so a directory is
-    // only visited once its extraneous children have already been removed.
-    for entry in walkdir::WalkDir::new(root).contents_first(true) {
-        let entry = match entry {
+    for item in walk {
+        let entry = match item {
             Ok(e) => e,
+            // Not noise: something is down there that this pass cannot see, so
+            // it cannot claim to have pruned the tree. Loud, and counted.
             Err(e) => {
-                debug!("revert prune: walk error: {e}");
+                warn!("revert prune: cannot account for an entry: {e}");
+                out.walk_errors += 1;
                 continue;
             }
         };
-        let path = entry.path();
-        // Map the on-disk path to its in-manifest form (`/a/b`); the root is `/`.
-        let mpath = match path.strip_prefix(root) {
-            Ok(rel) if rel.as_os_str().is_empty() => continue, // the root itself
-            Ok(rel) => match rel.to_str() {
-                Some(s) => format!("/{s}"),
-                // A non-UTF-8 name can never be a manifest path nor a credential
-                // /`.mari` path; leave it untouched rather than risk a bad match.
-                None => continue,
-            },
-            Err(_) => continue,
-        };
         // Preserve excluded paths (`.mari`, credentials): they are on disk on
         // purpose and never appear in a manifest.
-        if patterns.iter().any(|p| p.matches(&mpath)) {
+        if patterns.iter().any(|p| p.matches(&entry.path)) {
             continue;
         }
-        let ft = entry.file_type();
-        let on_disk = if ft.is_symlink() {
-            EntryKind::Symlink
-        } else if ft.is_dir() {
-            EntryKind::Dir
-        } else {
-            EntryKind::File
-        };
         // Keep it only if the manifest has this exact path with the same kind;
         // the restore that follows overwrites its content and mode.
-        if in_manifest.get(mpath.as_str()) == Some(&on_disk) {
+        if in_manifest.get(entry.path.as_str()) == Some(&entry.kind) {
             continue;
         }
         // Extraneous, or a kind conflict: remove it. Root-anchored — a symlink
         // is unlinked, never followed, and a directory only when it is empty.
-        match rootfs.remove_path(&mpath) {
-            Ok(_) => {}
+        match rootfs.remove_path(&entry.path) {
+            Ok(true) => out.removed += 1,
+            Ok(false) => {}
             // A directory that still has a *preserved* (excluded) child inside it
             // cannot be removed, and should not be — that is expected.
             Err(mari_core::Error::Io { ref source, .. })
-                if on_disk == EntryKind::Dir
+                if entry.kind == EntryKind::Dir
                     && source.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) => warn!(path = %path.display(), "revert prune: remove failed: {e}"),
+            Err(e) => {
+                out.refused += 1;
+                warn!(path = %entry.path, "revert prune: remove failed: {e}");
+            }
         }
     }
+    debug!(?out, path = %root.display(), "revert prune complete");
+    out
 }
 
 /// Cold-wake restore: reconstruct `root` from `manifest`, ordered by the stored
@@ -941,7 +990,10 @@ mod supervisor_tests {
             vec!["keep.txt".to_string(), "nested".to_string()],
             "the revert added to or removed from a directory outside the root"
         );
-        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"OUTSIDE-KEEP");
+        assert_eq!(
+            std::fs::read(outside.join("keep.txt")).unwrap(),
+            b"OUTSIDE-KEEP"
+        );
         assert_eq!(
             std::fs::read(outside.join("nested/deep.txt")).unwrap(),
             b"OUTSIDE-DEEP"

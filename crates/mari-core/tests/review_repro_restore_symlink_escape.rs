@@ -196,7 +196,10 @@ async fn preexisting_directory_symlink_does_not_redirect_a_file_write() {
     );
     // The symlink was replaced by the real directory the manifest implies, and
     // the bytes landed inside.
-    assert!(is_real_dir(&fx.root.join("sub")), "root/sub must be a real directory");
+    assert!(
+        is_real_dir(&fx.root.join("sub")),
+        "root/sub must be a real directory"
+    );
     assert_eq!(std::fs::read(fx.root.join("sub/pwned")).unwrap(), content);
 }
 
@@ -252,7 +255,10 @@ async fn a_symlink_pointing_inside_the_root_is_still_replaced() {
         .await
         .unwrap();
 
-    assert!(is_real_dir(&fx.root.join("sub")), "root/sub must be a real directory, not an alias");
+    assert!(
+        is_real_dir(&fx.root.join("sub")),
+        "root/sub must be a real directory, not an alias"
+    );
     assert_eq!(std::fs::read(fx.root.join("sub/f")).unwrap(), content);
     assert_eq!(
         names_in(&fx.root.join("real")),
@@ -315,7 +321,10 @@ async fn a_symlink_where_the_manifest_declares_a_directory_is_replaced() {
 
     fx.assert_outside_pristine(); // includes the outside directory's mode
     let meta = std::fs::symlink_metadata(fx.root.join("sub")).unwrap();
-    assert!(meta.file_type().is_dir(), "root/sub must be a real directory");
+    assert!(
+        meta.file_type().is_dir(),
+        "root/sub must be a real directory"
+    );
     assert_eq!(
         meta.mode() & 0o7777,
         0o750,
@@ -343,7 +352,10 @@ async fn a_symlink_at_the_leaf_file_path_is_replaced_not_written_through() {
         .unwrap();
 
     fx.assert_outside_pristine();
-    assert!(is_real_file(&fx.root.join("f")), "root/f must be a regular file");
+    assert!(
+        is_real_file(&fx.root.join("f")),
+        "root/f must be a regular file"
+    );
     assert_eq!(std::fs::read(fx.root.join("f")).unwrap(), content);
 }
 
@@ -437,7 +449,10 @@ async fn a_directory_mode_is_never_applied_through_a_symlink() {
 
     fx.assert_outside_pristine();
     assert_eq!(
-        std::fs::symlink_metadata(fx.root.join("sub")).unwrap().mode() & 0o7777,
+        std::fs::symlink_metadata(fx.root.join("sub"))
+            .unwrap()
+            .mode()
+            & 0o7777,
         0o700
     );
 }
@@ -476,10 +491,10 @@ async fn a_restore_over_a_dirty_root_is_still_byte_identical_and_still_heat_orde
     let src = fx.root.join("src");
     std::fs::create_dir_all(src.join("dir")).unwrap();
     std::fs::write(src.join("a.txt"), b"alpha").unwrap();
-    std::fs::set_permissions(&src.join("a.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(src.join("a.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(src.join("dir/b.txt"), b"bravo").unwrap();
     symlink("a.txt", src.join("link")).unwrap();
-    std::fs::set_permissions(&src.join("dir"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o750)).unwrap();
 
     let snap = snapshot(
         &fx.store,

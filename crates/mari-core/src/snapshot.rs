@@ -8,6 +8,43 @@
 //!
 //! Credential paths are excluded from the manifest per spec 10.1: a matched path
 //! never has its bytes read, chunked, uploaded, or recorded.
+//!
+//! # Only this computer's bytes
+//!
+//! Exclusion is by path, and a **hard link** is what makes a path a poor proxy
+//! for a file: it is a second name for one inode, so a run that links
+//! `/innocent.txt` to a secret outside the root — or to a credential path the
+//! exclude list drops — hands the snapshot an entry that is a regular file by
+//! every check `O_NOFOLLOW` can make, whose content is not this computer's.
+//! Chunked once, that content is in the chunk store, in this manifest, and in
+//! every fork and retained manifest that shares the chunk (spec 10.1, 10.2).
+//!
+//! So a file's bytes are read only once the snapshot can account for **every**
+//! name its inode has:
+//!
+//! - the walk records where each multiply-linked inode was seen, but never
+//!   reads anything;
+//! - a second pass opens each file root-anchored and takes `st_nlink` from that
+//!   descriptor (a `statat` on the name describes whatever occupied it an
+//!   instant ago, which is the whole attack);
+//! - `nlink == 1` needs nothing further: the name it was resolved through is
+//!   inside the root and is the inode's only one;
+//! - `nlink > 1` is read only if that many of this manifest's own paths still
+//!   resolve to that inode — re-resolved *after* the descriptor was opened, so
+//!   no count taken during the walk can be spent on an inode that has changed
+//!   since. Otherwise some name is somewhere this snapshot is not looking, and
+//!   the entry is dropped, unread, into
+//!   [`SnapshotResult::unattributable_links`].
+//!
+//! Dropping the entry rather than failing the snapshot is deliberate: a
+//! snapshot that a guest can make fail permanently, with one `link()` call, is a
+//! computer that can no longer checkpoint and cannot go COLD without losing its
+//! tree (spec 4.3, 4.4).
+//!
+//! In-root hard links are ordinary content, not an attack (`git clone --local`
+//! makes thousands), and they survive this intact: every name is accounted for,
+//! so each is snapshotted as its own entry — which is all a manifest can express
+//! — and content addressing stores the bytes once.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -20,7 +57,7 @@ use walkdir::WalkDir;
 
 use crate::chunker::{self, ChunkerConfig};
 use crate::error::{Error, Result};
-use crate::rootfs::{manifest_components, RootDir};
+use crate::rootfs::{manifest_components, FileFacts, RootDir};
 use crate::store::ChunkStore;
 
 /// Options controlling a snapshot.
@@ -93,6 +130,19 @@ pub struct SnapshotResult {
     pub reused_chunks: usize,
     /// Entry paths excluded by the glob list (for observability / tests).
     pub excluded: Vec<String>,
+    /// Paths of files dropped because the snapshot could not account for every
+    /// name their inode has (a hard link out of the root, or into an excluded
+    /// credential path). Their bytes were never read, chunked, or uploaded.
+    pub unattributable_links: Vec<String>,
+}
+
+/// A file the walk found and has not read yet: where its entry sits in the
+/// manifest under construction, and the components its bytes are read through.
+struct PendingFile {
+    /// Index into the entry list.
+    entry: usize,
+    /// The entry path, split for the root-anchored resolver.
+    comps: Vec<String>,
 }
 
 /// Compiled exclusion matcher.
@@ -155,6 +205,14 @@ pub async fn snapshot(
     let mut excluded: Vec<String> = Vec::new();
     // Prefixes (with trailing '/') of excluded directories, to prune subtrees.
     let mut pruned_prefixes: Vec<String> = Vec::new();
+    // Files the walk recorded but did not read: whether their bytes may be read
+    // at all depends on names the walk has not reached yet (see the module
+    // docs), so the reading happens in a second pass.
+    let mut pending: Vec<PendingFile> = Vec::new();
+    // For each multiply-linked inode the walk saw, the recorded files that named
+    // it. Singly-linked files need no entry here: one name is one name, and it
+    // is the one the resolver walked to inside the root.
+    let mut names_by_inode: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
 
     for entry in WalkDir::new(root).sort_by_file_name() {
         let entry =
@@ -205,38 +263,106 @@ pub async fn snapshot(
             });
         } else if ft.is_file() {
             let comps = manifest_components(&mpath)?;
-            // Root-anchored read: refuses a symlink in any position, and takes
-            // the mode from the very descriptor the bytes came out of, so the
-            // recorded mode always belongs to the recorded content.
-            let (data, mode) = rootfs.read_file(&comps)?;
-            let mut chunks = Vec::new();
-            for c in chunker::cut(&data, &opts.chunker) {
-                let slice = &data[c.offset..c.offset + c.len];
-                let id = ChunkStore::chunk_id(slice);
-                chunks.push(ChunkRef {
-                    chunk: id.clone(),
-                    len: c.len as u64,
-                });
-                total_refs += 1;
-                unique.entry(id).or_insert_with(|| slice.to_vec());
+            // A second name for this inode makes its content unattributable
+            // until every name is accounted for, so remember where this one is.
+            if meta.nlink() > 1 {
+                names_by_inode
+                    .entry((meta.dev(), meta.ino()))
+                    .or_default()
+                    .push(pending.len());
             }
-            debug_assert_eq!(
-                chunks.iter().map(|c| c.len).sum::<u64>(),
-                data.len() as u64,
-                "chunk lengths must sum to file size"
-            );
+            pending.push(PendingFile {
+                entry: entries.len(),
+                comps,
+            });
+            // Mode, size and chunks are filled in by the read pass, from the
+            // descriptor the bytes actually come out of.
             entries.push(ManifestEntry {
                 path: mpath,
                 kind: EntryKind::File,
                 mode,
-                size: data.len() as u64,
+                size: 0,
                 symlink_target: None,
-                chunks,
+                chunks: Vec::new(),
             });
         }
         // Other kinds (fifo, socket, device) are not part of a snapshot tree.
     }
 
+    // Read pass. Every open is root-anchored, so a symlink in any position is
+    // refused; the link-count accounting on the opened descriptor is what keeps
+    // a hard link from feeding an outside inode into the store.
+    let mut unattributable_links: Vec<String> = Vec::new();
+    let mut dropped: HashSet<usize> = HashSet::new();
+    // One verdict per inode, not per name: a directory holding n links to one
+    // inode would otherwise cost n² stats.
+    let mut verdicts: HashMap<(u64, u64), bool> = HashMap::new();
+
+    for p in &pending {
+        let (file, facts) = match rootfs.open_file(&p.comps) {
+            Ok(open) => open,
+            // The tree is live (spec 4.3 snapshots a running computer): a file
+            // the walk saw can be gone before its bytes are read. It is then not
+            // in the tree, so it is not in the manifest — and that is not an
+            // error about the snapshot.
+            Err(Error::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                dropped.insert(p.entry);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        if facts.nlink > 1 {
+            let allowed = match verdicts.get(&facts.inode()) {
+                Some(&v) => v,
+                None => {
+                    let v = links_are_accounted_for(&mut rootfs, &pending, &names_by_inode, &facts)?;
+                    verdicts.insert(facts.inode(), v);
+                    v
+                }
+            };
+            if !allowed {
+                // The descriptor is dropped here, unread: not one byte of an
+                // inode this computer cannot claim reaches the chunker.
+                unattributable_links.push(entries[p.entry].path.clone());
+                dropped.insert(p.entry);
+                continue;
+            }
+        }
+
+        let data = rootfs.read_open_file(&p.comps, file, &facts)?;
+        let mut chunks = Vec::new();
+        for c in chunker::cut(&data, &opts.chunker) {
+            let slice = &data[c.offset..c.offset + c.len];
+            let id = ChunkStore::chunk_id(slice);
+            chunks.push(ChunkRef {
+                chunk: id.clone(),
+                len: c.len as u64,
+            });
+            total_refs += 1;
+            unique.entry(id).or_insert_with(|| slice.to_vec());
+        }
+        debug_assert_eq!(
+            chunks.iter().map(|c| c.len).sum::<u64>(),
+            data.len() as u64,
+            "chunk lengths must sum to file size"
+        );
+        let entry = &mut entries[p.entry];
+        // The mode comes from the very descriptor the bytes came out of, so the
+        // recorded mode always belongs to the recorded content.
+        entry.mode = facts.mode;
+        entry.size = data.len() as u64;
+        entry.chunks = chunks;
+    }
+
+    let mut entries: Vec<ManifestEntry> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !dropped.contains(i))
+        .map(|(_, e)| e)
+        .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     // One batched existence check for every distinct chunk, then upload the
@@ -269,7 +395,55 @@ pub async fn snapshot(
         uploaded_chunks,
         reused_chunks: unique_chunks - uploaded_chunks,
         excluded,
+        unattributable_links,
     })
+}
+
+/// Whether every name the filesystem has for this inode is a path this snapshot
+/// is recording — the question that decides whether its bytes may be read.
+///
+/// `st_nlink` is a count with no names attached, so the proof has to come from
+/// the other side: re-resolve the recorded paths that named this inode during
+/// the walk, root-anchored, and count the ones that still lead to it. Reaching
+/// `nlink` means every name the inode has is one of ours. Falling short means at
+/// least one name is somewhere this snapshot is not looking — outside the root,
+/// or under a credential path the exclude list dropped (spec 10.1) — and the
+/// content behind it is not this computer's to store.
+///
+/// Order is what makes this hold under a racing tree. The re-resolution happens
+/// *after* the descriptor being vetted was opened and `fstat`ed, so a name that
+/// has been repointed at some other inode since the walk cannot be counted, and
+/// a stale count from the walk cannot be spent. A link created outside the root
+/// after the check is not a leak: at the moment of the check the inode was named
+/// only from inside the root, which is what makes its content part of this
+/// computer's filesystem in the first place.
+fn links_are_accounted_for(
+    rootfs: &mut RootDir,
+    pending: &[PendingFile],
+    names_by_inode: &HashMap<(u64, u64), Vec<usize>>,
+    facts: &FileFacts,
+) -> Result<bool> {
+    // No recorded name for this inode at all: the walk saw it as singly-linked
+    // (it has been linked since) or saw a different inode at this path. Either
+    // way there is nothing to account with.
+    let Some(names) = names_by_inode.get(&facts.inode()) else {
+        return Ok(false);
+    };
+    let mut found: u64 = 0;
+    for &i in names {
+        match rootfs.stat_file(&pending[i].comps)? {
+            Some(other) if other.inode() == facts.inode() => {
+                found += 1;
+                if found >= facts.nlink {
+                    return Ok(true);
+                }
+            }
+            // The name is gone, or leads to some other inode now: it is not
+            // evidence about this one.
+            _ => {}
+        }
+    }
+    Ok(false)
 }
 
 /// The distinct chunks referenced directly by a manifest's entries (not
