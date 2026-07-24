@@ -17,6 +17,7 @@ export function Workspace({ computer, user }: { computer: string; user: string }
   const setLayout = useUiStore((s) => s.setLayout);
   const addPane = useUiStore((s) => s.addPane);
   const splitFocused = useUiStore((s) => s.splitFocused);
+  const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
 
   const layoutQ = useLayout(computer);
   const hydrated = useRef<Set<string>>(new Set());
@@ -61,7 +62,17 @@ export function Workspace({ computer, user }: { computer: string; user: string }
         <button type="button" onClick={() => addPane({ kind: 'preview', port: 3000 })}>
           + Preview
         </button>
+        <button type="button" onClick={() => addPane({ kind: 'runs' })} data-testid="add-runs-pane">
+          + Runs
+        </button>
         <span className="spacer" style={{ flex: 1 }} />
+        <button
+          type="button"
+          data-testid="workspace-run-command"
+          onClick={() => setRunLauncherOpen(true)}
+        >
+          Run command <kbd>⌥R</kbd>
+        </button>
         <span className="hint">
           <kbd>⌥⏎</kbd> split · <kbd>⌥hjkl</kbd> focus · <kbd>⌥W</kbd> close
         </span>

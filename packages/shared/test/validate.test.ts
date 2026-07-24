@@ -25,6 +25,22 @@ describe('validation accepts real fixtures', () => {
     if (jf.t === 'journal_frame') expect(ArrayBuffer.isView(jf.c.bytes)).toBe(true);
   });
 
+  it('the WARM-rollback report and the interrupted attention kind', () => {
+    // Both are marid-originated (spec 4.7 / 5.6). If the TS mirror drifts from
+    // mari-proto, the tag set here rejects a message the supervisor really sends.
+    const rb = decodeSupervisorMessage(read('sup_rollback_detected'));
+    expect(rb.t).toBe('rollback_detected');
+    if (rb.t === 'rollback_detected') {
+      expect(rb.c.recorded_manifest).not.toBeNull();
+      expect(rb.c.diff.removed).toBe(2);
+      expect(rb.c.runs.map((r) => r.replayed)).toEqual([false, true]);
+      expect(rb.c.runs[0]?.control_offset).toBeGreaterThan(rb.c.runs[0]!.disk_offset);
+    }
+    const att = decodeSupervisorMessage(read('sup_attention_interrupted'));
+    expect(att.t).toBe('attention');
+    if (att.t === 'attention') expect(att.c.kind).toBe('interrupted');
+  });
+
   it('control messages incl. payload-free variant', () => {
     expect(decodeControlMessage(read('ctl_prepare_for_cold')).t).toBe('prepare_for_cold');
     expect(decodeControlMessage(read('ctl_start_run')).t).toBe('start_run');

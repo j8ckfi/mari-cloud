@@ -34,7 +34,9 @@ export default defineConfig({
   ],
   test: {
     include: ['test/**/*.test.ts'],
-    // The substrate lane owns test/substrates/**; keep it out of this run.
-    exclude: ['test/substrates/**', 'node_modules/**'],
+    // The substrate lane owns test/substrates/**, and test/node/** is the
+    // private-instance runtime (plain Node, its own config —
+    // vitest.node.config.ts). Neither belongs in the Workers pool.
+    exclude: ['test/substrates/**', 'test/node/**', 'node_modules/**'],
   },
 });

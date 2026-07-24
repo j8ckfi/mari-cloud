@@ -511,3 +511,201 @@ kbd {
   padding: 24px;
   color: var(--fg-faint);
 }
+
+/* ---- Attention badges (spec 6.2) ---- */
+.attn-badge {
+  background: var(--attn);
+  color: #12151a;
+  border: none;
+  border-radius: 999px;
+  padding: 0 7px;
+  height: 17px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.attn-badge.sm {
+  height: 15px;
+  padding: 0 5px;
+  margin-left: 5px;
+}
+.attn-badge:hover {
+  filter: brightness(1.12);
+}
+.attn-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--attn);
+  vertical-align: middle;
+}
+.attn-text {
+  color: var(--attn);
+}
+
+/* ---- Terminal bar ---- */
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex: 0 0 auto;
+}
+.term-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---- Runs (spec 5) ---- */
+.runs {
+  font-family: var(--mono);
+  font-size: 12px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.runs-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.runs-list {
+  overflow: auto;
+  flex: 1 1 auto;
+}
+.run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--bg-2);
+  min-height: var(--row);
+}
+.run-row[data-attention='true'] {
+  background: color-mix(in srgb, var(--attn) 12%, transparent);
+}
+.run-argv {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+.run-state {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.run-state.running {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.run-state.pending,
+.run-state.stopping {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.run-state.failed {
+  color: var(--attn);
+  border-color: var(--attn);
+}
+
+/* ---- Difference view (spec 5.3 / 9.2) ---- */
+.diff-pane,
+.diff {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.diff-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex: 0 0 auto;
+}
+.diff-counts {
+  font-weight: 700;
+}
+.diff-warn {
+  padding: 4px 6px;
+  color: var(--warn);
+  border-bottom: 1px solid var(--border);
+}
+.diff-list {
+  overflow: auto;
+  flex: 1 1 auto;
+}
+.diff-group-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 6px 2px;
+  color: var(--fg-dim);
+  background: var(--bg-1);
+  position: sticky;
+  top: 0;
+}
+.diff-dir {
+  font-weight: 700;
+}
+.diff-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 6px 1px 14px;
+}
+.diff-row:hover {
+  background: var(--bg-2);
+}
+.diff-mark {
+  width: 1ch;
+  text-align: center;
+  font-weight: 700;
+}
+.diff-mark.added {
+  color: var(--ok);
+}
+.diff-mark.removed {
+  color: var(--attn);
+}
+.diff-mark.content {
+  color: var(--accent);
+}
+.diff-mark.mode {
+  color: var(--warn);
+}
+.diff-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-kind,
+.diff-meta {
+  color: var(--fg-faint);
+  font-size: 11px;
+  margin-left: auto;
+}
+.diff-meta {
+  margin-left: 0;
+  min-width: 10ch;
+  text-align: right;
+}

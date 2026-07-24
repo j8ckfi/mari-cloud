@@ -1,0 +1,89 @@
+# A Mari private instance: ONE command (spec 11.2).
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# What comes up:
+#   base-image     builds `mari/base:v0` (deploy/Dockerfile.marid — the marid
+#                  supervisor + a POSIX userland) and exits. Every computer is
+#                  materialized from it (spec §2 base image).
+#   control-plane  the Node control plane: REST + WebSockets + the web app on
+#                  one origin, driving the local Docker daemon as the substrate
+#                  (spec 3.7 "Local Docker is the second, for development and
+#                  private instances").
+#
+# Storage is two named volumes, and the store volume is deliberately shared BY
+# NAME with every computer: the control plane opens it as its object store (the
+# R2 equivalent) while each container bind-mounts the same volume at /store and
+# `marid` opens it as `fs:///store`. The chunk store is the home of the computer
+# (spec §2) and both sides must see one home.
+#
+# Networking: `network_mode: bridge` is load-bearing, not incidental. Computers
+# are created as SIBLING containers through the mounted Docker socket, so they
+# land on the default bridge network; the control plane joins that same network
+# and hands each computer its own reachable address as MARI_CONTROL_URL. A
+# user-defined compose network would be isolated from those siblings by Docker's
+# inter-network isolation rules, and no computer could dial home.
+
+services:
+  base-image:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.marid
+    image: ${MARI_BASE_IMAGE:-mari/base:v0}
+    # The image's entrypoint IS marid; running its `--help` proves the binary
+    # exists and is executable for this platform, then exits 0.
+    command: ["--help"]
+    restart: "no"
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.control-plane
+    image: mari/control-plane:v0
+    depends_on:
+      base-image:
+        condition: service_completed_successfully
+    network_mode: bridge
+    ports:
+      - "${MARI_PORT:-8787}:8787"
+    volumes:
+      # The substrate (spec 3.5's six functions are Docker API calls).
+      - ${MARI_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - mari-data:/var/lib/mari/data
+      - mari-store:/var/lib/mari/store
+    environment:
+      PORT: 8787
+      MARI_BIND: 0.0.0.0
+      # The store as THIS process sees it, and as the DAEMON sees it. The second
+      # is the volume NAME: it is what gets bind-mounted into each computer.
+      MARI_STORE_DIR: /var/lib/mari/store
+      MARI_STORE_HOST_DIR: mari-store
+      MARI_STORE_MOUNT: /store
+      MARI_DATA_DIR: /var/lib/mari/data
+      MARI_COMPUTER_ROOT: /work
+      MARI_BASE_IMAGE: ${MARI_BASE_IMAGE:-mari/base:v0}
+      SUBSTRATE_MODE: docker
+      MARI_SUBSTRATES: docker
+      # Reachable FROM a computer. Left unset, the control plane uses its own
+      # bridge address, which is exactly right for sibling containers; set it
+      # when the daemon is remote or the port is forwarded.
+      MARI_CONTROL_HOST: ${MARI_CONTROL_HOST:-}
+      # Single-user sign-in for a private instance (decisions.md Auth). Set
+      # AUTH_SECRET to a random 32+ character value.
+      DEV_AUTH: ${MARI_DEV_AUTH:-1}
+      DEV_SEED: ${MARI_DEV_SEED:-0}
+      AUTH_SECRET: ${MARI_AUTH_SECRET:-mari-private-instance-change-me}
+      BASE_URL: ${MARI_BASE_URL:-}
+      PREVIEW_ZONE: ${MARI_PREVIEW_ZONE:-mari.sh}
+      # Tier policy (spec 4.4). Defaults: 5 min to WARM, 30 min to COLD.
+      WARM_IDLE_MS: ${MARI_WARM_IDLE_MS:-}
+      COLD_IDLE_MS: ${MARI_COLD_IDLE_MS:-}
+    restart: unless-stopped
+
+volumes:
+  # Pinned names: `MARI_STORE_HOST_DIR` above must match the volume the daemon
+  # knows, and compose would otherwise prefix it with the project name.
+  mari-store:
+    name: mari-store
+  mari-data:
+    name: mari-data

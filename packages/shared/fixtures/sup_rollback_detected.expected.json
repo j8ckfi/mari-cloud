@@ -1,0 +1,26 @@
+{
+  "t": "rollback_detected",
+  "c": {
+    "disk_manifest": "0101010101010101010101010101010101010101010101010101010101010101",
+    "recorded_manifest": "0202020202020202020202020202020202020202020202020202020202020202",
+    "diff": {
+      "added": 0,
+      "modified": 1,
+      "removed": 2
+    },
+    "runs": [
+      {
+        "run": "run-0001",
+        "control_offset": 4096,
+        "disk_offset": 1024,
+        "replayed": false
+      },
+      {
+        "run": "run-0002",
+        "control_offset": 0,
+        "disk_offset": 0,
+        "replayed": true
+      }
+    ]
+  }
+}

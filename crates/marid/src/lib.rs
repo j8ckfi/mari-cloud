@@ -7,10 +7,13 @@
 //! The library exposes the components so they can be tested with teeth and
 //! reused by the e2e suite; [`run`] is the daemon entry point.
 
+pub mod adapters;
 pub mod attention;
 pub mod config;
+pub(crate) mod continuation;
 pub mod journal;
 pub mod run;
+pub mod state;
 pub mod store_uri;
 pub mod supervisor;
 pub mod ws;
@@ -25,3 +28,6 @@ pub use supervisor::run;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_continuation;

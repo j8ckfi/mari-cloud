@@ -3,7 +3,13 @@ import { EditorView, keymap } from '@codemirror/view';
 import { EditorState, Prec } from '@codemirror/state';
 import { markdown } from '@codemirror/lang-markdown';
 import { basicSetup } from 'codemirror';
+import { useQueryClient } from '@tanstack/react-query';
 import { fetchFileText, writeFile, startRun } from '../../api/client';
+import { queryKeys } from '../../api/queries';
+import { briefArgv, dirnameOf } from '../../runs/command';
+import { setActiveEditor } from '../../store/pane-actions';
+import { useUiStore } from '../../store/ui';
+import type { ComputerState } from '@mari/shared';
 import type { EditorPaneSpec } from '../../wm/pane';
 
 const darkTheme = EditorView.theme(
@@ -21,40 +27,73 @@ const darkTheme = EditorView.theme(
 );
 
 /**
- * Editor pane (spec 8.5): CodeMirror 6 over markdown/config files. Save writes
- * through the files API (which WAKES a sleeping computer per spec 8.4). "Run
- * brief" saves then posts the document as a run (spec 8.5). It is not an IDE —
- * no LSP.
+ * Editor pane (spec 8.5): CodeMirror 6 over markdown/config files. It is not an
+ * IDE — no LSP.
+ *
+ * Save writes through the files API, which WAKES a computer that is not AWAKE
+ * (spec 8.4). Spec 8.3 forbids waiting in front of the interface for that wake,
+ * so Save does exactly this: it returns as soon as the write is accepted and
+ * shows the computer's resulting STATE (`waking`, `awake`) as text. There is no
+ * spinner and no blocked editor — the user keeps typing while the computer
+ * comes up behind the interface.
+ *
+ * "Run brief" saves and then starts the document as a run (spec 8.5). The
+ * document decides what runs (see runs/command): the user brings the agents.
  */
 export function EditorPane({ computer, spec }: { computer: string; spec: EditorPaneSpec }) {
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState<string>('');
+  const [computerState, setComputerState] = useState<ComputerState | null>(null);
+  const openRunTerminal = useUiStore((s) => s.openRunTerminal);
+  const qc = useQueryClient();
 
-  const save = async (): Promise<void> => {
+  const save = async (): Promise<boolean> => {
     const view = viewRef.current;
-    if (!view) return;
+    if (!view) return false;
     setStatus('Saving…');
     try {
-      await writeFile(computer, spec.path, view.state.doc.toString());
+      const res = await writeFile(computer, spec.path, view.state.doc.toString());
       setDirty(false);
-      setStatus('Saved');
+      setComputerState(res.state);
+      // Spec 8.4: the write started a wake. Report the transition; never wait.
+      setStatus(res.state === 'awake' ? 'Saved' : `Saved · ${res.state}`);
+      void qc.invalidateQueries({ queryKey: queryKeys.fleet });
+      void qc.invalidateQueries({ queryKey: queryKeys.dir(computer, dirnameOf(spec.path)) });
+      return true;
     } catch {
       setStatus('Save failed');
+      return false;
     }
   };
 
   const runBrief = async (): Promise<void> => {
-    await save();
+    const view = viewRef.current;
+    if (!view) return;
+    const text = view.state.doc.toString();
+    if (!(await save())) return;
     setStatus('Starting run…');
     try {
-      const { run } = await startRun(computer, { path: spec.path });
-      setStatus(`Run ${run} started`);
+      const { runId, state } = await startRun(computer, {
+        argv: briefArgv(spec.path, text),
+        cwd: dirnameOf(spec.path),
+      });
+      setStatus(`Run ${runId} · ${state}`);
+      openRunTerminal(computer, runId);
+      void qc.invalidateQueries({ queryKey: queryKeys.runs(computer) });
     } catch {
       setStatus('Run failed');
     }
   };
+
+  // Publish this editor's actions so the palette's stable "Save file" / "Run
+  // brief" commands act on it (spec 8.1). The commands themselves are never
+  // replaced or removed — see store/editor-actions for why that matters.
+  useEffect(() => {
+    return setActiveEditor({ path: spec.path, save, runBrief });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [computer, spec.path]);
 
   // Build (and rebuild on path/computer change) the editor.
   useEffect(() => {
@@ -91,7 +130,7 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
       viewRef.current = new EditorView({ state, parent: el });
     };
 
-    setStatus('Loading…');
+    setStatus('');
     fetchFileText(computer, spec.path)
       .then((text) => {
         build(text);
@@ -119,11 +158,23 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
           {dirty && <span className="dirty-dot"> ●</span>}
         </span>
         <span className="spacer" style={{ flex: 1 }} />
-        <span className="hint">{status}</span>
-        <button type="button" onClick={() => void save()}>
+        {computerState !== null && (
+          <span className={`state ${computerState}`} data-testid="editor-state">
+            {computerState}
+          </span>
+        )}
+        <span className="hint" data-testid="editor-status">
+          {status}
+        </span>
+        <button type="button" onClick={() => void save()} data-testid="editor-save">
           Save
         </button>
-        <button type="button" onClick={() => void runBrief()} title="Post this document as a run">
+        <button
+          type="button"
+          onClick={() => void runBrief()}
+          data-testid="editor-run-brief"
+          title="Save this document and start it as a run"
+        >
           Run brief
         </button>
       </div>

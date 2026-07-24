@@ -6,10 +6,18 @@
 
 import type {
   ComputerDetail,
+  DiffResponse,
   DirListing,
   FleetResponse,
   LayoutResponse,
+  ReviewResponse,
+  RunListResponse,
+  SnapshotResponse,
+  StartRunRequest,
   StartRunResponse,
+  StopRunResponse,
+  UploadResponse,
+  WriteFileResponse,
 } from './types';
 import type { SerializedLayout } from '../wm/serialize';
 
@@ -33,6 +41,25 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, { signal, headers: { accept: 'application/json' } });
   if (!res.ok) throw new ApiError(`GET ${path} → ${res.status}`, res.status, url);
   return (await res.json()) as T;
+}
+
+/** POST JSON (or nothing) and decode a JSON response. */
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: body === undefined
+      ? { accept: 'application/json' }
+      : { accept: 'application/json', 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new ApiError(`POST ${path} → ${res.status}`, res.status, url);
+  return (await res.json()) as T;
+}
+
+/** URL-safe computer segment. */
+function seg(id: string): string {
+  return encodeURIComponent(id);
 }
 
 /** Fleet home data (spec 8.2). */
@@ -67,14 +94,54 @@ export async function fetchFileText(id: string, path: string, signal?: AbortSign
 
 /**
  * Write a file. Per spec 8.4 this WAKES a computer that is not AWAKE; the wake
- * happens server-side and the interface does not block on it.
+ * happens server-side and the interface does not block on it. The response
+ * reports the resulting computer state so the caller can show the transition
+ * (spec 8.3: the transition is shown, never waited on).
  */
-export async function writeFile(id: string, path: string, contents: string | Uint8Array): Promise<void> {
+export async function writeFile(
+  id: string,
+  path: string,
+  contents: string | Uint8Array,
+): Promise<WriteFileResponse> {
   const q = new URLSearchParams({ path });
-  const url = `${API_BASE}/computers/${encodeURIComponent(id)}/file?${q}`;
+  const url = `${API_BASE}/computers/${seg(id)}/file?${q}`;
   const body = typeof contents === 'string' ? new TextEncoder().encode(contents) : contents;
   const res = await fetch(url, { method: 'PUT', body: body as BodyInit });
   if (!res.ok) throw new ApiError(`PUT file ${path} → ${res.status}`, res.status, url);
+  return (await readJsonOr(res, { ok: true, path, state: 'waking' as const })) as WriteFileResponse;
+}
+
+/** Decode a JSON body, falling back when the server answered with no body. */
+async function readJsonOr<T>(res: Response, fallback: T): Promise<T> {
+  try {
+    const text = await res.text();
+    if (text.trim() === '') return fallback;
+    return JSON.parse(text) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Upload a file into the computer (files pane). Multipart, so a browser file
+ * streams without a base64 round-trip. Same wake semantics as a write (8.4).
+ * If the server has no upload route, this falls back to the plain file write —
+ * the two are equivalent for a single file, and the UI must not lose the
+ * user's upload over a route-shape disagreement.
+ */
+export async function uploadFile(id: string, path: string, file: Blob): Promise<UploadResponse> {
+  const url = `${API_BASE}/computers/${seg(id)}/upload`;
+  const form = new FormData();
+  form.set('path', path);
+  form.set('file', file);
+  const res = await fetch(url, { method: 'POST', body: form });
+  if (res.status === 404 || res.status === 405 || res.status === 501) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const written = await writeFile(id, path, bytes);
+    return { ok: written.ok, path: written.path, state: written.state };
+  }
+  if (!res.ok) throw new ApiError(`POST upload ${path} → ${res.status}`, res.status, url);
+  return (await readJsonOr(res, { ok: true, path, state: 'waking' as const })) as UploadResponse;
 }
 
 /** Load the saved pane layout for a computer (spec 8.6). */
@@ -93,17 +160,64 @@ export async function saveLayout(id: string, layout: SerializedLayout): Promise<
   if (!res.ok) throw new ApiError(`PUT layout → ${res.status}`, res.status, url);
 }
 
-/** Start a run from a brief document (spec 8.5). */
-export async function startRun(
-  id: string,
-  brief: { path: string; argv?: string[]; cwd?: string },
-): Promise<StartRunResponse> {
-  const url = `${API_BASE}/computers/${encodeURIComponent(id)}/runs`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(brief),
-  });
-  if (!res.ok) throw new ApiError(`POST run → ${res.status}`, res.status, url);
-  return (await res.json()) as StartRunResponse;
+// ---- runs (spec 5) ----
+
+/**
+ * Start a run (spec 5.1: the SUPERVISOR owns the run — this request only asks
+ * the control plane to start one; no network connection owns it afterwards).
+ * `envNames` carries vault variable NAMES only; values never leave the vault
+ * (spec 10.1, contracts §5.2).
+ */
+export function startRun(id: string, req: StartRunRequest): Promise<StartRunResponse> {
+  const body: StartRunRequest = { argv: req.argv };
+  if (req.cwd !== undefined) body.cwd = req.cwd;
+  if (req.envNames !== undefined) body.envNames = req.envNames;
+  return postJson<StartRunResponse>(`/computers/${seg(id)}/runs`, body);
+}
+
+/** Stop a run's process (contracts §5.2 `stop_run`). */
+export function stopRun(id: string, runId: string): Promise<StopRunResponse> {
+  return postJson<StopRunResponse>(`/computers/${seg(id)}/runs/${seg(runId)}/stop`);
+}
+
+/** All runs of a computer, newest first. Served from control-plane data. */
+export function fetchRuns(id: string, signal?: AbortSignal): Promise<RunListResponse> {
+  return getJson<RunListResponse>(`/computers/${seg(id)}/runs`, signal);
+}
+
+/** One run's detail. */
+export function fetchRun(id: string, runId: string, signal?: AbortSignal) {
+  return getJson<RunListResponse['runs'][number]>(
+    `/computers/${seg(id)}/runs/${seg(runId)}`,
+    signal,
+  );
+}
+
+/**
+ * The run's changes against its pre-run manifest (spec 5.3). Manifest-only —
+ * reading a diff never wakes a computer (spec 8.4 reasoning applies: a diff is
+ * a function of two manifests, decisions.md).
+ */
+export function fetchRunDiff(id: string, runId: string, signal?: AbortSignal): Promise<DiffResponse> {
+  return getJson<DiffResponse>(`/computers/${seg(id)}/runs/${seg(runId)}/diff`, signal);
+}
+
+/** Keep a run's changes (spec 5.3). */
+export function keepRun(id: string, runId: string): Promise<ReviewResponse> {
+  return postJson<ReviewResponse>(`/computers/${seg(id)}/runs/${seg(runId)}/keep`);
+}
+
+/** Restore the pre-run manifest, discarding the run's changes (spec 5.3). */
+export function revertRun(id: string, runId: string): Promise<ReviewResponse> {
+  return postJson<ReviewResponse>(`/computers/${seg(id)}/runs/${seg(runId)}/revert`);
+}
+
+/** Write a manifest now (spec 4.3, on a user command). */
+export function snapshotComputer(id: string): Promise<SnapshotResponse> {
+  return postJson<SnapshotResponse>(`/computers/${seg(id)}/snapshot`);
+}
+
+/** The SSE endpoint carrying content-free attention/run/state events (6.2). */
+export function eventsUrl(): string {
+  return `${API_BASE}/events`;
 }

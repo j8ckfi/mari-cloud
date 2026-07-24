@@ -3,17 +3,25 @@
 // protocol (framed CBOR supervisor-side, discrete CBOR client-side) against a
 // real ComputerDO, so assertions are byte-level and behavior-level, not mocks.
 
-import { env } from 'cloudflare:test';
+import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { expect } from 'vitest';
 import {
   FrameReader,
   encodeFrame,
   encodeCbor,
   decodeCbor,
   PROTO_VERSION,
+  type Manifest,
+  type ManifestEntry,
 } from '@mari/shared';
 import { applySchema } from '../src/db/apply';
+import { chunkKey, manifestKey } from '../src/manifest-store';
+import { toArrayBuffer } from '../src/bytes';
+import type { ComputerDO } from '../src/computer-do';
 
 export { env };
+
+export const HOST = 'http://localhost';
 
 export function computerStub(id: string) {
   return env.COMPUTER.get(env.COMPUTER.idFromName(id));
@@ -25,6 +33,148 @@ export async function ensureSchema(): Promise<void> {
 
 export function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Poll `pred` until it is true, or throw after `timeoutMs`. */
+export async function waitUntil(
+  pred: () => boolean | Promise<boolean>,
+  timeoutMs = 3000,
+  label = 'condition',
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await pred()) return;
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
+    await delay(10);
+  }
+}
+
+/** The substrate driver's recorded operations, in order. */
+export async function substrateOps(stub: ReturnType<typeof computerStub>): Promise<string[]> {
+  return runInDurableObject(stub, (instance: ComputerDO) =>
+    (instance.substrate as { calls: { op: string }[] }).calls.map((c) => c.op),
+  );
+}
+
+/** Total objects currently in the R2 store (chunks + manifests + segments). */
+export async function r2ObjectCount(): Promise<number> {
+  let count = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.STORE.list(cursor ? { cursor } : undefined);
+    count += page.objects.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return count;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
+  let hex = '';
+  for (const b of new Uint8Array(digest)) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * Write a real manifest + its chunks into the R2 store from a `path -> contents`
+ * tree, and return the manifest id. Same content-addressing stand-in as the dev
+ * seed (SHA-256 for blake3, contracts.md Appendix A) — the diff and file-read
+ * paths only require ids to be self-consistent with the chunks they name.
+ */
+export async function writeManifestTree(tree: Record<string, string>): Promise<string> {
+  const enc = new TextEncoder();
+  const entries: ManifestEntry[] = [];
+  const dirs = new Set<string>();
+  for (const p of Object.keys(tree)) {
+    const parts = p.split('/').filter(Boolean);
+    let cur = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur += '/' + parts[i];
+      dirs.add(cur);
+    }
+  }
+  for (const dir of dirs) {
+    entries.push({ path: dir, kind: 'dir', mode: 0o040755, size: 0, symlink_target: null, chunks: [] });
+  }
+  for (const [path, contents] of Object.entries(tree)) {
+    const bytes = enc.encode(contents);
+    const id = await sha256Hex(bytes);
+    await env.STORE.put(chunkKey(id), bytes);
+    entries.push({
+      path,
+      kind: 'file',
+      mode: 0o100644,
+      size: bytes.length,
+      symlink_target: null,
+      chunks: [{ chunk: id, len: bytes.length }],
+    });
+  }
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const manifest: Manifest = { version: 1, parent: null, created_at: 1_700_000_000, entries };
+  const cbor = encodeCbor(manifest);
+  const id = await sha256Hex(cbor);
+  await env.STORE.put(manifestKey(id), cbor);
+  return id;
+}
+
+/** Run the dev seed and return a usable session cookie + the seeded computer.
+ *  `postRunManifest` is the seed's SECOND manifest (contracts.md Appendix A):
+ *  the same tree after a run touched it, for diff/review paths. */
+export async function seedSession(): Promise<{
+  cookie: string;
+  computerId: string;
+  manifest: string;
+  postRunManifest: string;
+}> {
+  const res = await SELF.fetch(`${HOST}/api/dev/seed`, { method: 'POST' });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as {
+    computer: { id: string };
+    manifest: string;
+    postRunManifest: string;
+  };
+  const cookie = cookieFromSetCookie(res.headers.get('set-cookie'));
+  expect(cookie).toMatch(/=/);
+  return {
+    cookie,
+    computerId: body.computer.id,
+    manifest: body.manifest,
+    postRunManifest: body.postRunManifest,
+  };
+}
+
+/** Create a fresh COLD computer through the real API; returns its id. */
+export async function createComputer(cookie: string, name: string): Promise<string> {
+  const res = await SELF.fetch(`${HOST}/api/computers`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** `GET` an authenticated JSON endpoint. */
+export async function apiGet<T>(path: string, cookie: string): Promise<{ status: number; body: T }> {
+  const res = await SELF.fetch(`${HOST}${path}`, { headers: { Cookie: cookie } });
+  return { status: res.status, body: (await res.json()) as T };
+}
+
+/** `POST` JSON to an authenticated endpoint. */
+export async function apiPost<T>(
+  path: string,
+  cookie: string,
+  body?: unknown,
+): Promise<{ status: number; body: T }> {
+  const res = await SELF.fetch(`${HOST}${path}`, {
+    method: 'POST',
+    headers:
+      body === undefined
+        ? { Cookie: cookie }
+        : { Cookie: cookie, 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return { status: res.status, body: (await res.json()) as T };
 }
 
 export function toU8(data: unknown): Uint8Array {
@@ -159,6 +309,29 @@ export class FakeSupervisor {
 
   snapshotWritten(manifest: string, epoch: number, reason: string): void {
     this.send({ t: 'snapshot_written', c: { manifest, epoch, reason } });
+  }
+
+  runStarted(run: string, preRunManifest: string): void {
+    this.send({ t: 'run_started', c: { run, pre_run_manifest: preRunManifest } });
+  }
+
+  runCompleted(
+    run: string,
+    postRunManifest: string,
+    exit: { t: 'exited'; c: { code: number } } | { t: 'signaled'; c: { signal: number } } = {
+      t: 'exited',
+      c: { code: 0 },
+    },
+    diff = { added: 0, modified: 0, removed: 0 },
+  ): void {
+    this.send({
+      t: 'run_completed',
+      c: { run, exit, post_run_manifest: postRunManifest, diff },
+    });
+  }
+
+  attention(run: string, kind: 'bell' | 'osc' | 'blocked_read'): void {
+    this.send({ t: 'attention', c: { run, kind } });
   }
 
   close(): void {

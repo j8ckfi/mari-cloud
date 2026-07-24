@@ -26,6 +26,8 @@ export interface HotkeyHandlers {
   onClosePane(): void;
   /** Super/Alt + 0 (or Backquote): go to the fleet home. */
   onFleet(): void;
+  /** Super/Alt + R: open the "Run command" prompt (spec 5, spec 8.1). */
+  onRunCommand?(): void;
 }
 
 const FOCUS_KEYS: Record<string, MoveDir> = {
@@ -76,6 +78,13 @@ export function handleKeydown(e: KeyboardEvent, h: HotkeyHandlers): boolean {
     }
     if (!e.shiftKey && (e.key === 'w' || e.key === 'W')) {
       h.onClosePane();
+      return true;
+    }
+
+    // Start a run (spec 5). Only consumed when a handler is installed, so an
+    // app without the run surface still passes ⌥R through to the terminal.
+    if (!e.shiftKey && (e.key === 'r' || e.key === 'R') && h.onRunCommand !== undefined) {
+      h.onRunCommand();
       return true;
     }
 

@@ -8,8 +8,15 @@
 // a background refetch runs — it must not mount a spinner.
 
 import { QueryClient, useQuery, type UseQueryResult } from '@tanstack/react-query';
-import { fetchComputer, fetchDir, fetchFleet, fetchLayout } from './client';
-import type { ComputerDetail, DirListing, FleetResponse, LayoutResponse } from './types';
+import { fetchComputer, fetchDir, fetchFleet, fetchLayout, fetchRunDiff, fetchRuns } from './client';
+import type {
+  ComputerDetail,
+  DiffResponse,
+  DirListing,
+  FleetResponse,
+  LayoutResponse,
+  RunListResponse,
+} from './types';
 
 export function makeQueryClient(): QueryClient {
   return new QueryClient({
@@ -32,6 +39,8 @@ export const queryKeys = {
   computer: (id: string) => ['computer', id] as const,
   dir: (id: string, path: string) => ['dir', id, path] as const,
   layout: (id: string) => ['layout', id] as const,
+  runs: (id: string) => ['runs', id] as const,
+  runDiff: (id: string, run: string) => ['run-diff', id, run] as const,
 };
 
 export function useFleet(): UseQueryResult<FleetResponse> {
@@ -62,5 +71,30 @@ export function useLayout(id: string | null): UseQueryResult<LayoutResponse> {
     queryKey: queryKeys.layout(id ?? ''),
     queryFn: ({ signal }) => fetchLayout(id as string, signal),
     enabled: id !== null,
+  });
+}
+
+/**
+ * A computer's runs (spec 5). Polled slowly: the live truth arrives on the
+ * event stream (spec 6.2 / 5.5), and this is the durable backstop for a client
+ * that just loaded or missed a push. It never blocks a render (spec 8.3).
+ */
+export function useRuns(id: string | null): UseQueryResult<RunListResponse> {
+  return useQuery({
+    queryKey: queryKeys.runs(id ?? ''),
+    queryFn: ({ signal }) => fetchRuns(id as string, signal),
+    enabled: id !== null,
+    refetchInterval: 15_000,
+  });
+}
+
+/** One run's difference against its pre-run manifest (spec 5.3). */
+export function useRunDiff(id: string | null, run: string | null): UseQueryResult<DiffResponse> {
+  return useQuery({
+    queryKey: queryKeys.runDiff(id ?? '', run ?? ''),
+    queryFn: ({ signal }) => fetchRunDiff(id as string, run as string, signal),
+    enabled: id !== null && run !== null,
+    // A finished run's diff is immutable; a live one's changes as it writes.
+    staleTime: 2_000,
   });
 }

@@ -1,0 +1,10 @@
+# BuildKit prefers `<dockerfile>.dockerignore` over the context's, so the build
+# context stays small without adding an ignore file to the repo root.
+target/
+**/node_modules/
+.git/
+**/dist/
+**/.wrangler/
+**/test-results/
+**/playwright-report/
+data/

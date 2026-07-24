@@ -1,0 +1,24 @@
+{
+  "name": "@mari/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-lane end-to-end suites. The 1.3 loop lives here: it needs the control plane, marid, Docker and the chunk store at once, so it belongs to no single lane.",
+  "scripts": {
+    "test": "vitest run",
+    "test:loop": "vitest run loop.e2e.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mari/control-plane": "workspace:*",
+    "@mari/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
+    "ws": "^8.21.0",
+    "@cloudflare/workers-types": "^5.20260724.1"
+  }
+}

@@ -37,6 +37,11 @@ pub struct Journal {
     store: ChunkStore,
     local_dir: PathBuf,
     segment_size: usize,
+    /// Offset of the first byte this instance holds. Non-zero for a **resumed**
+    /// run (spec 5.6): the run's earlier life already produced bytes
+    /// `[0, base)`, so the continuation must take offsets from `base` on rather
+    /// than restarting at 0 and colliding with what the control plane holds.
+    base: u64,
     inner: Mutex<Inner>,
     /// Serializes segment flushing so the reserve/upload/commit sequence never
     /// interleaves with another flush of the same journal.
@@ -44,7 +49,9 @@ pub struct Journal {
 }
 
 struct Inner {
+    /// Bytes this instance produced; index 0 is journal offset `base`.
     buf: Vec<u8>,
+    /// Absolute offset up to which segments have been written.
     uploaded_up_to: u64,
     next_seq: u64,
     finished: bool,
@@ -60,6 +67,30 @@ impl Journal {
         local_root: impl AsRef<Path>,
         segment_size: usize,
     ) -> std::io::Result<Self> {
+        Self::resumed(run, computer, store, local_root, segment_size, 0, 0)
+    }
+
+    /// Create a journal that **continues** an earlier life of the same run
+    /// (spec 5.6): new bytes take offsets from `base_offset`, and new segments
+    /// take ordinals from `next_seq` so they cannot overwrite the segments the
+    /// earlier life wrote.
+    ///
+    /// `base_offset` is the highest journal end any surviving copy attests to.
+    /// When the control plane durably held bytes the earlier life never managed
+    /// to flush into a segment, the base is above the end of the stored segment
+    /// chain, and that chain reconstructs the run's journal with those bytes
+    /// missing — they exist only at the control plane, which is where the
+    /// journal's truth lives anyway (spec 4.2). The offsets stay correct either
+    /// way, which is what the stream contract depends on.
+    pub fn resumed(
+        run: RunId,
+        computer: ComputerId,
+        store: ChunkStore,
+        local_root: impl AsRef<Path>,
+        segment_size: usize,
+        base_offset: u64,
+        next_seq: u64,
+    ) -> std::io::Result<Self> {
         let local_dir = local_root.as_ref().join(run.as_str());
         std::fs::create_dir_all(&local_dir)?;
         Ok(Self {
@@ -68,14 +99,22 @@ impl Journal {
             store,
             local_dir,
             segment_size: segment_size.max(1),
+            base: base_offset,
             inner: Mutex::new(Inner {
                 buf: Vec::new(),
-                uploaded_up_to: 0,
-                next_seq: 0,
+                uploaded_up_to: base_offset,
+                next_seq,
                 finished: false,
             }),
             flush_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The offset of the first byte this instance holds (0 for a fresh run).
+    /// The streamer never asks for anything below it: those bytes belong to the
+    /// run's earlier life and are already at the control plane / in the store.
+    pub fn base_offset(&self) -> u64 {
+        self.base
     }
 
     /// The run this journal belongs to.
@@ -92,32 +131,43 @@ impl Journal {
         g.buf.extend_from_slice(data);
     }
 
-    /// Total bytes in the journal so far (the next offset).
+    /// The journal's end offset: the offset the next appended byte will take.
     pub fn len(&self) -> u64 {
-        self.inner.lock().unwrap().buf.len() as u64
+        self.base + self.inner.lock().unwrap().buf.len() as u64
     }
 
-    /// Whether the journal is empty.
+    /// Whether this instance holds no bytes.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len() == self.base
     }
 
     /// Read up to `max` bytes starting at byte offset `from`. Returns an empty
-    /// vec when `from` is at or past the end. Used by the streamer to build the
+    /// vec when `from` is at or past the end, and also when `from` is **below**
+    /// [`Journal::base_offset`] — those bytes belong to the run's earlier life
+    /// and this instance does not hold them. Used by the streamer to build the
     /// next [`mari_proto::SupervisorMessage::JournalFrame`] and by resume to
     /// re-read from the acked offset.
     pub fn read_from(&self, from: u64, max: usize) -> Vec<u8> {
+        if from < self.base {
+            return Vec::new();
+        }
         let g = self.inner.lock().unwrap();
-        let len = g.buf.len() as u64;
+        let len = self.base + g.buf.len() as u64;
         if from >= len {
             return Vec::new();
         }
-        let start = from as usize;
+        let start = (from - self.base) as usize;
         let end = (start + max).min(g.buf.len());
         g.buf[start..end].to_vec()
     }
 
-    /// The entire journal so far (test/assertion helper).
+    /// Bytes durably written to store segments so far (an absolute offset).
+    pub fn uploaded_len(&self) -> u64 {
+        self.inner.lock().unwrap().uploaded_up_to
+    }
+
+    /// Every byte this instance produced, i.e. the journal from
+    /// [`Journal::base_offset`] to the end (test/assertion helper).
     pub fn snapshot_bytes(&self) -> Vec<u8> {
         self.inner.lock().unwrap().buf.clone()
     }
@@ -144,17 +194,19 @@ impl Journal {
             // across the await.
             let job = {
                 let g = self.inner.lock().unwrap();
-                let len = g.buf.len() as u64;
+                let len = self.base + g.buf.len() as u64;
                 let start = g.uploaded_up_to;
                 let avail = len - start;
+                // Index into `buf`, whose element 0 is journal offset `base`.
+                let at = (start - self.base) as usize;
                 if avail == 0 {
                     None
                 } else if avail >= self.segment_size as u64 {
                     let take = self.segment_size;
-                    Some((g.next_seq, start, g.buf[start as usize..start as usize + take].to_vec()))
+                    Some((g.next_seq, start, g.buf[at..at + take].to_vec()))
                 } else if g.finished {
                     let take = avail as usize;
-                    Some((g.next_seq, start, g.buf[start as usize..start as usize + take].to_vec()))
+                    Some((g.next_seq, start, g.buf[at..at + take].to_vec()))
                 } else {
                     None
                 }
@@ -187,7 +239,9 @@ impl Journal {
         Ok(())
     }
 
-    /// Number of segments uploaded so far (test helper).
+    /// The next free segment ordinal — equal to the number of segments this run
+    /// has ever produced, including those written by an earlier life of a
+    /// resumed run (test helper and durable-record source).
     pub fn segments_uploaded(&self) -> u64 {
         self.inner.lock().unwrap().next_seq
     }
@@ -223,6 +277,74 @@ mod tests {
         assert_eq!(j.read_from(11, 100), b"");
         // Bounded read returns at most `max` bytes from `from`.
         assert_eq!(j.read_from(0, 5), b"hello");
+    }
+
+    /// A resumed run's journal continues the offsets and the segment ordinals of
+    /// its earlier life (spec 5.6): new bytes must never be handed out at
+    /// offsets the control plane already holds, and a new segment must never
+    /// overwrite one already in the store.
+    #[tokio::test]
+    async fn resumed_journal_continues_offsets_and_segment_ordinals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = store(tmp.path());
+        let computer = ComputerId::new("comp-resume");
+        let run = RunId::new("run-resume");
+        // The earlier life wrote 2 segments of 8 bytes = 16 bytes.
+        let j = Journal::resumed(
+            run.clone(),
+            computer.clone(),
+            st.clone(),
+            tmp.path().join("journal"),
+            8,
+            16,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(j.base_offset(), 16);
+        assert_eq!(j.len(), 16, "an empty resumed journal ends at its base");
+        assert!(j.is_empty());
+        // Nothing below the base is served: those bytes are the earlier life's.
+        assert_eq!(j.read_from(0, 100), b"");
+        assert_eq!(j.read_from(15, 100), b"");
+
+        j.append(b"CONTINUED");
+        assert_eq!(j.len(), 25);
+        assert_eq!(j.read_from(16, 100), b"CONTINUED");
+        // offset 16 is 'C'; offset 20 is the 5th byte of "CONTINUED".
+        assert_eq!(j.read_from(20, 100), b"INUED");
+        assert_eq!(j.read_from(25, 100), b"");
+
+        j.finish();
+        j.flush_ready_segments().await.unwrap();
+        // 9 bytes at a segment size of 8: a full segment at ordinal 2 and the
+        // 1-byte tail at ordinal 3 — the ordinals continue where the earlier
+        // life stopped, so segments 0 and 1 are never overwritten.
+        assert_eq!(j.segments_uploaded(), 4);
+        assert_eq!(j.uploaded_len(), 25);
+        assert_eq!(
+            st.operator()
+                .read(&Journal::segment_key(&computer, &run, 2))
+                .await
+                .unwrap()
+                .to_vec(),
+            b"CONTINUE"
+        );
+        assert_eq!(
+            st.operator()
+                .read(&Journal::segment_key(&computer, &run, 3))
+                .await
+                .unwrap()
+                .to_vec(),
+            b"D"
+        );
+        assert!(
+            st.operator()
+                .read(&Journal::segment_key(&computer, &run, 0))
+                .await
+                .is_err(),
+            "the resumed journal must not have written over ordinal 0"
+        );
     }
 
     #[tokio::test]

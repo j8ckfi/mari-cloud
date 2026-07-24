@@ -6,6 +6,7 @@ import { handleFetch } from './handler';
 import type { Env } from './types';
 
 export { ComputerDO } from './computer-do';
+export { EventsDO } from './events-do';
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

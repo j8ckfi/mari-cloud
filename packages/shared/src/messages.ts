@@ -7,8 +7,15 @@
 import type { ComputerId, Epoch, JournalOffset, ManifestId, RunId } from './ids';
 import type { DiffSummary, SnapshotReason } from './manifest';
 
-/** Generic attention signal (spec 6.1). Bare snake_case string. */
-export type AttentionKind = 'bell' | 'osc' | 'blocked_read';
+/**
+ * Generic attention signal (spec 6.1). Bare snake_case string.
+ *
+ * `interrupted` is the supervisor's defined degradation: a run it could not
+ * continue after a restart (no agent adapter / no resume template, spec 5.6) or
+ * one a WARM rollback (spec 4.7) hit that it may not safely replay. Like every
+ * other kind it is content-free — the kind is the whole signal.
+ */
+export type AttentionKind = 'bell' | 'osc' | 'blocked_read' | 'interrupted';
 
 /** How a child process ended. Adjacently tagged like the envelopes. */
 export type ExitStatus =
@@ -69,6 +76,26 @@ export interface RunHeartbeat {
   run: RunId;
 }
 
+/** One run's journal divergence in a {@link RollbackDetected} report. */
+export interface RunRollback {
+  run: RunId;
+  /** Journal bytes the control plane durably holds (its `hello_ack` offset). */
+  control_offset: JournalOffset;
+  /** Journal bytes still present on the restored (older) disk. */
+  disk_offset: JournalOffset;
+  /** True if the supervisor judged replay safe and restarted the run. */
+  replayed: boolean;
+}
+
+/** WARM-rollback report (spec 4.7): the disk is behind what was recorded. */
+export interface RollbackDetected {
+  disk_manifest: ManifestId;
+  recorded_manifest: ManifestId | null;
+  /** The on-disk tree measured against `recorded_manifest`. */
+  diff: DiffSummary;
+  runs: RunRollback[];
+}
+
 /** Supervisor -> control envelope. */
 export type SupervisorMessage =
   | { t: 'hello'; c: Hello }
@@ -78,7 +105,8 @@ export type SupervisorMessage =
   | { t: 'snapshot_written'; c: SnapshotWritten }
   | { t: 'head_advance_request'; c: HeadAdvanceRequest }
   | { t: 'attention'; c: Attention }
-  | { t: 'run_heartbeat'; c: RunHeartbeat };
+  | { t: 'run_heartbeat'; c: RunHeartbeat }
+  | { t: 'rollback_detected'; c: RollbackDetected };
 
 /** Discriminant strings of {@link SupervisorMessage}. */
 export type SupervisorMessageTag = SupervisorMessage['t'];

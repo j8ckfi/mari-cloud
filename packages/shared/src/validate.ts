@@ -71,6 +71,7 @@ const SUPERVISOR_TAGS: ReadonlySet<string> = new Set<SupervisorMessageTag>([
   'head_advance_request',
   'attention',
   'run_heartbeat',
+  'rollback_detected',
 ]);
 
 const CONTROL_TAGS: ReadonlySet<string> = new Set<ControlMessageTag>([

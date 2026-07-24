@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    // These suites import the control plane BY PATH (it publishes no entry
+    // map), so `tsc` follows the import into a Workers-typed package: the
+    // `cloudflare:workers` builtin and the Workers globals have to resolve here
+    // too. The path below is the same file `vitest.config.ts` aliases at
+    // runtime, so the type view and the run view agree.
+    "types": ["node", "@cloudflare/workers-types"],
+    "paths": {
+      "cloudflare:workers": ["../packages/control-plane/src/node/cloudflare-workers.ts"]
+    },
+    "noEmit": true
+  },
+  "include": ["*.ts", "src/**/*.ts"]
+}

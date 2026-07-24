@@ -1,0 +1,63 @@
+# The Mari BASE IMAGE (spec §2: "a shared manifest (operating system,
+# toolchains). The fleet stores each base image once").
+#
+# It contains exactly two things a computer needs to exist on a substrate:
+#   * `marid`, the supervisor, built for Linux from this repo — it is the
+#     container's entrypoint, so `materialize` needs no command override;
+#   * a plain POSIX userland (`/bin/sh`, coreutils) because a run is an
+#     arbitrary program the user brought (spec §2 "Agent"), and control-plane
+#     file writes are expressed as `/bin/sh -c … base64 -d > path` runs
+#     (contracts.md Appendix C.2).
+#
+# `/work` is the computer's filesystem root (MARI_ROOT) — the tree that gets
+# snapshotted into the chunk store; `/store` is where the private instance binds
+# the chunk store (MARI_STORE=fs:///store).
+#
+# Build (from the repo root):
+#   docker build -f deploy/Dockerfile.marid -t mari/base:v0 .
+#
+# The build context is the repo (Cargo workspace); deploy/Dockerfile.marid.dockerignore
+# keeps `target/`, `node_modules/` and `.git/` out of it.
+
+# ---- stage 1: build marid for Linux -----------------------------------------
+FROM rust:1-bookworm AS build
+
+WORKDIR /repo
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+
+# Cache mounts keep the cargo registry and target dir out of the image and make
+# a rebuild incremental. The binary is copied out inside the same RUN because a
+# cache mount does not survive the layer.
+ARG CARGO_PROFILE=release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/repo/target,sharing=locked \
+    set -eux; \
+    if [ "$CARGO_PROFILE" = "release" ]; then \
+      cargo build -p marid --locked --release; cp /repo/target/release/marid /marid; \
+    else \
+      cargo build -p marid --locked; cp /repo/target/debug/marid /marid; \
+    fi; \
+    /marid --help >/dev/null
+
+# ---- stage 2: the base image -------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /work /store /etc/mari/agents.d
+
+COPY --from=build /marid /usr/local/bin/marid
+
+# Defaults for the six substrate functions' env contract (contracts.md §5.1 and
+# crates/marid/src/config.rs). The control plane overrides computer id, control
+# URL, token, epoch and restore manifest at materialize time.
+ENV MARI_ROOT=/work \
+    MARI_STORE=fs:///store \
+    MARI_AGENTS_DIR=/etc/mari/agents.d \
+    RUST_LOG=info,marid=debug
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/marid"]

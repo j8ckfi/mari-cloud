@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use mari_proto::{
     AttentionKind, ComputerId, ControlMessage, DiffSummary, Epoch, ExitStatus, FrameReader,
-    JournalOffset, ManifestId, RunId, RunOffset, SnapshotReason, SupervisorMessage,
+    JournalOffset, ManifestId, RunId, RunOffset, RunRollback, SnapshotReason, SupervisorMessage,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -97,6 +97,15 @@ impl RunReassembly {
     }
 }
 
+/// A WARM-rollback report the supervisor sent (spec 4.7).
+#[derive(Clone, Debug)]
+pub struct RollbackReport {
+    pub disk_manifest: ManifestId,
+    pub recorded_manifest: Option<ManifestId>,
+    pub diff: DiffSummary,
+    pub runs: Vec<RunRollback>,
+}
+
 /// Everything the fake control plane observed. Tests lock and assert against it.
 #[derive(Default)]
 pub struct FakeState {
@@ -109,6 +118,8 @@ pub struct FakeState {
     pub head_advances: Vec<HeadAdvance>,
     pub attentions: Vec<(RunId, AttentionKind)>,
     pub heartbeats: HashMap<RunId, u32>,
+    /// WARM-rollback reports received (spec 4.7).
+    pub rollbacks: Vec<RollbackReport>,
     pub errors: Vec<String>,
     /// The DO's current (authoritative) fencing epoch: the max epoch of any
     /// `Hello` seen so far. Monotonic — a later wake never lowers it.
@@ -416,6 +427,19 @@ async fn handle_sup(
         }
         SupervisorMessage::RunHeartbeat { run } => {
             *state.lock().unwrap().heartbeats.entry(run).or_insert(0) += 1;
+        }
+        SupervisorMessage::RollbackDetected {
+            disk_manifest,
+            recorded_manifest,
+            diff,
+            runs,
+        } => {
+            state.lock().unwrap().rollbacks.push(RollbackReport {
+                disk_manifest,
+                recorded_manifest,
+                diff,
+                runs,
+            });
         }
     }
     Ok(())

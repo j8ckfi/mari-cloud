@@ -5,6 +5,11 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { AttachClient, attachUrl } from '../../ws/attach';
 import { EchoPredictor } from '../../terminal/predictor';
+import { stopRun } from '../../api/client';
+import { useEventsStore } from '../../store/events';
+import { liveRun } from '../../events/reducer';
+import { runStateLabel } from '../../runs/state';
+import { useUiStore } from '../../store/ui';
 import type { GridSnapshot } from '@mari/shared';
 import type { TerminalPaneSpec } from '../../wm/pane';
 
@@ -40,6 +45,9 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   const [renderer, setRenderer] = useState<'webgl' | 'dom'>('dom');
   const [predict, setPredict] = useState<{ text: string; pending: number }>({ text: '', pending: 0 });
+  const live = useEventsStore((s) => liveRun(s.model, computer, spec.run));
+  const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
+  const openRunDiff = useUiStore((s) => s.openRunDiff);
 
   useEffect(() => {
     const el = host.current;
@@ -133,14 +141,52 @@ export function TerminalPane({
   }, [focused]);
 
   return (
-    <div style={{ position: 'absolute', inset: 0 }} data-testid="terminal-pane" data-renderer={renderer}>
-      <div className="term-host" ref={host} />
-      {predict.pending > 0 && (
-        <div className="term-predict" data-testid="term-predict">
-          <span className="hint">predicting </span>
-          <span className="predicted">{predict.text}</span>
-        </div>
-      )}
+    <div
+      style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}
+      data-testid="terminal-pane"
+      data-renderer={renderer}
+      data-run={spec.run}
+    >
+      {/* A run's controls live with its view (spec 7.1: the pane is a view of
+          the run, so stopping is an action ON the run, not on this pane). */}
+      <div className="term-bar">
+        <span className="hint" data-testid="term-run">
+          {spec.run}
+        </span>
+        {live !== null && (
+          <span className={`run-state ${live.state}`} data-testid="term-run-state">
+            {runStateLabel(live.state, live.exitCode)}
+          </span>
+        )}
+        <span className="spacer" style={{ flex: 1 }} />
+        <button type="button" data-testid="term-run-command" onClick={() => setRunLauncherOpen(true)}>
+          Run command
+        </button>
+        <button
+          type="button"
+          data-testid="term-stop"
+          onClick={() => void stopRun(computer, spec.run).catch(() => undefined)}
+        >
+          Stop
+        </button>
+        <button
+          type="button"
+          data-testid="term-review"
+          onClick={() => openRunDiff(computer, spec.run)}
+          title="Review this run’s changes"
+        >
+          Changes
+        </button>
+      </div>
+      <div className="term-wrap">
+        <div className="term-host" ref={host} />
+        {predict.pending > 0 && (
+          <div className="term-predict" data-testid="term-predict">
+            <span className="hint">predicting </span>
+            <span className="predicted">{predict.text}</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

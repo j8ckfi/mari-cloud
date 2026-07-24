@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use mari_proto::{
     AttentionKind, ComputerId, ControlMessage, DiffSummary, Epoch, ExitStatus, FrameReader,
-    JournalOffset, ManifestId, RunId, RunOffset, SnapshotReason, SupervisorMessage,
+    JournalOffset, ManifestId, RunId, RunOffset, RunRollback, SnapshotReason, SupervisorMessage,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -76,6 +76,22 @@ impl RunReassembly {
     }
 }
 
+/// A WARM-rollback report the supervisor sent (spec 4.7).
+#[derive(Clone, Debug)]
+pub struct RollbackReport {
+    pub disk_manifest: ManifestId,
+    pub recorded_manifest: Option<ManifestId>,
+    pub diff: DiffSummary,
+    pub runs: Vec<RunRollback>,
+}
+
+impl RollbackReport {
+    /// The per-run entry for `run`, if the report names it.
+    pub fn run(&self, run: &RunId) -> Option<&RunRollback> {
+        self.runs.iter().find(|r| &r.run == run)
+    }
+}
+
 /// Everything the fake control plane observed. Tests lock and assert against it.
 #[derive(Default)]
 pub struct FakeState {
@@ -91,6 +107,8 @@ pub struct FakeState {
     pub snapshots: Vec<(ManifestId, Epoch, SnapshotReason)>,
     pub head_advances: Vec<(ManifestId, Epoch)>,
     pub heartbeats: HashMap<RunId, u32>,
+    /// WARM-rollback reports received (spec 4.7).
+    pub rollbacks: Vec<RollbackReport>,
     /// Non-empty if any journal-integrity check failed.
     pub errors: Vec<String>,
 }
@@ -146,6 +164,18 @@ impl FakeControlPlane {
     /// Queue a control message to send to the supervisor on the live connection.
     pub fn queue_control(&self, msg: ControlMessage) {
         self.ctrl.pending_out.lock().unwrap().push_back(msg);
+    }
+
+    /// Pre-load a run's journal as if an earlier supervisor had streamed these
+    /// bytes and this control plane had durably kept them. `hello_ack` then
+    /// reports `bytes.len()` as the run's acked offset — the state a resumed run
+    /// must continue from, not restart at (spec 5.6).
+    pub fn seed_journal(&self, run: &RunId, bytes: &[u8]) {
+        let mut s = self.state.lock().unwrap();
+        let entry = s.journals.entry(run.clone()).or_default();
+        entry.buf.clear();
+        entry.buf.extend_from_slice(bytes);
+        entry.acked = bytes.len() as u64;
     }
 
     /// Drop the current connection (simulate a network kill), forcing the
@@ -405,6 +435,19 @@ async fn handle_sup(
         }
         SupervisorMessage::RunHeartbeat { run } => {
             *state.lock().unwrap().heartbeats.entry(run).or_insert(0) += 1;
+        }
+        SupervisorMessage::RollbackDetected {
+            disk_manifest,
+            recorded_manifest,
+            diff,
+            runs,
+        } => {
+            state.lock().unwrap().rollbacks.push(RollbackReport {
+                disk_manifest,
+                recorded_manifest,
+                diff,
+                runs,
+            });
         }
     }
     Ok(())

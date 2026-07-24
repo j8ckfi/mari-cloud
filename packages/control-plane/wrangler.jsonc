@@ -14,6 +14,12 @@
       {
         "name": "COMPUTER",
         "class_name": "ComputerDO"
+      },
+      {
+        // One event hub per USER (not per computer): the fan-out point for the
+        // live attention / run / state stream at /api/events (spec 6.2).
+        "name": "EVENTS",
+        "class_name": "EventsDO"
       }
     ]
   },
@@ -22,6 +28,10 @@
       "tag": "v1",
       // SQLite-backed DO storage (spec 3.2): ctx.storage.sql + KV.
       "new_sqlite_classes": ["ComputerDO"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["EventsDO"]
     }
   ],
 

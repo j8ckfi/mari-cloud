@@ -43,6 +43,10 @@ export interface SubstrateCall {
  */
 export class FakeSubstrate implements SubstrateProvider {
   readonly calls: SubstrateCall[] = [];
+  /** Every `materialize` spec, so a test can assert the CONFIGURATION the DO
+   *  hands `marid` (contracts.md §5.1 / crates/marid/src/config.rs) and not just
+   *  that a call happened. */
+  readonly specs: MaterializeSpec[] = [];
   #seq = 0;
 
   /** Count of wake-ish operations, for "did browsing wake it?" assertions. */
@@ -50,8 +54,14 @@ export class FakeSubstrate implements SubstrateProvider {
     return this.calls.filter((c) => c.op === 'wake' || c.op === 'materialize').length;
   }
 
+  /** The most recent materialize spec, or null. */
+  get lastSpec(): MaterializeSpec | null {
+    return this.specs.length === 0 ? null : (this.specs[this.specs.length - 1] as MaterializeSpec);
+  }
+
   async materialize(spec: MaterializeSpec): Promise<SubstrateHandle> {
     this.calls.push({ op: 'materialize', at: Date.now(), detail: spec.computer });
+    this.specs.push(spec);
     return { substrate: 'fake', computer: spec.computer, id: `fake-${++this.#seq}` };
   }
 
@@ -84,13 +94,30 @@ export class FakeSubstrate implements SubstrateProvider {
   }
 }
 
+/** The part of `Env` this module reads. Typed structurally so `substrate.ts`
+ *  does not import the binding types (and so nothing Node-only is reachable
+ *  from the Workers bundle — see below). */
+interface SubstrateEnv {
+  SUBSTRATE_MODE?: string;
+  SUBSTRATE?: SubstrateProvider;
+}
+
 /**
- * Choose a substrate driver from the environment. v0 control-plane: only the
- * fake is constructed here (real drivers live behind `./substrates`'
- * `createSubstrate`/`selectSubstrate`, wired at the Docker-e2e / private-instance
- * milestone). Defaults to the fake so the DO never accidentally hits a real API.
+ * Choose the substrate driver for a Durable Object.
+ *
+ * A REAL driver is never constructed here: Docker needs dockerode and a daemon
+ * socket, neither of which exists on Workers, and even a dynamic `import()`
+ * would drag the module into the Workers bundle. Instead the private-instance
+ * runtime performs the spec §3.6 selection itself (`src/node/substrate.ts`) and
+ * INJECTS the ready driver as `env.SUBSTRATE`. The Workers entry leaves that
+ * unset and gets the fake, so the DO never accidentally hits a real API.
  */
-export function makeSubstrate(mode: string | undefined): SubstrateProvider {
+export function makeSubstrate(
+  mode: string | undefined,
+  env?: SubstrateEnv,
+): SubstrateProvider {
+  const injected = env?.SUBSTRATE;
+  if (injected && mode !== 'fake') return injected;
   switch (mode) {
     case 'fake':
     default:

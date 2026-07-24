@@ -8,8 +8,39 @@ importers:
 
   .: {}
 
+  e2e:
+    dependencies:
+      '@mari/control-plane':
+        specifier: workspace:*
+        version: link:../packages/control-plane
+      '@mari/shared':
+        specifier: workspace:*
+        version: link:../packages/shared
+    devDependencies:
+      '@cloudflare/workers-types':
+        specifier: ^5.20260724.1
+        version: 5.20260724.1
+      '@types/node':
+        specifier: ^26.1.1
+        version: 26.1.1
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(@types/node@26.1.1)(jsdom@29.1.1(@noble/hashes@2.2.0))(vite@8.1.5(@types/node@26.1.1)(esbuild@0.28.1))
+      ws:
+        specifier: ^8.21.0
+        version: 8.21.0
+
   packages/control-plane:
     dependencies:
+      '@hono/node-server':
+        specifier: ^2.0.11
+        version: 2.0.11(hono@4.12.32)
       '@mari/shared':
         specifier: workspace:*
         version: link:../shared
@@ -19,12 +50,18 @@ importers:
       cbor-x:
         specifier: ^1.6.4
         version: 1.6.4
+      dockerode:
+        specifier: ^5.0.1
+        version: 5.0.1
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(@cloudflare/workers-types@5.20260724.1)(kysely@0.29.4)
       hono:
         specifier: ^4.12.32
         version: 4.12.32
+      ws:
+        specifier: ^8.21.0
+        version: 8.21.0
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -35,18 +72,18 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^5.20260724.1
         version: 5.20260724.1
-      '@hono/node-server':
-        specifier: ^2.0.11
-        version: 2.0.11(hono@4.12.32)
       '@types/dockerode':
         specifier: ^4.0.1
         version: 4.0.1
       '@types/node':
         specifier: ^26.1.1
         version: 26.1.1
-      dockerode:
-        specifier: ^5.0.1
-        version: 5.0.1
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
+      esbuild:
+        specifier: ^0.28.1
+        version: 0.28.1
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -1050,6 +1087,9 @@ packages:
 
   '@types/ssh2@1.15.5':
     resolution: {integrity: sha512-N1ASjp/nXH3ovBHddRJpli4ozpk6UdDYIX4RJWFa9L1YKnzdhTlVmiGHm4DZnj/jLbqZpes4aeR30EFGQtvhQQ==}
+
+  '@types/ws@8.18.1':
+    resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     resolution: {integrity: sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==}
@@ -2870,6 +2910,10 @@ snapshots:
   '@types/ssh2@1.15.5':
     dependencies:
       '@types/node': 18.19.130
+
+  '@types/ws@8.18.1':
+    dependencies:
+      '@types/node': 26.1.1
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     optional: true

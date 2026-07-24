@@ -1,5 +1,7 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { test as setup, expect } from '@playwright/test';
-import { STORAGE_STATE } from './auth-paths';
+import { SEED_RECORD, STORAGE_STATE } from './auth-paths';
 
 // Auth setup for the e2e suite. The control plane runs with DEV_SEED=1 (a
 // deterministic COLD fleet exists) and DEV_AUTH=1 (email/password sign-in is
@@ -20,13 +22,30 @@ setup('authenticate via dev seed', async ({ request }) => {
   expect(res.status(), await res.text()).toBe(200);
 
   const body = (await res.json()) as {
-    computer: { id: string; state: string };
+    computer: { id: string; state: string; head: string };
+    manifest: string;
     files: string[];
+    postRunManifest: string;
+    postRunFiles: string[];
   };
   // Sanity: the deterministic seed produced a COLD computer with a real tree.
   expect(body.computer.state).toBe('cold');
   expect(body.files.length).toBeGreaterThan(0);
 
+  // …and a SECOND real manifest, the post-run side of a difference. A run's
+  // result is a diff between two manifests (spec 5.3) and only a supervisor can
+  // write one, so the e2e's fake supervisor reports THESE ids — both of which
+  // are really in R2 — instead of an invented one that would make the review
+  // pane render an error and the assertion prove nothing.
+  expect(body.manifest, 'seed manifest id').toMatch(/^[0-9a-f]{64}$/);
+  expect(body.postRunManifest, 'post-run manifest id').toMatch(/^[0-9a-f]{64}$/);
+  expect(body.postRunManifest).not.toBe(body.manifest);
+  expect(body.computer.head).toBe(body.manifest);
+
   // Persist the session cookie so the browser context is authenticated.
   await request.storageState({ path: STORAGE_STATE });
+
+  // Record the seed for the specs (manifest ids, computer id, file lists).
+  fs.mkdirSync(path.dirname(SEED_RECORD), { recursive: true });
+  fs.writeFileSync(SEED_RECORD, JSON.stringify(body, null, 2));
 });

@@ -1,12 +1,12 @@
-import { useRef, useState } from 'react';
-import { useDir } from '../../api/queries';
-import { fetchFile, writeFile } from '../../api/client';
+import { useEffect, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { queryKeys, useDir } from '../../api/queries';
+import { fetchFile, uploadFile } from '../../api/client';
 import { useUiStore } from '../../store/ui';
+import { openActionFor } from '../../files/dispatch';
+import { setActiveFiles } from '../../store/pane-actions';
 import type { FileEntry } from '../../api/types';
 import type { FilesPaneSpec } from '../../wm/pane';
-
-const TEXT_EXT = /\.(md|markdown|txt|json|ya?ml|toml|ini|conf|cfg|env|sh|rs|ts|tsx|js|jsx|css|html?|xml|py|go|lock|gitignore)$/i;
-const PREVIEWABLE = new Set(['file']);
 
 function joinPath(dir: string, name: string): string {
   return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
@@ -22,41 +22,73 @@ function parentOf(path: string): string {
 /**
  * Files pane (spec 8.5): a filesystem browser over the manifest-backed API,
  * which works fully on a COLD computer (spec 8.4 — reads come from the manifest
- * head, never a wake). Opening a file dispatches it to the correct pane type.
- * Upload/download are supported; an upload WRITES and therefore wakes (8.4).
+ * head, never a wake). Opening a file dispatches it to the pane of the correct
+ * type (see files/dispatch). Upload and download are both possible; an upload
+ * WRITES and therefore wakes (8.4), and the pane says so instead of blocking.
  */
 export function FilesPane({ computer, spec }: { computer: string; spec: FilesPaneSpec }) {
   const [path, setPath] = useState(spec.path);
+  const [status, setStatus] = useState('');
   const addPane = useUiStore((s) => s.addPane);
   const uploadRef = useRef<HTMLInputElement>(null);
   const dir = useDir(computer, path);
+  const qc = useQueryClient();
 
   const open = (entry: FileEntry): void => {
-    if (entry.kind === 'dir') {
-      setPath(entry.path);
-      return;
-    }
-    if (!PREVIEWABLE.has(entry.kind)) return;
-    if (TEXT_EXT.test(entry.name) || entry.size < 512 * 1024) {
-      addPane({ kind: 'editor', path: entry.path });
+    const action = openActionFor(entry);
+    switch (action.kind) {
+      case 'browse':
+      case 'follow':
+        setPath(action.path);
+        return;
+      case 'editor':
+        addPane({ kind: 'editor', path: action.path });
+        return;
+      case 'download':
+        void download(entry);
+        return;
     }
   };
 
   const download = async (entry: FileEntry): Promise<void> => {
-    const bytes = await fetchFile(computer, entry.path);
-    const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = entry.name;
-    a.click();
-    URL.revokeObjectURL(url);
+    setStatus(`Downloading ${entry.name}…`);
+    try {
+      const bytes = await fetchFile(computer, entry.path);
+      const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = entry.name;
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus('');
+    } catch {
+      setStatus(`Could not download ${entry.name}`);
+    }
   };
 
   const onUpload = async (file: File): Promise<void> => {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    await writeFile(computer, joinPath(path, file.name), bytes);
-    void dir.refetch();
+    const target = joinPath(path, file.name);
+    // Spec 8.4: this write wakes the computer. Spec 8.3: say so, do not wait.
+    setStatus(`Uploading ${file.name}…`);
+    try {
+      const res = await uploadFile(computer, target, file);
+      setStatus(`Uploaded ${file.name} · ${res.state}`);
+      void qc.invalidateQueries({ queryKey: queryKeys.fleet });
+      void dir.refetch();
+    } catch {
+      setStatus(`Upload of ${file.name} failed`);
+    }
   };
+
+  // Publish this pane's actions for the palette's stable Files commands
+  // (spec 8.1). Re-published per path so "Upload" targets what is on screen.
+  useEffect(() => {
+    return setActiveFiles({
+      path,
+      upload: () => uploadRef.current?.click(),
+      up: () => setPath((p) => parentOf(p)),
+    });
+  }, [computer, path]);
 
   const entries = dir.data?.entries ?? [];
 
@@ -74,13 +106,18 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
         <span className="files-path" data-testid="files-path">
           {path}
         </span>
-        <button type="button" onClick={() => uploadRef.current?.click()}>
+        <span className="spacer" style={{ flex: 1 }} />
+        <span className="hint" data-testid="files-status">
+          {status}
+        </span>
+        <button type="button" onClick={() => uploadRef.current?.click()} data-testid="files-upload">
           Upload
         </button>
         <input
           ref={uploadRef}
           type="file"
           hidden
+          data-testid="files-upload-input"
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) void onUpload(f);
@@ -96,6 +133,7 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
               className="file-row"
               data-testid="file-entry"
               data-kind={entry.kind}
+              data-path={entry.path}
               onDoubleClick={() => open(entry)}
               onClick={() => open(entry)}
             >
@@ -110,6 +148,7 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
                 type="button"
                 title="Download"
                 className="hint"
+                data-testid="file-download"
                 onClick={() => void download(entry)}
               >
                 ⇩
@@ -117,9 +156,7 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
             )}
           </div>
         ))}
-        {dir.isError && (
-          <div className="empty-note">Could not read directory.</div>
-        )}
+        {dir.isError && <div className="empty-note">Could not read directory.</div>}
       </div>
     </div>
   );

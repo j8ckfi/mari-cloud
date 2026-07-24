@@ -36,11 +36,34 @@ export interface BrowserPreviewPaneSpec {
   title?: string;
 }
 
+/** Runs pane: the run list of one computer (spec 5, spec 8.2 "active runs"). */
+export interface RunsPaneSpec {
+  kind: 'runs';
+  title?: string;
+}
+
+/**
+ * Difference pane: the reviewed difference between two manifests. With `run`
+ * set it is the result review of that run (spec 5.3); with `base`/`head` set it
+ * is a fork difference (spec 9.2). Same view, same data, no automatic merge.
+ */
+export interface DiffPaneSpec {
+  kind: 'diff';
+  /** The run whose result is under review, when this is a run diff. */
+  run?: RunId;
+  /** Explicit manifests, when this is a manifest-to-manifest (fork) diff. */
+  base?: string;
+  head?: string;
+  title?: string;
+}
+
 export type PaneSpec =
   | TerminalPaneSpec
   | FilesPaneSpec
   | EditorPaneSpec
-  | BrowserPreviewPaneSpec;
+  | BrowserPreviewPaneSpec
+  | RunsPaneSpec
+  | DiffPaneSpec;
 
 export type PaneKind = PaneSpec['kind'];
 
@@ -56,7 +79,21 @@ export function paneLabel(pane: PaneSpec): string {
       return `Editor · ${basename(pane.path)}`;
     case 'preview':
       return `Preview · :${pane.port}`;
+    case 'runs':
+      return 'Runs';
+    case 'diff':
+      return pane.run !== undefined ? `Changes · ${pane.run}` : 'Changes';
   }
+}
+
+/** Whether a pane is the terminal view of a particular run (spec 6.2 target). */
+export function isTerminalFor(pane: PaneSpec, run: RunId): boolean {
+  return pane.kind === 'terminal' && pane.run === run;
+}
+
+/** Whether a pane is the difference view of a particular run (spec 5.3). */
+export function isDiffFor(pane: PaneSpec, run: RunId): boolean {
+  return pane.kind === 'diff' && pane.run === run;
 }
 
 function basename(path: string): string {

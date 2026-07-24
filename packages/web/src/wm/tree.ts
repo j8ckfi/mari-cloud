@@ -92,6 +92,21 @@ export function findPane(node: WmNode | null, id: string): PaneNode | null {
 }
 
 /**
+ * Find the first pane leaf whose spec satisfies `predicate`, in left-to-right
+ * depth-first order. Used to reuse an existing pane instead of stacking a
+ * duplicate — e.g. an attention event opening "the terminal pane of that run"
+ * (spec 6.2) must focus the one that is already there.
+ */
+export function findPaneBy(
+  node: WmNode | null,
+  predicate: (pane: PaneSpec) => boolean,
+): PaneNode | null {
+  if (node === null) return null;
+  if (node.type === 'pane') return predicate(node.pane) ? node : null;
+  return findPaneBy(node.a, predicate) ?? findPaneBy(node.b, predicate);
+}
+
+/**
  * Split the pane `targetId` along `axis`, inserting `newPane`. The existing
  * pane keeps slot `a`; the new pane takes slot `b` (so a horizontal split puts
  * the new pane to the right, a vertical split puts it below). Returns the new

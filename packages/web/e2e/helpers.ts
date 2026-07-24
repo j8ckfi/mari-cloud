@@ -1,4 +1,37 @@
-import type { Page, Locator } from '@playwright/test';
+import fs from 'node:fs';
+import type { Page, Locator, APIRequestContext } from '@playwright/test';
+import { SEED_RECORD } from './auth-paths';
+
+/** The control plane the e2e suite boots (playwright.config.ts pins the port). */
+export const CONTROL_PLANE: string =
+  (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+    ?.MARI_CONTROL_PLANE ?? 'http://127.0.0.1:8787';
+
+/** The dev seed's response body, as the setup project recorded it. */
+export interface SeedRecord {
+  computer: { id: string; name: string; state: string; head: string };
+  /** The manifest every seeded computer's head points at. */
+  manifest: string;
+  files: string[];
+  /** A second real manifest in R2: the seed tree after a run touched it. */
+  postRunManifest: string;
+  postRunFiles: string[];
+}
+
+/**
+ * The seed record written by `global.setup.ts`. Throws if it is missing — a
+ * spec that silently fell back to invented manifest ids would assert against
+ * the review pane's ERROR state and prove nothing (that is the bug this file
+ * pair exists to prevent).
+ */
+export function seedRecord(): SeedRecord {
+  const raw = fs.readFileSync(SEED_RECORD, 'utf8');
+  const parsed = JSON.parse(raw) as SeedRecord;
+  if (!parsed.manifest || !parsed.postRunManifest) {
+    throw new Error(`seed record at ${SEED_RECORD} has no manifest ids`);
+  }
+  return parsed;
+}
 
 /**
  * Record every request that would cause a computer to WAKE. A wake is either an
@@ -56,4 +89,29 @@ export function spinnerSeen(page: Page): Promise<boolean> {
 /** The first COLD computer card in the fleet. */
 export function coldCard(page: Page): Locator {
   return page.locator('[data-testid="computer-card"][data-state="cold"]').first();
+}
+
+/**
+ * Clear every computer's saved pane layout.
+ *
+ * Pane layouts persist in the Durable Object (spec 8.6) — which is the product
+ * working correctly, and which makes a workspace's contents depend on what an
+ * EARLIER test left behind. A spec that opens a pane and asserts on it must
+ * therefore state its precondition instead of inheriting one.
+ *
+ * This runs on the `request` fixture: a separate APIRequestContext, so the
+ * setup PUTs are not page traffic and cannot be mistaken for the application
+ * waking a computer. Call it BEFORE `installNoWakeSpy` / `page.goto` all the
+ * same, so the window a spec observes contains only the app's own requests.
+ */
+export async function resetLayouts(request: APIRequestContext): Promise<void> {
+  const res = await request.get('/api/fleet');
+  if (!res.ok()) throw new Error(`fleet read failed: ${res.status()}`);
+  const body = (await res.json()) as { computers: Array<{ id: string }> };
+  for (const c of body.computers) {
+    const put = await request.put(`/api/computers/${encodeURIComponent(c.id)}/layout`, {
+      data: null,
+    });
+    if (!put.ok()) throw new Error(`layout reset failed for ${c.id}: ${put.status()}`);
+  }
 }

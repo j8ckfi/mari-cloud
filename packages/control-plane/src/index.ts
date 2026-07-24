@@ -4,6 +4,30 @@
 export { createApp } from './app';
 export { handleFetch } from './handler';
 export { ComputerDO } from './computer-do';
+export { EventsDO, type FleetEvent, sseRecord } from './events-do';
+export {
+  diffManifests,
+  diffManifestIds,
+  changedCount,
+  type ManifestDiff,
+  type DiffEntry,
+  type ModifiedEntry,
+} from './diff';
+export {
+  costMeter,
+  ratePerHour,
+  SUBSTRATE_PRICE_PER_HOUR,
+  type CostMeter,
+} from './pricing';
+export {
+  writeRunArgv,
+  normalizeWritePath,
+  shellQuote,
+  MAX_WRITE_BYTES,
+  type RunRecord,
+  type RunDetail,
+  type RunStatus,
+} from './runs';
 export { parsePreviewHost, type PreviewTarget } from './host';
 export { MiniVtEngine, type GridEngine } from './grid';
 export {

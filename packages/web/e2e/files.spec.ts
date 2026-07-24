@@ -1,10 +1,12 @@
 import { test, expect } from '@playwright/test';
-import { installNoWakeSpy, installSpinnerWatchdog, spinnerSeen, coldCard } from './helpers';
+import { installNoWakeSpy, installSpinnerWatchdog, resetLayouts, spinnerSeen, coldCard } from './helpers';
 
 // Spec 8.4: the file browser reads a COLD computer from its manifest head; no
 // wake, no spinner. Opening the workspace shows a Files pane rooted at "/".
 test.describe('file browser (COLD)', () => {
-  test('lists seeded paths of a COLD computer without waking it', async ({ page }) => {
+  test('lists seeded paths of a COLD computer without waking it', async ({ page, request }) => {
+    // Precondition: a workspace with no leftover panes from another spec.
+    await resetLayouts(request);
     const wake = installNoWakeSpy(page);
     await installSpinnerWatchdog(page);
 

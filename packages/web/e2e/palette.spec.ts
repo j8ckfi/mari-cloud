@@ -1,11 +1,12 @@
 import { test, expect } from '@playwright/test';
-import { coldCard } from './helpers';
+import { coldCard, resetLayouts } from './helpers';
 
 // Spec 8.1: the command palette (Cmd+K) exposes every command and executes them
 // by keyboard. Here: open a workspace, open the palette, run "New terminal
 // pane", and assert a terminal pane appears.
 test.describe('command palette', () => {
-  test('opens on Cmd+K and executes a command by keyboard', async ({ page }) => {
+  test('opens on Cmd+K and executes a command by keyboard', async ({ page, request }) => {
+    await resetLayouts(request);
     await page.goto('/');
     await coldCard(page).click();
     await expect(page.getByTestId('workspace')).toBeVisible();

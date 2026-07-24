@@ -1,0 +1,13 @@
+# BuildKit reads `<dockerfile>.dockerignore` in preference to the context's
+# `.dockerignore`, so the base-image build can exclude the 7 GB host `target/`
+# without adding an ignore file to the repo root.
+target/
+**/node_modules/
+.git/
+packages/
+docs/
+deploy/
+**/dist/
+**/.wrangler/
+**/test-results/
+**/playwright-report/

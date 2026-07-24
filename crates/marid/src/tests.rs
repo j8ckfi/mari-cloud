@@ -34,16 +34,19 @@ fn build_manager(
 ) -> (Arc<RunManager>, UnboundedReceiver<SupervisorMessage>) {
     let (tx, rx) = unbounded_channel();
     let notify = Arc::new(Notify::new());
+    let computer = ComputerId::new("comp-test");
     let m = Arc::new(RunManager::new(
-        store,
+        store.clone(),
         root.to_path_buf(),
         journal_dir.to_path_buf(),
-        ComputerId::new("comp-test"),
+        computer.clone(),
         Epoch::new(1),
         tx,
         notify,
         silence,
         segment,
+        Arc::new(crate::adapters::AdapterSet::default()),
+        Arc::new(crate::state::DurableState::new(store, computer, Epoch::new(1))),
     ));
     (m, rx)
 }
@@ -429,6 +432,7 @@ fn ws_config(cp: &FakeControlPlane, root: &Path, store_dir: &Path) -> Config {
         snapshot_interval_secs: 3600,
         attention_silence_ms: 600_000,
         restore_manifest: None,
+        agents_dir: store_dir.join("agents.d"),
         segment_bytes: 4 * 1024 * 1024,
     }
 }

@@ -1,0 +1,62 @@
+# The Mari control plane, as a private instance (spec 11.2, spec 3.1's "or an
+# equivalent Node service").
+#
+# It runs the SAME Hono app and the SAME Durable Object classes as the
+# Cloudflare entry (packages/control-plane/src/node/ supplies the platform), so
+# there is one control plane in this repo, not two.
+#
+# Stage 1 produces two artifacts:
+#   * `dist/node.mjs` — the whole control plane bundled into one ESM file
+#     (esbuild, with `cloudflare:workers` aliased to the Node base class);
+#   * the built web application, served by that same process at `/`, so a
+#     private instance is ONE origin and needs no reverse proxy.
+#
+# The runtime stage carries no package manager and no native module: Durable
+# Object storage and D1 are `node:sqlite` (built in), R2 is a directory, and the
+# substrate is reached over the mounted Docker socket.
+
+# ---- stage 1: build ---------------------------------------------------------
+FROM node:24-slim AS build
+
+WORKDIR /repo
+RUN corepack enable
+
+# Manifests first, so editing source does not re-run the install.
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/control-plane/package.json packages/control-plane/
+COPY packages/web/package.json packages/web/
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+    pnpm install --frozen-lockfile --filter @mari/control-plane... --filter @mari/web...
+
+COPY packages ./packages
+RUN pnpm --filter @mari/control-plane build:node \
+ && pnpm --filter @mari/web exec vite build
+
+# ---- stage 2: runtime -------------------------------------------------------
+FROM node:24-slim
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates tini; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /var/lib/mari/data /var/lib/mari/store
+
+COPY --from=build /repo/packages/control-plane/dist/node.mjs /app/node.mjs
+COPY --from=build /repo/packages/web/dist /app/web
+COPY deploy/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENV NODE_ENV=production \
+    PORT=8787 \
+    MARI_BIND=0.0.0.0 \
+    MARI_DATA_DIR=/var/lib/mari/data \
+    MARI_STORE_DIR=/var/lib/mari/store \
+    MARI_WEB_DIR=/app/web \
+    MARI_SUBSTRATES=docker \
+    SUBSTRATE_MODE=docker
+
+EXPOSE 8787
+# tini reaps the node process cleanly on `docker compose down` so the control
+# plane's own SIGTERM handler (drain + close SQLite) actually runs.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

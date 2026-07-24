@@ -19,7 +19,7 @@ use mari_proto::messages::PROTO_VERSION;
 use mari_proto::{
     AttentionKind, ChunkRef, ComputerId, ComputerState, ControlMessage, DiffSummary, Epoch,
     EntryKind, ExitStatus, HeatProfile, JournalOffset, MANIFEST_VERSION, Manifest, ManifestEntry,
-    ManifestId, RunId, RunOffset, SnapshotReason, SupervisorMessage,
+    ManifestId, RunId, RunOffset, RunRollback, SnapshotReason, SupervisorMessage,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -223,6 +223,45 @@ fn generate_and_verify_fixtures() {
         &dir,
         "sup_run_heartbeat",
         &SupervisorMessage::RunHeartbeat { run: run.clone() },
+    );
+    // A run the supervisor could not continue after a restart (spec 5.6's
+    // defined degradation) — still content-free.
+    write_fixture(
+        &dir,
+        "sup_attention_interrupted",
+        &SupervisorMessage::Attention {
+            run: run.clone(),
+            kind: AttentionKind::Interrupted,
+        },
+    );
+    // The WARM-rollback report (spec 4.7): one run replayed (it had produced no
+    // journal output), one left interrupted.
+    write_fixture(
+        &dir,
+        "sup_rollback_detected",
+        &SupervisorMessage::RollbackDetected {
+            disk_manifest: base_manifest.clone(),
+            recorded_manifest: Some(head_manifest.clone()),
+            diff: DiffSummary {
+                added: 0,
+                modified: 1,
+                removed: 2,
+            },
+            runs: vec![
+                RunRollback {
+                    run: run.clone(),
+                    control_offset: JournalOffset::new(4096),
+                    disk_offset: JournalOffset::new(1024),
+                    replayed: false,
+                },
+                RunRollback {
+                    run: RunId::new("run-0002"),
+                    control_offset: JournalOffset::new(0),
+                    disk_offset: JournalOffset::new(0),
+                    replayed: true,
+                },
+            ],
+        },
     );
 
     // ---- control -> supervisor ----

@@ -47,10 +47,16 @@ async function tryWsRoute(request: Request, env: Env): Promise<Response | null> 
 
   // DEV-ONLY: prime the DO with the fencing epoch/token the fake supervisor
   // presents, so its `hello` handshake succeeds without a real substrate wake.
-  if (kind === 'supervisor' && env.DEV_AUTH === '1') {
-    const epoch = Number(url.searchParams.get('epoch') ?? '1') || 1;
-    const token = url.searchParams.get('token') ?? 'dev-supervisor';
-    await stub.devPrimeSupervisor(id, epoch, token);
+  //
+  // Both parameters must be present. A private instance runs with dev sign-in
+  // enabled (decisions.md Auth) while REAL supervisors dial this same route with
+  // no query at all; defaulting the prime would reset the DO's minted epoch and
+  // token on every such connect — fencing out the live supervisor (spec 4.1) and
+  // handing a known token to whoever opened the socket.
+  const devEpoch = url.searchParams.get('epoch');
+  const devToken = url.searchParams.get('token');
+  if (kind === 'supervisor' && env.DEV_AUTH === '1' && devEpoch !== null && devToken !== null) {
+    await stub.devPrimeSupervisor(id, Number(devEpoch) || 1, devToken);
   }
 
   // The DO routes on the path suffix; carry the computer id in a header.

@@ -22,7 +22,12 @@ portable-pty = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "2"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
+# Declarative agent adapters (spec 5.6): /etc/mari/agents.d/*.toml.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# Same version mari-core uses: marid names `ErrorKind::NotFound` when reading its
+# own durable state objects (runs/, state/) through the store's operator.
+opendal = { version = "0.57", default-features = false, features = ["services-fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"

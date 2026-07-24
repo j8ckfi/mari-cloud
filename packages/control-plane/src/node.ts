@@ -1,53 +1,40 @@
-// Node entry for private instances (spec 11.2, decisions.md v0 deviation 4).
+// Node entry for private instances (spec 11.2, decisions.md deviation 4).
 //
-// v0 status: the shared Hono app factory compiles and boots under Node via
-// @hono/node-server, giving private instances the same REST surface. Full
-// Durable Object parity on Node (SQLite-backed coordination, alarms) arrives
-// with the private-instance milestone; until then the DO/D1/R2 bindings must be
-// provided by a Node-native adapter. The binding object is assembled from
-// `process.env` and cast at this platform boundary (decisions.md permits a cast
-// at the edge, kept localized here).
+// The Node runtime runs the SAME Hono app and the SAME `ComputerDO` /`EventsDO`
+// classes as the Workers entry; only the platform underneath differs, and it
+// lives in `./node/`:
+//
+//   Durable Object   `node/namespace.ts` + `node/state.ts` — one actor per
+//                    computer id, SQLite storage (`node/sql.ts`), a persisted
+//                    alarm driving the tier policy (spec 4.4)
+//   D1               `node/d1.ts`   — local SQLite
+//   R2               `node/r2.ts`   — a directory keyed by contracts.md §9, the
+//                    same directory `marid` opens as `fs:///store`
+//   WebSockets       `node/server.ts` — a real `ws` server bridged onto the
+//                    `WebSocketPair` the DO answers with
+//   Substrate        `node/substrate.ts` — Docker/Sprites selected per wake
+//                    (spec 3.6), not the test fake
+//
+// Run it: `node dist/node.mjs` (see deploy/README.md), or `boot()` from a test.
 
-import { serve } from '@hono/node-server';
-import { handleFetch } from './handler';
-import type { Env } from './types';
+export { boot, type BootOptions, type NodeInstance } from './node/boot.js';
+export { readConfig, createNodeRuntime, type NodeConfig, type NodeRuntimeEnv } from './node/env.js';
+export { ensureBaseManifest, baseComputerId, basePointerKey } from './node/base-image.js';
 
-/** Assemble an `Env` from process env. Node-native DO/D1/R2 adapters are wired
- *  in the private-instance milestone; here they are left undefined and any route
- *  that needs them throws until then (documented deviation 4). */
-export function nodeEnv(): Env {
-  const e = process.env;
-  // The platform boundary: Node has no Workers bindings yet in v0.
-  const bindings = {
-    PREVIEW_ZONE: e.PREVIEW_ZONE,
-    DEV_AUTH: e.DEV_AUTH,
-    DEV_SEED: e.DEV_SEED,
-    AUTH_SECRET: e.AUTH_SECRET,
-    BASE_URL: e.BASE_URL,
-    SUBSTRATE_MODE: e.SUBSTRATE_MODE,
-    WARM_IDLE_MS: e.WARM_IDLE_MS,
-    COLD_IDLE_MS: e.COLD_IDLE_MS,
-  } as unknown as Env;
-  return bindings;
-}
+import { boot } from './node/boot.js';
 
-const nodeCtx: ExecutionContext = {
-  waitUntil() {},
-  passThroughOnException() {},
-} as unknown as ExecutionContext;
+/** Boot when executed directly (`node dist/node.mjs`), not when imported. */
+const executedDirectly =
+  typeof process !== 'undefined' &&
+  process.argv[1] !== undefined &&
+  import.meta.url === new URL(`file://${process.argv[1]}`).href;
 
-/** Boot an HTTP server bound to `port`. Returns the node-server handle. */
-export function boot(port = Number(process.env.PORT ?? 8787)) {
-  const env = nodeEnv();
-  return serve({
-    fetch: (request: Request) => handleFetch(request, env, nodeCtx),
-    port,
-  });
-}
-
-// Boot when executed directly (`node dist/node.js`), not when imported.
-if (import.meta.url === `file://${process.argv[1]}`) {
-  boot();
-  // eslint-disable-next-line no-console
-  console.log(`mari control-plane (node) listening on :${process.env.PORT ?? 8787}`);
+if (executedDirectly) {
+  const instance = await boot();
+  const shutdown = (signal: string) => {
+    console.log(`[mari] ${signal}: shutting down`);
+    void instance.close().then(() => process.exit(0));
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }

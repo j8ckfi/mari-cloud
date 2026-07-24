@@ -10,14 +10,17 @@ import {
   singlePane,
   splitPane,
   closePane as closePaneOp,
+  findPane,
+  findPaneBy,
   focusMove as focusMoveOp,
   focusPane as focusPaneOp,
   resizeSplit as resizeSplitOp,
   type Layout,
   type MoveDir,
+  type PaneNode,
   type SplitAxis,
 } from '../wm/tree';
-import type { PaneSpec } from '../wm/pane';
+import { isDiffFor, isTerminalFor, type PaneSpec } from '../wm/pane';
 
 export type View = 'fleet' | 'workspace';
 
@@ -34,6 +37,15 @@ interface UiState {
   /** Per-computer pane layout. */
   layouts: Record<string, Layout>;
   paletteOpen: boolean;
+  /** The "Run command" prompt (spec 8.1: every command is keyboard-reachable). */
+  runLauncherOpen: boolean;
+  /**
+   * One line of plain text reporting the outcome of a command the user ran
+   * from the palette (a snapshot, a stop). It is text, not a spinner: spec 8.3
+   * forbids blocking the interface, but a command that reports NOTHING is not
+   * operable either — the user cannot tell success from a dead key.
+   */
+  notice: string;
 
   // ---- navigation ----
   setWorkspaces(ids: string[]): void;
@@ -51,10 +63,20 @@ interface UiState {
   moveFocus(dir: MoveDir): void;
   focusPane(id: string): void;
   resizeFocusedSplit(splitId: string, ratio: number): void;
+  /** The focused pane leaf of the active computer, or null. */
+  focusedPane(): PaneNode | null;
+
+  // ---- runs (spec 5) ----
+  /** Focus the terminal pane of `run` on `computer`, opening one if absent. */
+  openRunTerminal(computer: string, run: string): void;
+  /** Focus the difference pane of `run`, opening one if absent (spec 5.3). */
+  openRunDiff(computer: string, run: string): void;
 
   // ---- palette ----
   setPaletteOpen(open: boolean): void;
   togglePalette(): void;
+  setRunLauncherOpen(open: boolean): void;
+  setNotice(text: string): void;
 }
 
 export const useUiStore = create<UiState>((set, get) => ({
@@ -63,6 +85,8 @@ export const useUiStore = create<UiState>((set, get) => ({
   activeComputer: null,
   layouts: {},
   paletteOpen: false,
+  runLauncherOpen: false,
+  notice: '',
 
   setWorkspaces: (ids) => set({ workspaces: ids }),
 
@@ -136,8 +160,50 @@ export const useUiStore = create<UiState>((set, get) => ({
     get().setLayout(id, resizeSplitOp(get().layoutFor(id), splitId, ratio));
   },
 
+  focusedPane: () => {
+    const id = get().activeComputer;
+    if (id === null) return null;
+    const layout = get().layoutFor(id);
+    if (layout.focused === null) return null;
+    return findPane(layout.root, layout.focused);
+  },
+
+  openRunTerminal: (computer, run) => {
+    get().openComputer(computer);
+    const layout = get().layoutFor(computer);
+    const existing = findPaneBy(layout.root, (p) => isTerminalFor(p, run));
+    if (existing !== null) {
+      get().setLayout(computer, focusPaneOp(layout, existing.id));
+      return;
+    }
+    const pane: PaneSpec = { kind: 'terminal', run };
+    const next =
+      layout.root === null || layout.focused === null
+        ? singlePane(pane)
+        : splitPane(layout, layout.focused, 'row', pane);
+    get().setLayout(computer, next);
+  },
+
+  openRunDiff: (computer, run) => {
+    get().openComputer(computer);
+    const layout = get().layoutFor(computer);
+    const existing = findPaneBy(layout.root, (p) => isDiffFor(p, run));
+    if (existing !== null) {
+      get().setLayout(computer, focusPaneOp(layout, existing.id));
+      return;
+    }
+    const pane: PaneSpec = { kind: 'diff', run };
+    const next =
+      layout.root === null || layout.focused === null
+        ? singlePane(pane)
+        : splitPane(layout, layout.focused, 'row', pane);
+    get().setLayout(computer, next);
+  },
+
   setPaletteOpen: (open) => set({ paletteOpen: open }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
+  setRunLauncherOpen: (open) => set({ runLauncherOpen: open }),
+  setNotice: (text) => set({ notice: text }),
 }));
 
 /** Non-hook accessor for imperative callers (hotkeys, command runners). */

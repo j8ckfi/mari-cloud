@@ -41,7 +41,14 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-const PANE_KINDS = new Set<PaneSpec['kind']>(['terminal', 'files', 'editor', 'preview']);
+const PANE_KINDS = new Set<PaneSpec['kind']>([
+  'terminal',
+  'files',
+  'editor',
+  'preview',
+  'runs',
+  'diff',
+]);
 
 function isValidNode(node: unknown): node is WmNode {
   if (!isRecord(node)) return false;

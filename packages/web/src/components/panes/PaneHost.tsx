@@ -4,6 +4,8 @@ import { TerminalPane } from './TerminalPane';
 import { FilesPane } from './FilesPane';
 import { EditorPane } from './EditorPane';
 import { BrowserPreviewPane } from './BrowserPreviewPane';
+import { RunsPane } from './RunsPane';
+import { DiffPane } from './DiffPane';
 
 /** Renders one leaf pane: a header plus the type-specific body. */
 export function PaneHost({
@@ -57,6 +59,8 @@ export function PaneHost({
         {pane.kind === 'preview' && (
           <BrowserPreviewPane computer={computer} user={user} spec={pane} />
         )}
+        {pane.kind === 'runs' && <RunsPane computer={computer} />}
+        {pane.kind === 'diff' && <DiffPane computer={computer} spec={pane} />}
       </div>
     </div>
   );

@@ -35,9 +35,12 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::adapters::AdapterSet;
 use crate::config::Config;
+use crate::continuation;
 use crate::journal::FRAME_CHUNK;
 use crate::run::RunManager;
+use crate::state::DurableState;
 use crate::store_uri::open_store;
 use crate::ws::{Backoff, decode_payload, send_framed};
 
@@ -48,17 +51,24 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const COLD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// State shared between the connection loop and the background tasks.
-struct Shared {
-    config: Config,
-    store: ChunkStore,
-    computer: ComputerId,
-    epoch: Epoch,
-    run_manager: Arc<RunManager>,
-    outbox_tx: UnboundedSender<SupervisorMessage>,
-    journal_notify: Arc<Notify>,
+pub(crate) struct Shared {
+    pub(crate) config: Config,
+    pub(crate) store: ChunkStore,
+    pub(crate) computer: ComputerId,
+    pub(crate) epoch: Epoch,
+    pub(crate) run_manager: Arc<RunManager>,
+    pub(crate) outbox_tx: UnboundedSender<SupervisorMessage>,
+    pub(crate) journal_notify: Arc<Notify>,
     /// Durably-acked journal offset per run (updated by `JournalAck`, seeded by
     /// `HelloAck`). The resume baseline.
-    acked: Mutex<HashMap<RunId, u64>>,
+    pub(crate) acked: Mutex<HashMap<RunId, u64>>,
+    /// True when THIS process restored the tree from the chunk store on the way
+    /// up (a cold wake). The disk is then exactly the manifest we wrote it from,
+    /// so the WARM-rollback comparison (spec 4.7) does not apply and is skipped.
+    pub(crate) cold_restored: bool,
+    /// Guards the one-shot startup continuation pass (spec 5.6 / 4.7): it runs
+    /// on the FIRST `HelloAck`, never again on a reconnect.
+    pub(crate) continuation_done: std::sync::atomic::AtomicBool,
 }
 
 /// The manifest exclusions the supervisor uses (spec 10.1): credential paths,
@@ -73,7 +83,7 @@ pub(crate) fn mari_excludes() -> Vec<String> {
 }
 
 impl Shared {
-    fn excludes(&self) -> Vec<String> {
+    pub(crate) fn excludes(&self) -> Vec<String> {
         mari_excludes()
     }
 
@@ -103,13 +113,27 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Cold-wake: restore the manifest into MARI_ROOT before connecting, ordered
     // by the stored heat profile, then feed the heat recorder for the next wake.
+    let cold_restored = config.restore_manifest.is_some();
     if let Some(manifest) = config.restore_manifest.clone() {
         restore_cold(&store, &computer, &config.root, &manifest).await?;
+    }
+
+    // Agent adapters (spec 5.6). Loading never fails: a malformed file is
+    // skipped, because the daemon owns runs that have nothing to do with it.
+    let adapters = Arc::new(AdapterSet::load_dir(&config.agents_dir));
+    if adapters.is_empty() {
+        info!(dir = %config.agents_dir.display(), "no agent adapters loaded");
+    } else {
+        info!(adapters = ?adapters.names(), "agent adapters loaded");
+    }
+    for (path, reason) in adapters.rejected() {
+        warn!(path = %path.display(), "agent adapter ignored: {reason}");
     }
 
     let (outbox_tx, mut outbox_rx) = unbounded_channel::<SupervisorMessage>();
     let journal_notify = Arc::new(Notify::new());
     let journal_dir = config.root.join(".mari").join("journal");
+    let durable = Arc::new(DurableState::new(store.clone(), computer.clone(), epoch));
     let run_manager = Arc::new(RunManager::new(
         store.clone(),
         config.root.clone(),
@@ -120,6 +144,8 @@ pub async fn run(config: Config) -> Result<()> {
         journal_notify.clone(),
         config.silence_threshold(),
         config.segment_bytes as usize,
+        adapters,
+        durable,
     ));
 
     let shared = Arc::new(Shared {
@@ -131,6 +157,8 @@ pub async fn run(config: Config) -> Result<()> {
         outbox_tx,
         journal_notify,
         acked: Mutex::new(HashMap::new()),
+        cold_restored,
+        continuation_done: std::sync::atomic::AtomicBool::new(false),
     });
 
     spawn_heartbeat(shared.clone());
@@ -243,12 +271,29 @@ async fn connect_and_serve(
 async fn handle_control(shared: &Arc<Shared>, msg: ControlMessage, sent: &mut HashMap<RunId, u64>) {
     match msg {
         ControlMessage::HelloAck { acked } => {
-            let mut acked_map = shared.acked.lock().unwrap();
-            for ro in acked {
-                let off = ro.offset.get();
-                // Resume: re-send from the durably-acked offset.
-                sent.insert(ro.run.clone(), off);
-                acked_map.insert(ro.run, off);
+            {
+                let mut acked_map = shared.acked.lock().unwrap();
+                for ro in acked {
+                    let off = ro.offset.get();
+                    // Resume: re-send from the durably-acked offset.
+                    sent.insert(ro.run.clone(), off);
+                    acked_map.insert(ro.run, off);
+                }
+            }
+            // The control plane has told us the journal head it holds for every
+            // run it knows. That is both halves of the startup duty: the
+            // reference for continuing unfinished runs (spec 5.6) and the
+            // journal head a WARM rollback is measured against (spec 4.7). Run
+            // it once, off the connection loop so a slow store cannot stall the
+            // socket; a reconnect must not re-run it.
+            if !shared
+                .continuation_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    continuation::run_startup_continuation(&shared).await;
+                });
             }
         }
         ControlMessage::JournalAck { run, offset } => {
@@ -330,6 +375,12 @@ where
                 .copied()
                 .unwrap_or(0)
         });
+        // A resumed run's journal starts above 0 (spec 5.6): its earlier life
+        // owns everything below `base_offset`, and this instance cannot serve
+        // those bytes. Never try to stream below the base — an ack lower than
+        // the base (the control plane holding less than the store recorded) must
+        // not park the stream at an offset that can only ever read empty.
+        off = off.max(journal.base_offset());
         loop {
             let chunk = journal.read_from(off, FRAME_CHUNK);
             if chunk.is_empty() {
@@ -382,6 +433,14 @@ where
     };
     match snapshot(&shared.store, &shared.config.root, &opts).await {
         Ok(res) => {
+            if let Err(e) = shared
+                .run_manager
+                .state()
+                .record_head(&res.manifest_id, shared.epoch)
+                .await
+            {
+                warn!("recording final head failed: {e:#}");
+            }
             send_framed(
                 write,
                 &SupervisorMessage::SnapshotWritten {
@@ -424,6 +483,14 @@ fn spawn_snapshot(shared: Arc<Shared>, reason: SnapshotReason) {
         let opts = shared.snapshot_opts();
         match snapshot(&shared.store, &shared.config.root, &opts).await {
             Ok(res) => {
+                if let Err(e) = shared
+                    .run_manager
+                    .state()
+                    .record_head(&res.manifest_id, shared.epoch)
+                    .await
+                {
+                    warn!("recording head failed: {e:#}");
+                }
                 let _ = shared.outbox_tx.send(SupervisorMessage::SnapshotWritten {
                     manifest: res.manifest_id.clone(),
                     epoch: shared.epoch,
@@ -648,6 +715,8 @@ mod supervisor_tests {
             notify.clone(),
             Duration::from_secs(30),
             4096,
+            Arc::new(crate::adapters::AdapterSet::default()),
+            Arc::new(DurableState::new(store.clone(), computer.clone(), epoch)),
         ));
         let config = Config {
             computer_id: "comp-test".into(),
@@ -659,6 +728,7 @@ mod supervisor_tests {
             snapshot_interval_secs: 3600,
             attention_silence_ms: 600_000,
             restore_manifest: None,
+            agents_dir: root.join("agents.d"),
             segment_bytes: 4 * 1024 * 1024,
         };
         let shared = Arc::new(Shared {
@@ -670,6 +740,8 @@ mod supervisor_tests {
             outbox_tx: tx,
             journal_notify: notify,
             acked: Mutex::new(HashMap::new()),
+            cold_restored: false,
+            continuation_done: std::sync::atomic::AtomicBool::new(false),
         });
         (shared, rx)
     }

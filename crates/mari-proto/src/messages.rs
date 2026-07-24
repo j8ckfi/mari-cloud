@@ -46,6 +46,12 @@ pub enum AttentionKind {
     Osc,
     /// A blocked read on the PTY with no output past the idle threshold.
     BlockedRead,
+    /// A run the supervisor could not continue: it was unfinished at a restart
+    /// and its agent declares no resume (spec 5.6's defined degradation), or a
+    /// WARM rollback (spec 4.7) destroyed work the supervisor may not safely
+    /// replay. The run's journal is preserved; the user decides what happens
+    /// next. Still content-free: no terminal text, no reason string.
+    Interrupted,
 }
 
 /// How a child process ended. Adjacently tagged: `{ "t": "exited", "c": {
@@ -73,6 +79,23 @@ pub struct RunOffset {
     pub run: RunId,
     /// The byte offset the control plane has durably received up to.
     pub offset: JournalOffset,
+}
+
+/// One run's journal divergence in a [`SupervisorMessage::RollbackDetected`]
+/// report: what the control plane holds against what survived on the disk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRollback {
+    /// The unfinished run this entry describes.
+    pub run: RunId,
+    /// Journal bytes the control plane durably holds for the run (its
+    /// `hello_ack` offset) — the journal head, per spec 4.7.
+    pub control_offset: JournalOffset,
+    /// Journal bytes still present for the run on the restored (older) disk.
+    /// Less than `control_offset` means the disk lost recorded journal bytes.
+    pub disk_offset: JournalOffset,
+    /// True if the supervisor judged replay safe and restarted the run; false
+    /// if it left the run interrupted and raised an attention event instead.
+    pub replayed: bool,
 }
 
 /// Supervisor -> control messages. Adjacently tagged (`t`/`c`).
@@ -153,6 +176,26 @@ pub enum SupervisorMessage {
     RunHeartbeat {
         /// The run being held alive.
         run: RunId,
+    },
+    /// The supervisor found, at connect, that the substrate had restored an old
+    /// checkpoint: the disk is behind what was recorded (a WARM rollback, spec
+    /// 4.7). This is the structured report of the difference. It is a *report*,
+    /// not a request: the supervisor has already decided per run whether replay
+    /// was safe (`RunRollback::replayed`) and raised an attention event for each
+    /// run it did not replay.
+    RollbackDetected {
+        /// Manifest of the tree actually found on disk at connect.
+        disk_manifest: ManifestId,
+        /// The newest manifest the supervisor had recorded before the rollback,
+        /// or `null` if it had recorded none.
+        recorded_manifest: Option<ManifestId>,
+        /// The difference of the on-disk tree measured **against**
+        /// `recorded_manifest`: `removed` counts entries the recorded head has
+        /// that the disk lost, `added` counts entries only the disk has.
+        diff: DiffSummary,
+        /// Per-run journal divergence and the replay verdict for each
+        /// unfinished run.
+        runs: Vec<RunRollback>,
     },
 }
 

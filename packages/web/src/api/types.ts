@@ -11,7 +11,7 @@
 // no wake and no spinner.
 
 import type { ComputerId, ManifestId, RunId } from '@mari/shared';
-import type { ComputerState, EntryKind } from '@mari/shared';
+import type { AttentionKind, ComputerState, DiffSummary, EntryKind } from '@mari/shared';
 import type { SerializedLayout } from '../wm/serialize';
 
 /** Cost meter (spec 8.2). Internal accounting from substrate price sheets
@@ -49,21 +49,188 @@ export interface FleetResponse {
   computers: FleetComputer[];
 }
 
-/** One run summary for a computer's detail view. */
+/**
+ * The lifecycle of a run (spec 5). The supervisor owns the run; these are the
+ * states the *control plane* can report about it. `pending` covers the window
+ * between a start being accepted and the supervisor's `run_started` — a COLD
+ * computer wakes behind the interface during it (spec 8.3), so the UI shows a
+ * pending run immediately rather than blocking.
+ */
+export type RunState = 'pending' | 'running' | 'stopping' | 'exited' | 'failed';
+
+/** The disposition of a finished run's changes (spec 5.3 result review). */
+export type RunReview = 'pending' | 'kept' | 'reverted';
+
+/** One run as reported by the runs API. */
 export interface RunSummary {
   id: RunId;
-  alive: boolean;
-  /** Present once the run has ended. */
+  state: RunState;
+  /** The command the run executes (spec 5.2 / contracts §5.2 `start_run`). */
+  argv: string[];
+  cwd: string | null;
+  /** Exit code once the run ended normally, else null. */
   exitCode: number | null;
-  /** Whether this run is currently flagged for attention. */
+  /** Signal number when the run was signaled, else null. */
+  signal: number | null;
+  /** Whether this run is currently waiting for attention (spec 6.2). */
   attention: boolean;
   startedAt: number;
+  endedAt: number | null;
+  /** The diff baseline (spec 5.2). */
+  preRunManifest: ManifestId | null;
+  postRunManifest: ManifestId | null;
+  /** Counts of changed entries, once the run completed. */
+  diff: DiffSummary | null;
+  review: RunReview;
 }
 
-/** A computer's detail, including its live runs. */
-export interface ComputerDetail extends FleetComputer {
+/** `GET /api/computers/:id/runs`. */
+export interface RunListResponse {
+  computer: ComputerId;
   runs: RunSummary[];
 }
+
+/** `POST /api/computers/:id/runs` body. */
+export interface StartRunRequest {
+  argv: string[];
+  cwd?: string;
+  /** Vault variable NAMES to inject at run start; values never travel (10.1). */
+  envNames?: string[];
+}
+
+/** `POST /api/computers/:id/runs` response. */
+export interface StartRunResponse {
+  runId: RunId;
+  state: RunState;
+}
+
+/** `POST /api/computers/:id/runs/:runId/stop` response. */
+export interface StopRunResponse {
+  runId: RunId;
+  state: RunState;
+}
+
+/** How one path changed between two manifests. */
+export type DiffChange = 'added' | 'modified' | 'removed';
+
+/**
+ * One changed path in a manifest-to-manifest difference. This is the shape both
+ * the run result review (spec 5.3) and the fork difference view (spec 9.2)
+ * render — they are the same function of two manifests.
+ */
+export interface DiffEntry {
+  path: string;
+  change: DiffChange;
+  /** Mode bits on each side; null where the entry does not exist. */
+  oldMode: number | null;
+  newMode: number | null;
+  oldSize: number | null;
+  newSize: number | null;
+  /** Whether the file's CONTENT chunks differ (false ⇒ a mode-only change). */
+  contentChanged: boolean;
+}
+
+/** A manifest-to-manifest difference (spec 5.3 result, spec 9.2 fork diff). */
+export interface DiffResponse {
+  /** Present for a run diff; absent for a bare manifest-to-manifest diff. */
+  runId?: RunId;
+  /** Baseline manifest (pre-run / fork point). */
+  base: ManifestId | null;
+  /** Compared manifest (post-run / fork head). */
+  head: ManifestId | null;
+  summary: DiffSummary;
+  entries: DiffEntry[];
+  /** True when the server capped the entry list. */
+  truncated?: boolean;
+}
+
+/** `POST .../runs/:runId/keep` and `.../revert`. */
+export interface ReviewResponse {
+  runId: RunId;
+  review: RunReview;
+  /** The manifest head after the decision (a revert restores the baseline). */
+  head: ManifestId | null;
+}
+
+/** `POST /api/computers/:id/snapshot` (spec 4.3, user command). */
+export interface SnapshotResponse {
+  computer: ComputerId;
+  manifest: ManifestId | null;
+  state: ComputerState;
+}
+
+/**
+ * `PUT /api/computers/:id/file` — a write WAKES a computer that is not AWAKE
+ * (spec 8.4). The response reports the resulting state so the interface can
+ * show the transition WITHOUT blocking on it (spec 8.3).
+ */
+export interface WriteFileResponse {
+  ok: boolean;
+  path: string;
+  state: ComputerState;
+}
+
+/** `POST /api/computers/:id/upload` (multipart). Same wake semantics as PUT. */
+export interface UploadResponse {
+  ok: boolean;
+  path: string;
+  state: ComputerState;
+}
+
+/**
+ * A computer's detail. The control plane's `GET /api/computers/:id` names the
+ * display field `name` (the fleet listing calls the same thing `hostname`), so
+ * both are declared optional here rather than pretending one shape covers
+ * both — the runs list is the field this view actually exists for.
+ */
+export interface ComputerDetail extends Omit<FleetComputer, 'hostname'> {
+  hostname?: string;
+  name?: string;
+  runs?: RunSummary[];
+}
+
+// ---- /api/events (SSE) ----
+//
+// Spec 6.2: the supervisor sends a CONTENT-FREE attention event; the control
+// plane notifies the user and the notification opens the terminal pane of the
+// run. Every event below is therefore metadata only — there is no message text,
+// no terminal bytes, and no prompt content anywhere in these shapes, and the UI
+// has nothing of the sort to render.
+
+/** Fields common to every server event. */
+export interface EventBase {
+  /** Monotonic sequence for this stream; used to de-duplicate and reorder. */
+  seq: number;
+  /** Emission time, Unix milliseconds. */
+  at: number;
+  computer: ComputerId;
+}
+
+/** A run started waiting for attention, or stopped waiting (spec 6.2). */
+export interface AttentionEvent extends EventBase {
+  type: 'attention';
+  runId: RunId;
+  /** `waiting` badges the fleet card and the workspace; `cleared` removes it. */
+  state: 'waiting' | 'cleared';
+  /** The generic terminal signal that raised it (spec 6.1). Metadata only. */
+  kind?: AttentionKind;
+}
+
+/** A run changed lifecycle state (spec 5.5 completion event included). */
+export interface RunEvent extends EventBase {
+  type: 'run';
+  runId: RunId;
+  state: RunState;
+  exitCode?: number | null;
+}
+
+/** A computer changed state (spec §2 states; e.g. a write-triggered wake). */
+export interface StateEvent extends EventBase {
+  type: 'state';
+  state: ComputerState;
+}
+
+export type MariEvent = AttentionEvent | RunEvent | StateEvent;
 
 /** One entry in a directory listing, served from the manifest (spec 8.4). */
 export interface FileEntry {

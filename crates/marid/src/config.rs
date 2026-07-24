@@ -51,6 +51,12 @@ pub struct Config {
     #[arg(long, env = "MARI_RESTORE_MANIFEST")]
     pub restore_manifest: Option<String>,
 
+    /// Directory of declarative agent adapters (`*.toml`, spec 5.6). A missing
+    /// directory is not an error: the computer then simply has no agent that
+    /// declares a resume function.
+    #[arg(long, env = "MARI_AGENTS_DIR", default_value = "/etc/mari/agents.d")]
+    pub agents_dir: PathBuf,
+
     /// Journal segment size in bytes; a segment is uploaded once it reaches this.
     #[arg(long, env = "MARI_SEGMENT_BYTES", default_value_t = 4 * 1024 * 1024)]
     pub segment_bytes: u64,

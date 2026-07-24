@@ -297,7 +297,10 @@ it responds `404`. It is unauthenticated because it mints the session it returns
     "computer": { "id": "seedcomputer", "name": "Seed Computer",
                   "state": "cold", "head": "<manifestId>" },
     "manifest": "<manifestId>",
-    "files":    ["/README.md", "/notes/todo.txt", "/src/main.ts", "/src/util.ts"]
+    "files":    ["/README.md", "/notes/todo.txt", "/src/main.ts", "/src/util.ts"],
+    "postRunManifest": "<manifestId>",
+    "postRunFiles":    ["/README.md", "/notes/made-by-mari.txt",
+                        "/notes/todo.txt", "/src/main.ts"]
   }
   ```
 
@@ -305,8 +308,27 @@ it responds `404`. It is unauthenticated because it mints the session it returns
   (or `session.token`) to authenticate subsequent `/api/*` calls.
 - Side effects (idempotent): applies the D1 schema; upserts the seed user + a
   session; writes the manifest + chunks for the tree above into the R2 `STORE`;
+  **resets each seeded computer's Durable Object run/attention/journal state**;
   sets the `seedcomputer` Durable Object head **without waking** (spec 8.4); and
   records one sample vault secret name (`ANTHROPIC_API_KEY`, spec 10.1).
+- **`postRunManifest`** is a SECOND real manifest in the store (`SEED_TREE_AFTER`
+  in `src/seed.ts`): the seed tree after a run touched it, differing by exactly
+  one added (`/notes/made-by-mari.txt`), one modified (`/README.md`) and one
+  removed (`/src/util.ts`) entry, so `diff(manifest → postRunManifest)` is
+  `{ added: 1, modified: 1, removed: 1 }` at known paths. No computer's head
+  points at it. It exists because a run's result is a difference between two
+  manifests (spec 5.3) and only `marid`/`mari-core` can write one: the web e2e's
+  fake supervisor reports these two ids in `run_started`/`run_completed` so the
+  review pane renders a difference the real engine computed from real manifest
+  bytes. (A made-up id makes `GET /runs/:id/diff` a `404 manifest_missing`, and a
+  subsequent `keep` moves the head to an object that is not in the store, after
+  which the file browser 404s.)
+- **The reset is what makes the seed deterministic on a re-run.** `wrangler dev`
+  persists Durable Object storage between sessions, so without it a second suite
+  run inherits the previous run's run rows and undismissed attention events —
+  and an e2e assertion such as "the attention badge shows exactly one waiting
+  run" would pass on residue. `ComputerDO.resetSeedState()` is gated on
+  `DEV_SEED=1` and is a no-op in any deployed control plane.
 
 **v0 deviation:** the seed's content addresses (`manifest`/chunk ids) are
 SHA-256 hex, a stand-in for blake3 (§3) until `mari-core`'s blake3 chunker is
@@ -339,3 +361,126 @@ _Appended by the control-plane builder._
   grid, exposed via the DO `snapshotGrid(run)` method; that is the point where
   attach will send a populated `grid` (baseOffset = journal head) once
   libghostty-vt lands.
+
+## Appendix C — Run lifecycle, file writes, fleet, and the event stream
+
+_Appended by the control-plane builder (append-only, per directory ownership)._
+
+The REST surface that drives spec 1.3's central loop. Every route below is under
+the `/api/*` session guard and is ownership-scoped (a computer id you do not own
+is `404`, never `403`-by-existence). Ids in paths are URL-encoded.
+
+### C.1 Runs (spec 5)
+
+| Route | Body / result |
+|---|---|
+| `POST /api/computers/:id/runs` | `{ argv: string[], cwd?, envNames?: string[], agent?, path? }` → `200 { runId, run, state: "pending", computerState, queued }` |
+| `GET /api/computers/:id/runs` | → `{ computer, runs: RunSummary[] }` (newest first) |
+| `GET /api/computers/:id/runs/:runId` | → `RunSummary` + `{ journalLength, journalTailOffset, journalTail (base64), journalTailEncoding }` |
+| `POST /api/computers/:id/runs/:runId/stop` | → `{ runId, state, sent }` |
+| `POST /api/computers/:id/runs/:runId/keep` | `{ epoch? }` → `{ runId, review: "kept", head, applied, currentEpoch }` |
+| `POST /api/computers/:id/runs/:runId/revert` | `{ epoch? }` → `{ runId, review: "reverted", head, applied, currentEpoch }` |
+| `GET /api/computers/:id/runs/:runId/diff` | → `{ runId, base, head, summary, entries[], truncated }` |
+| `POST /api/computers/:id/snapshot` | `{ reason?: "command" \| "scheduled" }` → `{ computer, manifest, state }` |
+
+`RunSummary` = `{ id, state, argv, cwd, exitCode, signal, attention, startedAt,
+endedAt, preRunManifest, postRunManifest, diff, review }` plus control-plane
+detail (`kind`, `queuedAt`, `dispatched`, `dispatchedAt`, `writePath`,
+`attentionCount`, `epoch`). `state` is the client run state
+(`pending`/`running`/`stopping`/`exited`/`failed`); `review` is
+`pending`/`kept`/`reverted`.
+
+- **Queue-then-dispatch (spec 5.1 + 8.3).** `POST /runs` persists the run in the
+  computer's DO and returns immediately. If no current-generation supervisor is
+  attached it starts a wake in the background (`computerState: "waking"`) and the
+  run is handed over when that supervisor's `hello` arrives. A persisted
+  `dispatched` latch is written **before** the `start_run` frame, so a reconnect
+  (a second `hello`) never re-dispatches and a closed tab never loses a run.
+  A stop before dispatch cancels the run in place and latches it, so it is never
+  started later.
+- **`argv` is required** unless an `agent` is given (a brief then runs as
+  `[agent, path]`, spec 8.5). The control plane never invents a command.
+- **`envNames`** default to the computer's vault secret NAMES (spec 10.1);
+  values never travel in `start_run`.
+- **keep/revert (spec 5.3)** are idempotent and epoch-fenced. An `epoch` in the
+  body (or `?epoch=`) is compared with the DO's current fencing epoch; a stale
+  one is refused `409 { error: "stale_epoch", currentEpoch }` with the head
+  untouched and nothing sent to the supervisor. `keep` leaves the head at the
+  post-run manifest; `revert` sets the head back to the pre-run manifest and
+  sends exactly one `restore_to_manifest`. Conflicting decisions are `409`
+  (`already_kept` / `already_reverted`); an unfinished run is `409 run_active`.
+- **Diff (spec 5.3 / 9.2)** is computed in the control plane from the two
+  manifests in R2 — no substrate, no wake. `entries[]` is
+  `{ path, change: "added"|"modified"|"removed", oldMode, newMode, oldSize,
+  newSize, contentChanged, kind, symlinkTarget }`, path-sorted, capped at 5000
+  with `truncated: true`. A run without both manifests is `409 run_incomplete`.
+
+### C.2 Files (spec 8.4, 8.5)
+
+| Route | Result |
+|---|---|
+| `GET /api/computers/:id/files?path=` (and `/files/*`) | directory listing `{ computer, manifest, path, entries[] }` |
+| `GET /api/computers/:id/file?path=` | the file's bytes, `x-mari-manifest`, `x-mari-state`, `x-mari-source: manifest` |
+| `PUT /api/computers/:id/file?path=` (body = bytes) | `202 { ok, path, state, runId, queued, bytes }` |
+| `POST /api/computers/:id/upload` (multipart `file` + `path`, or raw body + `?path=`) | `202 { ok, path, state, runId, queued, bytes }` |
+
+- Reads are served from the **manifest head in every state** — for a COLD
+  computer that is spec 8.4 literally; for an AWAKE one the head is the latest
+  snapshot the supervisor wrote (spec 4.3), and `x-mari-manifest` names it, so a
+  client is never misled about freshness. Reading never wakes anything.
+- **A write is a RUN.** Spec 4.1 makes the AWAKE substrate disk the only copy
+  that accepts writes, so the control plane does not synthesize chunks or
+  manifests for an editor Save. It queues a small run —
+  `["/bin/sh", "-c", "set -e; mkdir -p '<dir>'; printf '%s' '<base64>' | base64 -d > '<path>'"]`
+  — through the same queue-then-dispatch path as any other run, which also gives
+  the write a pre-run snapshot, a journal, and a post-run diff (spec 5.2/5.3).
+  **No new `ControlMessage` was added**: `start_run` already carries everything.
+  Paths and payloads are POSIX single-quoted (`'` → `'\''`). Limits: 256 KiB per
+  write (`413`), absolute non-directory paths without `..` (`400`).
+- A write to a non-AWAKE computer **starts a wake** and reports the transition
+  (`state: "waking"`) without blocking on it (spec 8.3).
+
+### C.3 Fleet (spec 8.2)
+
+`GET /api/fleet` → `{ computers: [{ id, hostname, state, activeRuns,
+activeRunIds, attention, changedFiles, cost, manifestHead, updatedAt }] }`.
+
+- `activeRuns`/`activeRunIds`: runs in `queued`/`dispatched`/`running`.
+- `attention`: undismissed attention events on that computer.
+- `changedFiles`: the diff count of the current head against the **previous**
+  head (the DO records `prevHead` on every head change); `0` when there is no
+  previous head or a manifest is missing — the fleet view never fails on a
+  storage gap.
+- `cost`: `{ currency, accrued, ratePerHour, window, awakeSeconds }`, computed as
+  accumulated **AWAKE seconds × a static substrate price sheet**
+  (`src/pricing.ts`). Internal accounting only, independent of billing
+  (decisions.md); `ratePerHour` is the live burn rate, so it is `0` unless the
+  computer is AWAKE, while `accrued` keeps the lifetime total.
+- The whole view is a read of D1 plus each computer's DO — it never wakes a
+  computer. `GET /api/computers/:id` carries the same summary plus `runs[]`.
+
+### C.4 `/api/events` — the live, content-free stream (spec 6.2)
+
+`GET /api/events` is a `text/event-stream` (SSE) for the authenticated USER,
+covering the whole fleet. It opens with an SSE comment (`: ready`), which
+`EventSource` ignores.
+
+Each record is `event: <type>` + `data: <json>`:
+
+| `type` | Payload |
+|---|---|
+| `attention` | `{ type, seq, at, computer, runId, state: "waiting"\|"cleared", kind? }` |
+| `run` | `{ type, seq, at, computer, runId, state, exitCode? }` |
+| `state` | `{ type, seq, at, computer, state: ComputerState }` |
+
+- `seq` is a per-stream monotonic sequence (seeded from the wall clock so it
+  never goes backwards across a hub restart); clients de-duplicate on it.
+- **Content-free (spec 6.3).** The hub rebuilds every event from an allow-list of
+  metadata fields before it reaches a socket, so terminal bytes, prompt text, or
+  file contents cannot appear on this stream even if a caller passed them.
+- **Transport addition:** a second Durable Object class, `EventsDO`, bound as
+  `EVENTS` (wrangler migration `v2`), is the per-user rendezvous — a ComputerDO
+  is the coordination point for ONE computer (spec 3.2) and cannot reach a client
+  watching the fleet. Each ComputerDO publishes into `EventsDO(userId)`; an event
+  with no listener is dropped, and the durable record of an attention remains the
+  attention log in the computer's own DO.

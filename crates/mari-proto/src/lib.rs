@@ -40,5 +40,5 @@ pub use manifest::{
 };
 pub use messages::{
     AttentionKind, ComputerState, ControlMessage, ExitStatus, PROTO_VERSION, RunOffset,
-    SupervisorMessage,
+    RunRollback, SupervisorMessage,
 };

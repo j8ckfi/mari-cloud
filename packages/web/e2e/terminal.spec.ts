@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { coldCard } from './helpers';
+import { coldCard, resetLayouts, seedRecord } from './helpers';
 // @ts-expect-error — plain .mjs helper, transpiled in-process by Playwright.
 import { startFakeSupervisor } from './fake-supervisor.mjs';
 
@@ -47,7 +47,9 @@ test.describe('terminal round-trip', () => {
     supervisor = null;
   });
 
-  test('typed input echoes back through the fake supervisor', async ({ page }) => {
+  test('typed input echoes back through the fake supervisor', async ({ page, request }) => {
+    // Start from a workspace with no panes saved by an earlier spec (8.6).
+    await resetLayouts(request);
     await page.goto('/');
 
     // Identify the COLD computer and stand up a fake supervisor for it.
@@ -58,6 +60,7 @@ test.describe('terminal round-trip', () => {
     supervisor = await startFakeSupervisor({
       url: process.env.MARI_CONTROL_PLANE ?? 'http://127.0.0.1:8787',
       computer: computer as string,
+      preRunManifest: seedRecord().manifest,
     });
 
     // Open the workspace and add a terminal pane.

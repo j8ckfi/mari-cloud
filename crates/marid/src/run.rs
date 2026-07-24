@@ -28,9 +28,11 @@ use mari_proto::{
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use crate::adapters::AdapterSet;
 use crate::journal::Journal;
+use crate::state::{DurableState, RunPhase, RunRecord};
 
 /// The shared map of live runs.
 type RunsMap = Arc<Mutex<HashMap<RunId, Arc<RunState>>>>;
@@ -55,6 +57,12 @@ struct RunCtx {
     /// completed run leaves `runs` but its journal stays here (spec 5.1: the
     /// journal outlives the connection).
     journals: Mutex<HashMap<RunId, Arc<Journal>>>,
+    /// The agent adapters (spec 5.6). A run is bound to one at start, by the
+    /// program it was started with, so a later restart knows whose resume
+    /// template — if any — continues it.
+    adapters: Arc<AdapterSet>,
+    /// Durable run records + head history: the state that survives this process.
+    state: Arc<DurableState>,
 }
 
 /// Handle to one running (or completed) run. Tests and the supervisor read the
@@ -131,6 +139,8 @@ impl RunManager {
         journal_notify: Arc<Notify>,
         silence_threshold: Duration,
         segment_size: usize,
+        adapters: Arc<AdapterSet>,
+        state: Arc<DurableState>,
     ) -> Self {
         let mut excludes = default_credential_excludes();
         // Never snapshot the supervisor's own journal/state cache.
@@ -150,8 +160,25 @@ impl RunManager {
                 excludes,
                 runs: Arc::new(Mutex::new(HashMap::new())),
                 journals: Mutex::new(HashMap::new()),
+                adapters,
+                state,
             }),
         }
+    }
+
+    /// The adapters this manager binds runs to.
+    pub fn adapters(&self) -> &Arc<AdapterSet> {
+        &self.ctx.adapters
+    }
+
+    /// The durable state handle (run records + head history).
+    pub fn state(&self) -> &Arc<DurableState> {
+        &self.ctx.state
+    }
+
+    /// Local journal directory root: a run's segments live in `{root}/{run}`.
+    pub fn journal_dir(&self) -> &PathBuf {
+        &self.ctx.journal_dir
     }
 
     /// The ids of all currently tracked (live) runs.
@@ -209,6 +236,28 @@ impl RunManager {
         };
         let pre = snapshot(&self.ctx.store, &self.ctx.root, &opts).await?;
         let pre_id = pre.manifest_id.clone();
+        // Record the tree we just captured: the startup rollback check compares
+        // the disk against these (spec 4.7).
+        if let Err(e) = self.ctx.state.record_head(&pre_id, self.ctx.epoch).await {
+            warn!(%run, "recording pre-run head failed: {e:#}");
+        }
+        // The durable run record: what a restart needs to continue this run
+        // (spec 5.6). Written BEFORE the child exists, so a supervisor that dies
+        // one instruction after the spawn still finds the run at startup.
+        let adapter = self.ctx.adapters.match_argv(&argv).map(|a| a.name.clone());
+        let record = RunRecord::new(
+            run.clone(),
+            argv.clone(),
+            env_names.clone(),
+            cwd.clone(),
+            adapter,
+            pre_id.clone(),
+            self.ctx.epoch,
+            now_secs(),
+        );
+        if let Err(e) = self.ctx.state.put_run(&record).await {
+            warn!(%run, "writing run record failed: {e:#}");
+        }
         emit(
             &self.ctx.outbox,
             SupervisorMessage::SnapshotWritten {
@@ -224,6 +273,82 @@ impl RunManager {
                 epoch: self.ctx.epoch,
             },
         );
+        self.spawn_run(run, argv, env_names, cwd, pre_id, 0, 0)
+            .await
+    }
+
+    /// Continue an unfinished run after a supervisor restart (spec 5.6), or
+    /// replay one a WARM rollback destroyed (spec 4.7).
+    ///
+    /// `argv` is the agent's **resume** command for a continuation, or the run's
+    /// original argv for a replay. The run keeps its identity: the same run id,
+    /// the same pre-run manifest (its diff baseline), and a journal that
+    /// continues at the offsets its earlier life reached — a resumed run must
+    /// never re-issue offsets the control plane already holds.
+    pub async fn continue_run(
+        &self,
+        record: &RunRecord,
+        argv: Vec<String>,
+        journal_base: u64,
+        next_seq: u64,
+    ) -> anyhow::Result<Arc<RunState>> {
+        let run = record.run.clone();
+        if argv.is_empty() {
+            anyhow::bail!("continue_run: empty argv for run {run}");
+        }
+        if self.ctx.runs.lock().unwrap().contains_key(&run) {
+            anyhow::bail!("continue_run: run {run} already exists");
+        }
+        // Env names come from the run's record; the adapter may add its own.
+        let mut env_names = record.env_names.clone();
+        let mut cwd = record.cwd.clone();
+        if let Some(adapter) = record
+            .adapter
+            .as_deref()
+            .and_then(|n| self.ctx.adapters.get(n))
+        {
+            for name in &adapter.env {
+                if !env_names.contains(name) {
+                    env_names.push(name.clone());
+                }
+            }
+            if cwd.is_empty() {
+                cwd = adapter.cwd.clone().unwrap_or_default();
+            }
+        }
+        if cwd.is_empty() {
+            cwd = self.ctx.root.to_string_lossy().to_string();
+        }
+        if let Err(e) = self.ctx.state.set_epoch(&run, self.ctx.epoch).await {
+            warn!(%run, "updating run record epoch failed: {e:#}");
+        }
+        info!(%run, ?argv, journal_base, "continuing unfinished run");
+        self.spawn_run(
+            run,
+            argv,
+            env_names,
+            cwd,
+            record.pre_run_manifest.clone(),
+            journal_base,
+            next_seq,
+        )
+        .await
+    }
+
+    /// Spawn the child on a real PTY and wire up its journal, attention
+    /// detection, housekeeping and completion. Shared by a fresh start and a
+    /// resume/replay; the only difference is where the journal starts.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_run(
+        &self,
+        run: RunId,
+        argv: Vec<String>,
+        env_names: Vec<String>,
+        cwd: String,
+        pre_id: ManifestId,
+        journal_base: u64,
+        next_seq: u64,
+    ) -> anyhow::Result<Arc<RunState>> {
         emit(
             &self.ctx.outbox,
             SupervisorMessage::RunStarted {
@@ -266,12 +391,14 @@ impl RunManager {
         // exits (the child keeps its own descriptor).
         drop(pair.slave);
 
-        let journal = Arc::new(Journal::new(
+        let journal = Arc::new(Journal::resumed(
             run.clone(),
             self.ctx.computer.clone(),
             self.ctx.store.clone(),
             &self.ctx.journal_dir,
             self.ctx.segment_size,
+            journal_base,
+            next_seq,
         )?);
 
         let done = Arc::new(Notify::new());
@@ -342,6 +469,25 @@ impl RunManager {
         if let Some(state) = state {
             state.resize(cols, rows);
         }
+    }
+
+    /// Mark an unfinished run interrupted and raise one content-free attention
+    /// event for it (spec 6.2). This is the defined degradation of spec 5.6: a
+    /// run the supervisor cannot continue — no adapter, no resume template, or a
+    /// rollback it may not safely replay — is not silently dropped and not
+    /// silently re-run. Its journal is left exactly as it is; the user decides.
+    pub async fn interrupt_run(&self, run: &RunId) {
+        if let Err(e) = self.ctx.state.set_phase(run, RunPhase::Interrupted).await {
+            warn!(%run, "marking run interrupted failed: {e:#}");
+        }
+        info!(%run, "run interrupted: cannot be continued, journal preserved");
+        emit(
+            &self.ctx.outbox,
+            SupervisorMessage::Attention {
+                run: run.clone(),
+                kind: AttentionKind::Interrupted,
+            },
+        );
     }
 
     /// Stop a run's process cleanly (SIGHUP via the pty). The completion task
@@ -425,6 +571,7 @@ fn spawn_housekeeping(ctx: Arc<RunCtx>, run: RunId, journal: Arc<Journal>, state
     let threshold = ctx.silence_threshold;
     let tick = housekeeping_tick(threshold);
     tokio::spawn(async move {
+        let mut recorded_len = journal.uploaded_len();
         loop {
             tokio::select! {
                 _ = state.done.notified() => break,
@@ -451,6 +598,22 @@ fn spawn_housekeeping(ctx: Arc<RunCtx>, run: RunId, journal: Arc<Journal>, state
                     // Stream finished segments to the store as the run proceeds.
                     if let Err(e) = journal.flush_ready_segments().await {
                         warn!(%run, "segment flush failed: {e}");
+                    }
+                    // Keep the durable record's journal head in step with what
+                    // is actually in the store: it is the reference a restart
+                    // resumes from, and the disk-vs-record comparison that
+                    // detects a WARM rollback (spec 4.7).
+                    let uploaded = journal.uploaded_len();
+                    if uploaded > recorded_len {
+                        if let Err(e) = ctx
+                            .state
+                            .set_journal_progress(&run, uploaded, journal.segments_uploaded())
+                            .await
+                        {
+                            warn!(%run, "recording journal progress failed: {e:#}");
+                        } else {
+                            recorded_len = uploaded;
+                        }
                     }
                 }
             }
@@ -487,6 +650,19 @@ fn spawn_completion(
             warn!(%run, "final segment flush failed: {e}");
         }
         ctx.journal_notify.notify_waiters();
+        // The run is over: record its final journal head, then its phase. A
+        // record left in `Running` is what a restart treats as unfinished, so
+        // this write is what stops a completed run from being resumed forever.
+        if let Err(e) = ctx
+            .state
+            .set_journal_progress(&run, journal.uploaded_len(), journal.segments_uploaded())
+            .await
+        {
+            warn!(%run, "recording final journal progress failed: {e:#}");
+        }
+        if let Err(e) = ctx.state.set_phase(&run, RunPhase::Completed).await {
+            warn!(%run, "marking run completed failed: {e:#}");
+        }
 
         let exit = match status {
             Ok(s) => map_exit(&s),
@@ -504,6 +680,9 @@ fn spawn_completion(
         };
         match snapshot(&ctx.store, &ctx.root, &opts).await {
             Ok(post) => {
+                if let Err(e) = ctx.state.record_head(&post.manifest_id, ctx.epoch).await {
+                    warn!(%run, "recording post-run head failed: {e:#}");
+                }
                 let summary = match ctx.store.get_manifest(&pre_id).await {
                     Ok(pre_manifest) => diff(&pre_manifest, &post.manifest).summary(),
                     Err(e) => {

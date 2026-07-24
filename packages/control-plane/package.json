@@ -6,24 +6,30 @@
   "scripts": {
     "test": "vitest run",
     "test:substrates": "vitest run -c vitest.substrates.config.ts",
+    "test:node": "vitest run -c vitest.node.config.ts",
     "dev": "wrangler dev",
+    "dev:node": "node scripts/build-node.mjs && node dist/node.mjs",
+    "build:node": "node scripts/build-node.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.11",
     "@mari/shared": "workspace:*",
     "better-auth": "^1.6.25",
     "cbor-x": "^1.6.4",
+    "dockerode": "^5.0.1",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.32",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.8",
     "@cloudflare/workers-types": "^5.20260724.1",
-    "@hono/node-server": "^2.0.11",
     "@types/dockerode": "^4.0.1",
     "@types/node": "^26.1.1",
-    "dockerode": "^5.0.1",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10",
     "wrangler": "^4.114.0"
