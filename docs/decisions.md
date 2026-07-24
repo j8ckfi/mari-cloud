@@ -55,6 +55,15 @@ silently diverge.
 - **Direct-to-R2**: chunks never transit the Worker. The DO mints short-lived
   scoped credentials / presigned URLs; marid reads and writes the store
   directly.
+- **Substrate drivers are TypeScript, in the control plane**
+  (`packages/control-plane/src/substrates/`). Rationale: wake is a
+  control-plane scheduling decision (spec 3.6), and the control plane runs on
+  Workers/Node which cannot load native modules — but it can speak HTTP to
+  Sprites (works on both entries) and dockerode to a local daemon (Node entry
+  only, for private instances and tests). The provider interface is exactly
+  spec 3.5's six functions: materialize, destroy, sleep, wake, exec,
+  exposePort. marid never talks to a substrate API directly; its run-hold
+  heartbeat (spec 5.4) flows through the DO, which forwards to the driver.
 
 ## v0 deviations (each preserves the spec-pure path behind an interface)
 
@@ -86,8 +95,8 @@ add dependencies only inside your own crate/package manifest.
 | `crates/mari-proto`, `packages/shared` | contracts |
 | `crates/mari-core` | core builder |
 | `crates/marid` | supervisor builder |
-| `crates/mari-substrate` | substrate builder |
-| `packages/control-plane` | control-plane builder |
+| `packages/control-plane/src/substrates/` (+ its tests) | substrate builder |
+| `packages/control-plane` (everything else) | control-plane builder |
 | `packages/web` | web builder |
 | `docs/` | contracts (append-only for others) |
 

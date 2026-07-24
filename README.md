@@ -16,9 +16,8 @@ at the edge. The `marid` supervisor owns runs; a closed laptop never stops one.
 |---|---|
 | `crates/mari-core` | Chunking, manifests, store, restore, GC (the storage inversion) |
 | `crates/mari-proto` | Wire protocol types (CBOR), mirrored in `packages/shared` |
-| `crates/mari-substrate` | Substrate provider trait + Docker + Sprites modules |
 | `crates/marid` | The supervisor daemon |
-| `packages/control-plane` | Hono on Workers: Durable Objects, wake proxy, auth |
+| `packages/control-plane` | Hono on Workers: Durable Objects, wake proxy, auth, substrate drivers |
 | `packages/web` | The tiled web application |
 | `packages/shared` | TS protocol mirror + client SDK |
 
