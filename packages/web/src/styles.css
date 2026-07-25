@@ -246,6 +246,187 @@ kbd {
   font-family: var(--mono);
 }
 
+/* ---- Auth: sign-in screen, account, passkeys (spec 11.3) ---- */
+.auth-bootstrap {
+  /* The session-resolving frame. Intentionally empty and intentionally NOT a
+     spinner (spec 8.3): the chrome above it is already on screen. */
+  height: 100%;
+}
+.auth {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: auto;
+}
+.auth-card {
+  width: min(360px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 18px;
+}
+.auth-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+.auth-brand {
+  font-weight: 600;
+  letter-spacing: 2px;
+  font-size: 15px;
+  color: var(--fg);
+}
+.auth-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--fg-faint);
+}
+.auth-input {
+  font: inherit;
+  font-family: var(--mono);
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  outline: none;
+}
+.auth-input.sm {
+  padding: 2px 6px;
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+}
+.auth-input:focus-visible {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent);
+}
+.auth-input:disabled {
+  color: var(--fg-faint);
+}
+.auth-primary,
+.auth-secondary {
+  padding: 7px 10px;
+  border-radius: 4px;
+  text-align: center;
+}
+.auth-primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--fg);
+  font-weight: 600;
+}
+.auth-primary:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg);
+}
+.auth-primary:disabled,
+.auth-secondary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.auth-or {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--fg-faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin: 2px 0;
+}
+.auth-or::before,
+.auth-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.auth-status {
+  margin: 2px 0 0;
+  min-height: var(--row);
+}
+.auth-error {
+  color: var(--attn);
+  font-size: 12px;
+  margin: 0;
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.account-email {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.passkeys {
+  width: min(560px, 94vw);
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  padding: 12px 14px 14px;
+  outline: none;
+}
+.passkeys-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.passkeys-head .spacer {
+  flex: 1;
+}
+.passkeys-title {
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-size: 11px;
+}
+.passkey-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.passkey-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--row);
+  padding: 4px 0;
+  border-bottom: 1px solid var(--bg-2);
+}
+.passkey-name {
+  font-family: var(--mono);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.passkey-rename {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  align-items: center;
+}
+
 /* ---- Tiling WM ---- */
 .tile-split {
   display: flex;

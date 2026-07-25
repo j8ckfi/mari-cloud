@@ -121,6 +121,27 @@ export interface ExecResult {
  */
 export interface SubstrateProvider {
   /**
+   * Whether this substrate can hold a computer WARM (spec §2, as amended by
+   * decisions.md "WARM is a fast cold wake"): substrate resources retained, the
+   * substrate disk still holding the computer, no process, no compute billed.
+   *
+   * `undefined` (the default) and `true` mean WARM works — Docker (`pause`) and
+   * Sprites (auto-suspend) both keep their disk. `false` means the substrate
+   * CANNOT keep the disk across a stop, so WARM would be a lie: Cloudflare
+   * Containers document "All disk is ephemeral. When a Container instance goes
+   * to sleep, the next time it is started, it will have a fresh disk as defined
+   * by its container image", which was also measured (a marker written to /work
+   * did not survive destroy+start).
+   *
+   * A driver that declares `false` has {@link sleep} ≡ {@link destroy}, and the
+   * tier policy (spec §4.4) must take such a computer AWAKE → COLD directly,
+   * still writing the pre-transition manifest spec §4.5 requires — otherwise the
+   * DO would record WARM for a computer whose disk is already gone, and the next
+   * wake would "resume" a resource that no longer holds anything.
+   */
+  readonly supportsWarm?: boolean;
+
+  /**
    * Materialize the computer on this substrate and return AWAKE (spec §2):
    * processes active, ready for {@link exec}. Idempotent per computer is not
    * required; callers hold the fencing epoch that guarantees a single writer.
@@ -135,8 +156,15 @@ export interface SubstrateProvider {
   destroy(handle: SubstrateHandle): Promise<void>;
 
   /**
-   * Put the computer into native sleep — WARM (spec §2): checkpoint or pause.
-   * Wake must be immediate and cost near zero.
+   * Put the computer into WARM (spec §2, as amended by decisions.md "WARM is a
+   * fast cold wake"): stop the processes and keep the disk. Memory does not
+   * survive — no substrate's checkpoint is relied upon — so the caller has
+   * already had the supervisor stop each agent session cleanly and write a
+   * manifest (spec §4.5). No compute is billed while WARM, and the wake reads
+   * the substrate's own disk cache with no chunk-store transfer.
+   *
+   * A substrate that cannot keep the disk declares {@link supportsWarm} `false`,
+   * and then `sleep` is exactly {@link destroy} (see cloudflare.ts).
    */
   sleep(handle: SubstrateHandle): Promise<void>;
 
@@ -160,4 +188,41 @@ export interface SubstrateProvider {
    * materialize time.
    */
   exposePort(handle: SubstrateHandle, port: number): Promise<string>;
+
+  // ── Optional capabilities ──────────────────────────────────────────────────
+  //
+  // Everything below is OPTIONAL and exists because one substrate cannot express
+  // a spec §3.5 function the way the others can. They are declarations, not new
+  // functions: a driver that omits them behaves exactly as before, and no caller
+  // may require them. Adding a seventh mandatory function would break §3.5.
+
+  /**
+   * Renew the substrate's own inactivity timer for the duration of a run
+   * (spec §5.4: "On a substrate that stops idle machines, the supervisor holds
+   * the machine AWAKE during a run"). Driven by `run_heartbeat` on the
+   * marid → DO → driver path (decisions.md), so the supervisor never talks to a
+   * substrate API itself.
+   *
+   * BEST EFFORT AND SECONDARY: the authoritative hold is the DO's own tier alarm,
+   * which every substrate shares. A driver implements this only when its platform
+   * has an idle timer of its own; a rejection is swallowed by the caller and must
+   * never fail a run.
+   */
+  holdAwake?(handle: SubstrateHandle): Promise<void>;
+
+  /**
+   * Serve a request to `port` inside the computer, for a substrate whose exposed
+   * port is reachable ONLY through the runtime that hosts the driver — no URL
+   * exists that a plain `fetch` could reach (Cloudflare Containers: the port is
+   * behind `ctx.container.getTcpPort(port)` on the computer's own Durable
+   * Object). {@link exposePort} still reports the in-computer address; this is
+   * how the bytes actually travel.
+   *
+   * Where a driver implements this, the wake proxy (spec §8.5) MUST prefer it
+   * over fetching {@link exposePort}'s string, and the request keeps flowing
+   * through the control plane — which is the point: a tunnel that fronted the
+   * container directly would bypass the auth and epoch gating the control plane
+   * exists to enforce.
+   */
+  proxyFetch?(handle: SubstrateHandle, port: number, request: Request): Promise<Response>;
 }

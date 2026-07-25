@@ -77,8 +77,10 @@ describe('supervisor channel + attach authorization (security regression)', () =
     const forged = new TextEncoder().encode('\x1b[2J FORGED TERMINAL OUTPUT ');
     attacker.journalFrame('run-1', 0, forged);
 
-    // Give the DO's coalescing flush timer (25ms) time to run: nothing is stored.
-    await delay(120);
+    // Give the DO's coalescing flush timer (FLUSH_MS = 100) time to run — and
+    // then some, so "nothing is stored" means REJECTED and not merely "not
+    // flushed yet".
+    await delay(260);
 
     const stored = await stub.readJournal('run-1');
     expect(new Uint8Array(stored).length).toBe(0);
@@ -95,7 +97,9 @@ describe('supervisor channel + attach authorization (security regression)', () =
     const supA = await FakeSupervisor.connect(id);
     await supA.handshake(id, w1.epoch, w1.token);
     supA.journalFrame('run-x', 0, new TextEncoder().encode('A-legit'));
-    await delay(80);
+    // The ack is emitted by the same flush that writes the row, so this is the
+    // exact durability point — no sleep to tune against FLUSH_MS.
+    await supA.recv.waitForTag('journal_ack');
     const afterA = new Uint8Array(await stub.readJournal('run-x'));
     expect(new TextDecoder().decode(afterA)).toBe('A-legit');
 
@@ -114,7 +118,9 @@ describe('supervisor channel + attach authorization (security regression)', () =
     // But A's journal bytes are now DROPPED — a fenced-out writer cannot append
     // to the current run (spec 4.1/4.2 single-writer).
     supA.journalFrame('run-x', afterA.length, new TextEncoder().encode('A-STALE-INJECT'));
-    await delay(80);
+    // Longer than one flush window (FLUSH_MS = 100): the stale bytes must be
+    // DROPPED, not just unflushed.
+    await delay(260);
     const afterStale = new Uint8Array(await stub.readJournal('run-x'));
     expect(new TextDecoder().decode(afterStale)).toBe('A-legit');
     expect(new TextDecoder().decode(afterStale)).not.toContain('STALE');

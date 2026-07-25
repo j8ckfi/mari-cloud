@@ -34,6 +34,14 @@ import {
   type SubstrateProvider,
   type SubstrateHandle,
 } from './substrate';
+// The Cloudflare driver is the one substrate whose construction the Durable
+// Object must perform itself: its only dependency is `ctx.container`, the live
+// container binding of THIS object, which exists nowhere else. It is Workers-safe
+// to import statically (no Node modules, no SDK — see substrates/cloudflare.ts).
+import {
+  CLOUDFLARE_SUBSTRATE,
+  createCloudflareProvider,
+} from './substrates/cloudflare';
 import { MiniVtEngine } from './grid';
 import { updateComputerState } from './db/fleet';
 import {
@@ -56,8 +64,26 @@ type EmitEvent =
   | { type: 'run'; runId: string; state: EventRunState; exitCode?: number | null; at?: number }
   | { type: 'state'; state: ComputerState; at?: number };
 
-/** Journal coalescing window (decisions.md: DO flushes the live tail <=100ms). */
-const FLUSH_MS = 25;
+/**
+ * Journal coalescing window (decisions.md: DO flushes the live tail <=100ms).
+ *
+ * COST, not taste — this constant is the single most expensive number in the
+ * system (docs/substrates-cloudflare.md, "Durable Object rows written"). Durable
+ * Objects bill $1.00 per million ROWS WRITTEN, and each flush writes 3 rows
+ * (`journal`, `journal_head`, `segments`). At the old 25 ms a continuously
+ * streaming terminal cost 40 flushes/s x 3 rows = 432,000 rows/h ~ $0.43/h,
+ * about 10x the $0.045/h of the container being journaled. At 100 ms — which is
+ * the window decisions.md already promised — it is 108,000 rows/h ~ $0.11/h.
+ *
+ * The remaining 3x wants the `segments` and `journal_head` rows folded into the
+ * `journal` row (both are derivable from it); that is a DO storage-schema change
+ * and is NOT done here. Note that batching the three inserts into one `sql.exec`
+ * would NOT have helped: billing counts rows, not statements, and real workerd
+ * rejects it anyway — "When executing multiple SQL statements in a single call,
+ * only the last statement can have parameters", and the journal row's payload is
+ * a bound BLOB.
+ */
+const FLUSH_MS = 100;
 
 /**
  * A wake that fails (no capacity, image pull error, daemon down) with a run
@@ -273,6 +299,13 @@ function parseStringArray(v: unknown): string[] {
   }
 }
 
+/** Parse a numeric `var` (Workers env values are always strings). */
+function numberVar(v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 function toBytes(data: string | ArrayBuffer | ArrayBufferView): Uint8Array {
   if (typeof data === 'string') return new TextEncoder().encode(data);
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -318,7 +351,27 @@ export class ComputerDO extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.substrate = makeSubstrate(env.SUBSTRATE_MODE, env);
+    this.substrate =
+      env.SUBSTRATE_MODE === CLOUDFLARE_SUBSTRATE && !env.SUBSTRATE
+        ? createCloudflareProvider({
+            // Undefined when the class has no `containers` binding: the driver
+            // then fails every operation with a typed `no_binding` error, which
+            // keeps a misdeployment loud without bricking the read-only paths a
+            // COLD computer serves without any substrate (spec 8.4).
+            container: ctx.container,
+            maxInstances: numberVar(env.CF_MAX_INSTANCES),
+            waitUntil: (p) => ctx.waitUntil(p.then(() => undefined)),
+            // A platform-initiated stop is otherwise UNOBSERVABLE (the monitor
+            // promise dies with the request's I/O context). Recording it is what
+            // lets spec 4.7 tell a cold wake from a stop nobody asked for.
+            onContainerExit: (info) => {
+              console.warn(
+                `mari: container exited computer=${info.computer} epoch=${info.epoch ?? '?'} ` +
+                  `doState=${this.#meta.state}${info.error ? ` error=${info.error}` : ''}`,
+              );
+            },
+          })
+        : makeSubstrate(env.SUBSTRATE_MODE, env);
     ctx.blockConcurrencyWhile(async () => {
       this.#initSql();
       const stored = await ctx.storage.get<Meta>('meta');
@@ -1238,14 +1291,27 @@ export class ComputerDO extends DurableObject<Env> {
     // a preview request hanging behind a spinner that never resolves (spec 8.3).
     if (!woken.ok) return new Response('wake failed', { status: 503 });
     if (!this.#meta.handle) return new Response('no substrate handle', { status: 502 });
-    const exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
-    const target = exposedUrl.replace(/\/$/, '') + url.pathname + url.search;
 
     const headers = new Headers(request.headers);
     headers.delete('x-mari-proxy-port');
     headers.delete('x-mari-computer');
     headers.set('x-mari-epoch', String(woken.epoch));
 
+    // A substrate whose exposed port has NO fetchable address — Cloudflare
+    // Containers, where the port lives behind `ctx.container.getTcpPort(port)` on
+    // this very Durable Object — serves the request itself (provider.ts
+    // `proxyFetch`). It must be called from HERE, the DO's own `fetch`: a
+    // WebSocket cannot be serialized across the Worker→DO RPC boundary, so a stub
+    // call could never carry a preview app's socket. This also keeps the control
+    // plane a mandatory hop, which an edge tunnel to the container would not.
+    const proxyFetch = this.substrate.proxyFetch;
+    if (proxyFetch) {
+      const forwarded = new Request(request, { headers });
+      return proxyFetch.call(this.substrate, this.#meta.handle, port, forwarded);
+    }
+
+    const exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
+    const target = exposedUrl.replace(/\/$/, '') + url.pathname + url.search;
     const init: RequestInit = { method: request.method, headers };
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       init.body = await request.arrayBuffer();
@@ -1262,6 +1328,15 @@ export class ComputerDO extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     server.accept();
+    // MANDATORY, and load-bearing for the Cloudflare substrate: from
+    // compatibility_date 2026-04-01 the runtime delivers binary WebSocket
+    // messages as a `Blob` instead of an `ArrayBuffer`. `toBytes` has no Blob
+    // branch (a Blob cannot be read synchronously at all), so every framed-CBOR
+    // supervisor message would decode to ZERO bytes — no exception, no log, the
+    // channel just goes mute. Measured by bisection against real workerd:
+    // 2026-03-01 ArrayBuffer, 2026-04-01 Blob. The container work requires the
+    // date bump (`containers_pid_namespace`), so pin the wire type here.
+    server.binaryType = 'arraybuffer';
     // A per-socket frame reader; do NOT mark this the active supervisor until it
     // completes the `hello` handshake (a fenced-out reconnect must not steal the
     // active channel from the current supervisor).
@@ -1344,8 +1419,26 @@ export class ComputerDO extends DurableObject<Env> {
         this.#broadcastRunStatus(msg.c.run, true, null);
         return;
       case 'run_heartbeat':
+        // Spec 5.4's run hold. `#touch` renews the DO's own tier alarm, which is
+        // the authoritative hold for EVERY substrate — and on Cloudflare it is the
+        // only one that works: there is no renewable `sleepAfter` on the raw
+        // container API, `setInactivityTimeout` is undocumented and measured not
+        // to fire, and an open outbound WebSocket (the journal!) is invisible to
+        // any platform activity timer by construction. A driver with an idle timer
+        // of its own also gets it renewed, best-effort: never `keepAlive`, and
+        // never allowed to fail a run.
         await this.#touch();
         await this.#persist();
+        if (this.#meta.handle && this.substrate.holdAwake) {
+          try {
+            await this.substrate.holdAwake(this.#meta.handle);
+          } catch (err) {
+            console.warn(
+              `mari: holdAwake failed computer=${this.#meta.computerId ?? '?'}: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         return;
       default:
         return;
@@ -1811,6 +1904,9 @@ export class ComputerDO extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     server.accept();
+    // See #acceptSupervisor: past compatibility_date 2026-04-01 binary frames
+    // arrive as Blobs and `toBytes` would silently yield nothing.
+    server.binaryType = 'arraybuffer';
     this.#clients.set(server, new Set());
 
     server.addEventListener('message', (event: MessageEvent) => {
@@ -1897,7 +1993,16 @@ export class ComputerDO extends DurableObject<Env> {
 
   async #touch(): Promise<void> {
     this.#meta.idleSince = Date.now();
-    if (this.#meta.state === 'awake') await this.#armTier(this.#warmIdleMs());
+    if (this.#meta.state === 'awake') {
+      // Activity supersedes an in-flight finalize, the same way a wake does
+      // (CP-COLDRACE-1). This only ever fires on a substrate with no WARM state,
+      // where the finalize is asked for while the computer is still AWAKE: a run
+      // heartbeat or a new request inside that window must not be answered by
+      // tearing the computer down when the supervisor's `snapshot_written{final}`
+      // lands. The next idle deadline asks again.
+      this.#meta.coldPending = false;
+      await this.#armTier(this.#warmIdleMs());
+    }
   }
 
   /** Arm the next tier alarm and AWAIT its scheduling (the alarm write must be
@@ -1928,6 +2033,20 @@ export class ComputerDO extends DurableObject<Env> {
     }
 
     if (this.#meta.state === 'awake') {
+      // A substrate that cannot keep the disk across a stop has NO WARM state
+      // (spec 2 as amended by decisions.md "WARM is a fast cold wake" — the
+      // amended definition still says "the substrate disk still holds the
+      // computer"). Recording WARM there would be a lie the next wake pays for:
+      // it would call `substrate.wake` to resume a resource that holds nothing.
+      // So the first idle deadline takes such a computer AWAKE -> COLD directly,
+      // through the SAME clean-stop path (prepare_for_cold -> final manifest ->
+      // destroy), because spec 4.5's pre-transition manifest is exactly what
+      // makes a discarded disk safe. WARM_IDLE_MS is then the single idle
+      // deadline and COLD_IDLE_MS is unused.
+      if (this.substrate.supportsWarm === false) {
+        await this.#beginCold();
+        return;
+      }
       // AWAKE -> WARM.
       if (this.#meta.handle) await this.substrate.sleep(this.#meta.handle);
       this.#meta.state = 'warm';
@@ -1941,36 +2060,44 @@ export class ComputerDO extends DurableObject<Env> {
     }
 
     if (this.#meta.state === 'warm') {
-      // WARM -> COLD: ask the supervisor to stop cleanly and write the final
-      // manifest; #onSnapshotWritten completes the destroy. If no supervisor is
-      // attached, tear down immediately.
-      if (this.#supervisor) {
-        // Spec 4.5: the supervisor stops each agent session in a clean state
-        // before COLD. It can only do that while it is RUNNING, so a substrate
-        // whose WARM state freezes the guest is resumed first (Docker `pause`;
-        // see FreezingSubstrate). Otherwise `prepare_for_cold` would sit in a
-        // frozen socket buffer and the computer would never reach COLD.
-        const handle = this.#meta.handle;
-        if (handle && (this.substrate as FreezingSubstrate).resumeBeforeCold?.(handle)) {
-          await this.substrate.wake(handle);
-        }
-        this.#meta.coldPending = true;
-        await this.#persist();
-        this.#sendControl({ t: 'prepare_for_cold' });
-      } else {
-        if (this.#meta.handle) {
-          await this.substrate.destroy(this.#meta.handle);
-          this.#meta.handle = null;
-        }
-        this.#meta.token = null;
-        this.#meta.state = 'cold';
-        this.#closeAwakeStretch();
-        await this.#persist();
-        await this.#syncFleetState();
-        this.#emit({ type: 'state', state: 'cold' });
-      }
+      await this.#beginCold();
       return;
     }
+  }
+
+  /** Begin the transition to COLD (spec 4.4/4.5): ask the supervisor to stop
+   *  cleanly and write the final manifest; `#onSnapshotWritten` records that
+   *  manifest as the head and completes the destroy. If no supervisor is
+   *  attached there is nobody to write a manifest, so tear down immediately.
+   *
+   *  Reached from WARM on a substrate that has WARM, and from AWAKE directly on
+   *  one that does not. */
+  async #beginCold(): Promise<void> {
+    if (this.#supervisor) {
+      // Spec 4.5: the supervisor stops each agent session in a clean state
+      // before COLD. It can only do that while it is RUNNING, so a substrate
+      // whose WARM state freezes the guest is resumed first (Docker `pause`;
+      // see FreezingSubstrate). Otherwise `prepare_for_cold` would sit in a
+      // frozen socket buffer and the computer would never reach COLD.
+      const handle = this.#meta.handle;
+      if (handle && (this.substrate as FreezingSubstrate).resumeBeforeCold?.(handle)) {
+        await this.substrate.wake(handle);
+      }
+      this.#meta.coldPending = true;
+      await this.#persist();
+      this.#sendControl({ t: 'prepare_for_cold' });
+      return;
+    }
+    if (this.#meta.handle) {
+      await this.substrate.destroy(this.#meta.handle);
+      this.#meta.handle = null;
+    }
+    this.#meta.token = null;
+    this.#meta.state = 'cold';
+    this.#closeAwakeStretch();
+    await this.#persist();
+    await this.#syncFleetState();
+    this.#emit({ type: 'state', state: 'cold' });
   }
 
   // ---------------------------------------------------------------------------

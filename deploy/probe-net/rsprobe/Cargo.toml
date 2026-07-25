@@ -1,0 +1,23 @@
+# SCRATCH — Gate 2. Does marid's ACTUAL WebSocket stack speak wss://?
+# Dependency spec copied verbatim from crates/marid/Cargo.toml.
+[package]
+name = "rsprobe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+mari-proto = { path = "../../../crates/mari-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net"] }
+# EXACTLY as marid declares it today (crates/marid/Cargo.toml:19).
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+anyhow = "1"
+# rustls 0.23 has no default crypto provider; one must be selected explicitly.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+
+[features]
+# The one-line change under test.
+tls = ["tokio-tungstenite/rustls-tls-webpki-roots", "dep:rustls"]

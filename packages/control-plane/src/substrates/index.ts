@@ -12,6 +12,8 @@ import type { SubstrateProvider } from './provider.js';
 import type { DockerProviderOptions } from './docker.js';
 import { SPRITES_SUBSTRATE, SpritesProvider, createSpritesProvider } from './sprites.js';
 import type { SpritesConfig } from './sprites.js';
+import { CLOUDFLARE_SUBSTRATE, CloudflareProvider } from './cloudflare.js';
+import type { CloudflareConfig } from './cloudflare.js';
 
 export type { SubstrateName } from './provider.js';
 import type { SubstrateName } from './provider.js';
@@ -26,6 +28,18 @@ export {
   createSpritesProvider,
 } from './sprites.js';
 export type { SpritesHandle, SpritesConfig } from './sprites.js';
+export {
+  CLOUDFLARE_SUBSTRATE,
+  CloudflareProvider,
+  CloudflareSubstrateError,
+  createCloudflareProvider,
+} from './cloudflare.js';
+export type {
+  CloudflareHandle,
+  CloudflareConfig,
+  CloudflareErrorKind,
+  ContainerExitInfo,
+} from './cloudflare.js';
 export type {
   DockerProvider,
   DockerHandle,
@@ -37,7 +51,11 @@ export type {
 export const DOCKER_SUBSTRATE = 'docker';
 
 /** The substrate names this build knows how to drive. */
-export const SUBSTRATE_NAMES = [DOCKER_SUBSTRATE, SPRITES_SUBSTRATE] as const;
+export const SUBSTRATE_NAMES = [
+  DOCKER_SUBSTRATE,
+  SPRITES_SUBSTRATE,
+  CLOUDFLARE_SUBSTRATE,
+] as const;
 
 /**
  * Create a driver by name.
@@ -55,12 +73,16 @@ export function createSubstrate(
   config: SpritesConfig,
 ): SubstrateProvider;
 export function createSubstrate(
+  name: typeof CLOUDFLARE_SUBSTRATE,
+  config: CloudflareConfig,
+): SubstrateProvider;
+export function createSubstrate(
   name: SubstrateName,
-  config?: DockerProviderOptions | SpritesConfig,
+  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig,
 ): SubstrateProvider | Promise<SubstrateProvider>;
 export function createSubstrate(
   name: SubstrateName,
-  config?: DockerProviderOptions | SpritesConfig,
+  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig,
 ): SubstrateProvider | Promise<SubstrateProvider> {
   switch (name) {
     case DOCKER_SUBSTRATE:
@@ -69,6 +91,11 @@ export function createSubstrate(
       );
     case SPRITES_SUBSTRATE:
       return new SpritesProvider(config as SpritesConfig);
+    case CLOUDFLARE_SUBSTRATE:
+      // Workers-only, but Workers-SAFE to import: the driver has no dependency
+      // beyond the live `ctx.container` handed to it here, so unlike docker.js it
+      // needs no lazy import.
+      return new CloudflareProvider(config as CloudflareConfig);
     default:
       throw new Error(`unknown substrate "${name}"`);
   }
@@ -84,6 +111,8 @@ export const substrateRegistry = {
     createSubstrate(DOCKER_SUBSTRATE, config),
   [SPRITES_SUBSTRATE]: (config: SpritesConfig): SubstrateProvider =>
     createSubstrate(SPRITES_SUBSTRATE, config),
+  [CLOUDFLARE_SUBSTRATE]: (config: CloudflareConfig): SubstrateProvider =>
+    createSubstrate(CLOUDFLARE_SUBSTRATE, config),
 } as const;
 
 // ── Wake scheduling (spec §3.6) ──────────────────────────────────────────────
@@ -111,6 +140,18 @@ export interface SubstrateProfile {
 export const SUBSTRATE_PROFILES: Readonly<Record<string, SubstrateProfile>> = {
   [DOCKER_SUBSTRATE]: { usdPerHour: 0, capacity: 1, wakeLatencyMs: 300 },
   [SPRITES_SUBSTRATE]: { usdPerHour: 0.06, capacity: 0.9, wakeLatencyMs: 1500 },
+  // Cloudflare is the only row here with MEASURED numbers behind it.
+  //   price: `standard-1` (0.5 vCPU / 4 GiB / 8 GB) at the published rates —
+  //          memory $0.0090/GiB-h + disk $0.000252/GB-h + CPU $0.0720/vCPU-h at
+  //          an assumed 20% duty = $0.0452/h. WARM and COLD are $0.00/h here.
+  //   latency: container start → marid "cold-wake restore complete" for a 35 MiB,
+  //          45-entry manifest was 686 ms and 1037 ms on two instances. Per-instance
+  //          throughput varied 2.8x on the same instance_type, so this is a p50-ish
+  //          figure and spec §13 still wants a real p99 before anyone budgets on it.
+  //   capacity: `max_instances` (default 20) caps CONCURRENT AWAKE computers and
+  //          errors a wake past it, so real capacity is a fleet-level fact this
+  //          static table cannot know.
+  [CLOUDFLARE_SUBSTRATE]: { usdPerHour: 0.0452, capacity: 0.95, wakeLatencyMs: 1000 },
 };
 
 /**

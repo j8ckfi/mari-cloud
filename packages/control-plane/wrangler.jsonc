@@ -6,7 +6,17 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mari-control-plane",
   "main": "src/worker.ts",
-  "compatibility_date": "2024-11-01",
+  // Past 2026-04-01 so `containers_pid_namespace` is on: without it, a process
+  // listing inside a computer shows every process in the VM. Verified on a real
+  // container at this date — /proc/self/ns/pid is a private namespace and `ps`
+  // sees only the container's own processes.
+  //
+  // BEWARE, and this is why `binaryType` is pinned in computer-do.ts: at
+  // 2026-04-01 the runtime switched binary WebSocket messages from ArrayBuffer to
+  // Blob. Bisected against real workerd — 2026-03-01 ArrayBuffer, 2026-04-01 Blob
+  // — and with a Blob every framed-CBOR supervisor message decodes to ZERO bytes,
+  // silently. Do not remove those two `server.binaryType = 'arraybuffer'` lines.
+  "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
 
   "durable_objects": {
@@ -35,6 +45,54 @@
     }
   ],
 
+  // ── The Cloudflare Containers substrate (spec 3.5 via substrates/cloudflare.ts)
+  //
+  // A container is bound to a Durable Object CLASS, not to an instance: this
+  // "makes this Durable Object a container-enabled Durable Object and allows each
+  // instance to control a container". `ComputerDO` is that class — it is already
+  // in `new_sqlite_classes` (required for containers), and spec 3.2 says the
+  // computer's DO is the ONE coordination point for its computer, so putting the
+  // container anywhere else would add a second object per computer and could not
+  // carry the terminal WebSocket across the Worker→DO RPC boundary anyway.
+  //
+  // A DO that never calls `start()` costs nothing, so a computer scheduled onto
+  // Docker or Sprites is unaffected by this block, and SUBSTRATE_MODE decides
+  // whether the driver is ever constructed at all.
+  //
+  // KNOWN CEILING (write it down rather than discover it): `image` and
+  // `instance_type` are per-class and fixed at deploy, so spec 3.6 keeps substrate
+  // SELECTION per wake but loses per-wake SIZING here. N sizes × M base images
+  // would be N×M DO classes. v0 is one image, one size.
+  "containers": [
+    {
+      "class_name": "ComputerDO",
+      // The production base image: release `marid` for linux/amd64 plus a POSIX
+      // userland, with /work as MARI_ROOT (spec 2's base image; the chunk store
+      // owns /work and the image supplies the OS).
+      "image": "../../deploy/Dockerfile.mari",
+      "image_build_context": "../..",
+      // 1/2 vCPU, 4 GiB, 8 GB disk. The row the cost model is built on
+      // ($0.0452/AWAKE-hour at 20% CPU duty) and the row every measurement in
+      // docs/substrates-cloudflare.md was taken on.
+      "instance_type": "standard-1",
+      // DELIBERATE, not the default. It caps CONCURRENT AWAKE computers (stopped
+      // containers do not count) and a wake past it ERRORS rather than queueing —
+      // measured: "There is no container instance that can be provided to this
+      // Durable Object", sometimes as a HANG. The driver bounds every platform
+      // call and reports `CloudflareSubstrateError{kind:'capacity'}`; mirror this
+      // number into CF_MAX_INSTANCES so the error can name it, and ALERT on it.
+      "max_instances": 20,
+      "constraints": {
+        // Pinned to the chunk store: `mari-store` is a WEUR bucket (verified via
+        // `wrangler r2 bucket info`), and a cold wake reads many chunks. The
+        // measured probe containers already landed in AMS, i.e. inside WEUR, so
+        // this codifies observed placement rather than fighting it. R2 egress is
+        // free, but distance is still latency on the read-heavy wake path.
+        "regions": ["WEUR"]
+      }
+    }
+  ],
+
   "d1_databases": [
     {
       "binding": "DB",
@@ -50,12 +108,162 @@
     }
   ],
 
+  // The built web application, so ONE Worker serves the API and the app on one
+  // origin. `pnpm --filter @mari/web build` writes this directory (vite).
+  //
+  // `run_worker_first: true` is load-bearing, not a preference: with it the
+  // Worker sees EVERY request first, and `src/worker.ts` reaches this binding
+  // only through its explicit fallthrough. That is what keeps the asset router
+  // from swallowing `/api/*`, the `/attach` + `/supervisor` WebSocket upgrades,
+  // the `/api/events` stream, or a `{port}--{computer}--{user}.mari.sh` preview
+  // host — none of which look like asset paths, and all of which an
+  // asset-router-first configuration would answer with index.html.
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+
   "vars": {
     "PREVIEW_ZONE": "mari.sh",
     "DEV_AUTH": "0",
     "DEV_SEED": "0",
+    // `"cloudflare"` switches the DO onto the container driver. Left at `"fake"`
+    // until the driver has run a week (the memo's maturity note: `exec()` shipped
+    // 2026-06-18), and because a real substrate must not be enabled by the same
+    // commit that first defines it.
     "SUBSTRATE_MODE": "fake",
+    // Mirror of `containers[].max_instances`, so the driver's capacity error can
+    // name the real cap instead of guessing the platform default.
+    "CF_MAX_INSTANCES": "20",
+    // DEV/TEST ONLY, and it cannot become a production secret by accident:
+    // auth.ts treats any public TLS origin as production and THROWS on a
+    // placeholder secret (or on a DEV_* flag) — whether it learned that from
+    // ENVIRONMENT, from BASE_URL, or from the REQUEST's own URL. So even
+    // `wrangler deploy` with no `--env` fails closed instead of signing sessions
+    // with this string. Deploy `--env production`.
     "AUTH_SECRET": "change-me-in-production",
     "BASE_URL": "http://localhost"
+  },
+
+  // ── Hosted production (app.mari.sh) ────────────────────────────────────────
+  //
+  // The ONE deployable environment. In wrangler, BINDING keys are
+  // non-inheritable: `vars`, `durable_objects`, `d1_databases`, `r2_buckets`,
+  // `containers` and `secrets` must each be repeated here in full or the
+  // deployed Worker simply does not have them. (`migrations` and `assets` ARE
+  // inherited, so they are not repeated.) test/auth-production.test.ts asserts
+  // that every non-inheritable key present at the top level is also present
+  // here, so adding a binding above without copying it down fails the suite
+  // instead of silently shipping a production Worker missing it.
+  //
+  // The default block above is deliberately untouched: the vitest-pool-workers
+  // suites bind against it.
+  //
+  // AUTH_SECRET is ABSENT from these vars ON PURPOSE — it must arrive from a
+  // real secret binding, set by the OWNER (see deploy/README.md). Routes,
+  // custom domains and DNS are likewise absent on purpose: the orchestrator
+  // owns the real deploy.
+  "env": {
+    "production": {
+      "account_id": "5b7019b38a2b1c0ce119ecf64e92fd92",
+
+      "vars": {
+        // Trigger #1 of the fail-closed check in auth.ts (the other two are a
+        // public-TLS BASE_URL and a public-TLS request URL). There is no value
+        // that switches it off.
+        "ENVIRONMENT": "production",
+        "PREVIEW_ZONE": "mari.sh",
+        "BASE_URL": "https://app.mari.sh",
+        // The WebAuthn Relying Party. rpID must be a registrable-domain suffix
+        // of the ceremony origin's host; `app.mari.sh` covers app.mari.sh only,
+        // which is what we want — a `{port}--{computer}--{user}.mari.sh` preview
+        // host must never be able to use an account's credentials.
+        "AUTH_RP_ID": "app.mari.sh",
+        "AUTH_RP_NAME": "Mari",
+        // Dev flags OFF — and not merely inert here: auth.ts refuses to build
+        // the app at all if either is "1" on a production environment, so a
+        // deploy carrying one fails loudly instead of exposing a dev login or an
+        // unauthenticated session-minting seed route.
+        "DEV_AUTH": "0",
+        "DEV_SEED": "0",
+        // Still the fake driver: a real substrate must not be switched on by the
+        // same change that first defines it (see the top-level note).
+        "SUBSTRATE_MODE": "fake",
+        "CF_MAX_INSTANCES": "20"
+      },
+
+      // EXPECTED WARNING, do not "fix" it: `wrangler types --env production`
+      // says AUTH_SECRET "exists at the top level, but not on
+      // env.production.vars ... Please add these vars". Adding it is precisely
+      // the forged-session hole this environment exists to close. It is declared
+      // below as a SECRET instead, which is how it should arrive.
+      //
+      // Declared so wrangler warns when it is unset rather than letting the
+      // Worker boot without it. GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET are
+      // deliberately NOT required: GitHub OAuth stays configured-but-optional
+      // (decisions.md) and activates only if both are ever set. There is no
+      // OAuth app today, so passkeys are the whole hosted auth story.
+      "secrets": {
+        "required": ["AUTH_SECRET"]
+      },
+
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "COMPUTER",
+            "class_name": "ComputerDO"
+          },
+          {
+            "name": "EVENTS",
+            "class_name": "EventsDO"
+          }
+        ]
+      },
+
+      // Copy of the top-level block (non-inheritable). Keep the two identical —
+      // the drift test above enforces that this key exists, and the substrate
+      // lane owns its contents.
+      //
+      // `name` is REQUIRED here and not at the top level: inside a named
+      // environment wrangler will not derive the container application's name
+      // and errors out with "Must have either a top level \"name\" and
+      // \"containers.class_name\" field defined, or have field
+      // \"containers.name\" defined" (verified with `wrangler types --env
+      // production`). It mirrors what wrangler would have derived.
+      "containers": [
+        {
+          "name": "mari-control-plane-production-computerdo",
+          "class_name": "ComputerDO",
+          "image": "../../deploy/Dockerfile.mari",
+          "image_build_context": "../..",
+          "instance_type": "standard-1",
+          "max_instances": 20,
+          "constraints": {
+            "regions": ["WEUR"]
+          }
+        }
+      ],
+
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "mari",
+          // The real, existing production database.
+          "database_id": "b423acd3-0b26-482c-a0be-9998393b0cfc",
+          // `wrangler d1 migrations apply mari --env production --remote`
+          // applies packages/control-plane/migrations/*.sql (deploy/README.md).
+          "migrations_dir": "migrations"
+        }
+      ],
+
+      "r2_buckets": [
+        {
+          "binding": "STORE",
+          "bucket_name": "mari-store"
+        }
+      ]
+    }
   }
 }

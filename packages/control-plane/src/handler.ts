@@ -4,7 +4,7 @@
 
 import { createApp } from './app';
 import { parsePreviewHost } from './host';
-import { makeAuth } from './auth';
+import { makeAuth, assertProductionSafety } from './auth';
 import { getOwnedComputer } from './db/fleet';
 import type { Env } from './types';
 
@@ -95,6 +95,14 @@ export async function handleFetch(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  // FAIL CLOSED, before anything else can consult a session. This must live
+  // here and not only in the Hono app, because `tryWsRoute` authenticates the
+  // `/attach/:id` terminal socket and `tryWakeProxy` forwards a preview host —
+  // both BEFORE the router. A `wrangler deploy` with no `--env` would otherwise
+  // reach `makeAuth` with the dev block's committed placeholder secret on a real
+  // public origin, and accept a session cookie forged with it.
+  assertProductionSafety(env, request.url);
+
   const ws = await tryWsRoute(request, env);
   if (ws) return ws;
   const proxied = await tryWakeProxy(request, env);

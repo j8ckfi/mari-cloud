@@ -268,6 +268,10 @@ async function openSocket(id: string, path: string): Promise<WebSocket> {
   const ws = (res as unknown as { webSocket: WebSocket | null }).webSocket;
   if (!ws) throw new Error(`no webSocket on upgrade response (status ${res.status})`);
   ws.accept();
+  // Past compatibility_date 2026-04-01 (bumped for the Cloudflare container
+  // binding) binary messages are delivered as Blobs, which `toU8` cannot read
+  // synchronously. The DO pins its own halves the same way (computer-do.ts).
+  ws.binaryType = 'arraybuffer';
   return ws;
 }
 

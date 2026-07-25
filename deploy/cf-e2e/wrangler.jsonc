@@ -1,0 +1,45 @@
+{
+  // SCRATCH app for the Cloudflare substrate e2e (test/substrates/cloudflare.e2e.test.ts,
+  // gated on MARI_CF_E2E=1). Namespaced mari-cf-e2e-*, deleted by the suite's
+  // afterAll. It is NOT app.mari.sh: no custom domain, no DNS record, no shared
+  // binding, no D1, no R2.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mari-cf-e2e",
+  "main": "src/worker.ts",
+  // Same date as the control plane, so the e2e runs on the runtime production
+  // runs on (PID namespace on, Blob-flavoured binary WebSocket messages).
+  "compatibility_date": "2026-07-01",
+
+  "durable_objects": {
+    "bindings": [{ "name": "E2E", "class_name": "E2eDO" }]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      // Container-enabled Durable Objects must be SQLite-backed.
+      "new_sqlite_classes": ["E2eDO"]
+    }
+  ],
+
+  "containers": [
+    {
+      "class_name": "E2eDO",
+      // The PRODUCTION base image plus exactly one test-only layer (busybox, for
+      // an HTTP listener the exposePort assertion can talk to). `ctx/` is
+      // assembled by the suite: `ctx/Dockerfile` is deploy/Dockerfile.mari
+      // verbatim with that one RUN appended, so this e2e exercises the real image
+      // rather than a lookalike.
+      "image": "./ctx/Dockerfile",
+      "image_build_context": "./ctx",
+      "instance_type": "standard-1",
+      // Above 1 deliberately: with max_instances=1 a second instance's start/exec
+      // fails with the same "no container instance" message a slow teardown
+      // produces, and the two are indistinguishable without spare capacity.
+      "max_instances": 5,
+      "constraints": { "regions": ["WEUR"] }
+    }
+  ],
+
+  "observability": { "enabled": true },
+  "workers_dev": true
+}

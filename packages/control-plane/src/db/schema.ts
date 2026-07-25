@@ -60,6 +60,28 @@ export const verification = sqliteTable('verification', {
   updatedAt: integer('updatedAt', { mode: 'timestamp' }),
 });
 
+/**
+ * The `@better-auth/passkey` plugin's model. Column names equal the plugin's
+ * field names exactly (`credentialID`, `deviceType`, `backedUp`, …) for the same
+ * reason the core tables do. `aaguid` identifies the authenticator MODEL, never a
+ * device or a person, and is what lets the management UI label a credential.
+ */
+export const passkey = sqliteTable('passkey', {
+  id: text('id').primaryKey(),
+  name: text('name'),
+  publicKey: text('publicKey').notNull(),
+  userId: text('userId')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  credentialID: text('credentialID').notNull(),
+  counter: integer('counter').notNull(),
+  deviceType: text('deviceType').notNull(),
+  backedUp: integer('backedUp', { mode: 'boolean' }).notNull(),
+  transports: text('transports'),
+  createdAt: integer('createdAt', { mode: 'timestamp' }),
+  aaguid: text('aaguid'),
+});
+
 /** The mapping passed to `drizzleAdapter(db, { schema })`. Keys are Better Auth
  *  model names. */
-export const authSchema = { user, session, account, verification };
+export const authSchema = { user, session, account, verification, passkey };

@@ -1,0 +1,43 @@
+{
+  // GATE 1 probe — a SCRATCH Cloudflare app, namespaced mari-probe-*, deleted
+  // when the experiment ends. It is not app.mari.sh, shares no bindings with
+  // it, and has no custom domain or DNS record.
+  "$schema": "../../node_modules/.pnpm/wrangler@4.114.0_@cloudflare+workers-types@5.20260724.1/node_modules/wrangler/config-schema.json",
+  "name": "mari-probe-gate1",
+  "main": "src/worker.ts",
+
+  // Past 2026-04-01, so the `containers_pid_namespace` flag is on and `ps`
+  // inside the container sees only the container's own processes — the memo's
+  // item 5 under Isolation, tested here rather than assumed.
+  "compatibility_date": "2026-07-01",
+
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "ProbeDO" }]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      // Container-enabled Durable Objects must be SQLite-backed.
+      "new_sqlite_classes": ["ProbeDO"]
+    }
+  ],
+
+  "containers": [
+    {
+      "class_name": "ProbeDO",
+      "image": "./Dockerfile",
+      "image_build_context": "./ctx",
+      // 1/2 vCPU, 4 GiB memory, 8 GB disk — the row the memo's cost model uses
+      // for a Mari computer, so the timings below are comparable to it.
+      "instance_type": "standard-1",
+      // Deliberately >1: with max_instances=1 a second object's start() fails
+      // with "There is no container instance that can be provided to this
+      // Durable Object", which is indistinguishable from a slow teardown
+      // unless you have spare capacity to compare against.
+      "max_instances": 5
+    }
+  ],
+
+  "observability": { "enabled": true },
+  "workers_dev": true
+}

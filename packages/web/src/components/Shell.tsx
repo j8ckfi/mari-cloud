@@ -7,7 +7,9 @@ import { FleetHome } from './FleetHome';
 import { Workspace } from './Workspace';
 import { CommandPalette } from './CommandPalette';
 import { RunLauncher } from './RunLauncher';
+import { AccountMenu } from './AccountMenu';
 import type { CommandRegistry } from '../palette/registry';
+import type { Account } from '../auth/machine';
 
 /** Current user handle for preview hostnames; the control plane sets the real
  *  one, this is the dev/default fallback (must be a valid DNS label field). */
@@ -24,8 +26,22 @@ const USER = (import.meta.env.VITE_USER as string | undefined) ?? 'user';
  * card and the workspace tab, and activating a badge opens the terminal pane of
  * the run that is waiting. The events are content-free and so is this: a badge
  * is a count and a run id, never a message.
+ *
+ * `account` is optional so the shell stays renderable on its own (the attention
+ * tests drive it directly); the app always passes one, because a signed-out
+ * visitor never reaches this component at all (see AuthGate).
  */
-export function Shell({ registry }: { registry: CommandRegistry }) {
+export function Shell({
+  registry,
+  account = null,
+  onSignOut,
+  onPasskeys,
+}: {
+  registry: CommandRegistry;
+  account?: Account | null;
+  onSignOut?: () => void;
+  onPasskeys?: () => void;
+}) {
   const view = useUiStore((s) => s.view);
   const workspaces = useUiStore((s) => s.workspaces);
   const active = useUiStore((s) => s.activeComputer);
@@ -143,6 +159,13 @@ export function Shell({ registry }: { registry: CommandRegistry }) {
         <button type="button" onClick={() => setPaletteOpen(true)} data-testid="open-palette">
           <kbd>⌘K</kbd> Commands
         </button>
+        {account !== null && (
+          <AccountMenu
+            account={account}
+            onPasskeys={() => onPasskeys?.()}
+            onSignOut={() => onSignOut?.()}
+          />
+        )}
       </div>
 
       <div className="main">

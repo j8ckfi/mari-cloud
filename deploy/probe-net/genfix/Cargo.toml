@@ -1,0 +1,16 @@
+# SCRATCH — Gate 2 (outbound WebSocket) probe fixture generator.
+# Standalone (its own [workspace]) so it never joins the Mari workspace.
+# Delete this whole directory when the gate is closed.
+[package]
+name = "probe-genfix"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+mari-proto = { path = "../../../crates/mari-proto" }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"

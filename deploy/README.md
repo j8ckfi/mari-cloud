@@ -54,9 +54,9 @@ Every variable is optional; the defaults are the ones in
 | Variable | Default | Meaning |
 |---|---|---|
 | `MARI_PORT` | `8787` | Published host port. |
-| `MARI_AUTH_SECRET` | `mari-private-instance-change-me` | Better Auth signing secret. **Set this**: 32+ random characters. |
+| `MARI_AUTH_SECRET` | `mari-private-instance-change-me` | Better Auth signing secret. **Set this**: 32+ random characters. The default is a published placeholder, so the control plane REFUSES TO START (`AuthConfigError`) once it is reachable on a public https origin — see "Hosted deployment" below for the rule. On plain `http://localhost` it stays a convenience. |
 | `MARI_BASE_URL` | derived | Public origin, if the instance is behind a proxy or a different hostname. |
-| `MARI_DEV_AUTH` | `1` | Email + password sign-in — the single-user sign-in of a private instance (decisions.md Auth). |
+| `MARI_DEV_AUTH` | `1` | Email + password sign-in — the single-user sign-in of a private instance (decisions.md Auth). Also refused on a public https origin: put the instance behind a VPN/tunnel, or use passkeys there. |
 | `MARI_DEV_SEED` | `0` | The deterministic seed route (`POST /api/dev/seed`); for demos and the web e2e only. |
 | `MARI_BASE_IMAGE` | `mari/base:v0` | Base image ref. |
 | `MARI_CONTROL_HOST` | auto | Host (optionally `host:port`) a COMPUTER dials to reach the control plane. Auto-detection uses the control plane's own bridge address inside a container, and `host.docker.internal` outside one. Set it when the daemon is remote or the port is forwarded. |
@@ -158,3 +158,96 @@ container*, never `localhost`. Set `MARI_CONTROL_HOST`.
 looking at the same chunk store. Compare `MARI_STORE_DIR` with
 `MARI_STORE_HOST_DIR`, and check `docker inspect <container>` shows a mount of
 the store at `/store`.
+
+---
+
+# Hosted deployment (app.mari.sh)
+
+The hosted control plane is the same Hono app on Cloudflare Workers. Its config
+lives in `packages/control-plane/wrangler.jsonc` under `env.production`:
+account `5b7019b38a2b1c0ce119ecf64e92fd92`, D1 `mari`
+(`b423acd3-0b26-482c-a0be-9998393b0cfc`), R2 `mari-store`,
+`BASE_URL=https://app.mari.sh`, `PREVIEW_ZONE=mari.sh`, both `DEV_*` flags off.
+
+## Secrets — the OWNER sets these, by hand
+
+Secret VALUES must never be typed by tooling, pasted into a file, or handled by
+an agent. They are set once, interactively, by the person who owns the account.
+`wrangler secret put` prompts for the value on stdin and stores it encrypted; it
+is never written to the repo.
+
+**Required.** The deploy is dead without it, by design:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=5b7019b38a2b1c0ce119ecf64e92fd92
+cd packages/control-plane
+
+# Generate the value privately (`openssl rand -base64 32`), then paste it at the
+# prompt. 32 characters minimum; the app refuses to start below that.
+wrangler secret put AUTH_SECRET --env production
+```
+
+`AUTH_SECRET` signs every session cookie. On a production environment
+`src/auth.ts` THROWS at startup when it is missing, still one of the committed
+placeholders (`change-me-in-production`, …), or shorter than 32 characters — so
+a misconfigured deploy answers 500 rather than accepting forged sessions. The
+same check refuses to build the app while `DEV_AUTH=1` or `DEV_SEED=1`, and it
+triggers on any of three signals: `ENVIRONMENT=production`, an `https` non-loopback
+`BASE_URL`, or an `https` non-loopback REQUEST url. That last one means even
+`wrangler deploy` with no `--env` cannot serve the dev block's placeholder from a
+real `*.workers.dev` origin.
+
+**Optional.** GitHub OAuth is configured-but-optional (`docs/decisions.md`) and
+activates only when BOTH are present. There is no GitHub OAuth app today, so
+passkeys are the entire hosted auth story and neither is set:
+
+```sh
+wrangler secret put GITHUB_CLIENT_ID --env production      # optional
+wrangler secret put GITHUB_CLIENT_SECRET --env production  # optional
+```
+
+To confirm what is set without revealing any value:
+
+```sh
+wrangler secret list --env production
+```
+
+## Database schema
+
+D1 has no automatic migration on boot. Apply the schema — including the
+`passkey` table WebAuthn needs — with wrangler's migration runner:
+
+```sh
+wrangler d1 migrations apply mari --env production --remote
+```
+
+`migrations/0001_init.sql` is generated from `src/db/apply.ts` and every
+statement is `IF NOT EXISTS`, so re-running it is a no-op.
+`test/auth-schema.test.ts` asserts the two are statement-for-statement identical
+and that the `passkey` table matches the plugin's declared fields, so a schema
+change cannot ship to production without the migration.
+
+## Passkeys
+
+Sign-up on the hosted origin is a WebAuthn ceremony and nothing else — there is
+no password, and `account` rows stay empty for a passkey-born user:
+
+1. `GET /api/auth/passkey/generate-register-options?context=<email>` — no session
+   required. Nothing is written yet, so an abandoned ceremony leaves no account
+   and does not squat the address.
+2. `POST /api/auth/passkey/verify-registration` — on a verified attestation the
+   user row is created and the response carries a session cookie. Sign-up ends
+   signed in.
+3. Later visits: `GET /api/auth/passkey/generate-authenticate-options` then
+   `POST /api/auth/passkey/verify-authentication`. Credentials are discoverable
+   (`residentKey: "required"`), so no username is typed.
+4. Management: `list-user-passkeys`, `update-passkey` (rename), `delete-passkey`.
+   Multiple passkeys per user; each is owner-checked.
+
+The Relying Party is config-driven, so one build serves every origin:
+`AUTH_RP_ID` (default: `BASE_URL`'s hostname) is `localhost` in dev, the full
+`<name>.workers.dev` host on a preview deploy (workers.dev is a public suffix, so
+the rpID must be the whole host), and `app.mari.sh` in production. In production
+the ceremony origin is PINNED to `BASE_URL` plus anything in
+`AUTH_TRUSTED_ORIGINS`, instead of being echoed from the request's `Origin`
+header.

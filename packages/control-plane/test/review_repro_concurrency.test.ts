@@ -207,7 +207,9 @@ describe('concurrency: cold-finalize race + supervisor ingest auth (regression)'
     // Connect a supervisor socket and send a journal frame WITHOUT any hello.
     const rogue = await FakeSupervisor.connect(id);
     rogue.journalFrame(run, 0, bytes(0x01, 0x02, 0x03, 0x04, 0x05));
-    await delay(60); // let the flush window fire
+    // Longer than one flush window (FLUSH_MS = 100), so 0 stored means REJECTED
+    // rather than not-yet-flushed.
+    await delay(260);
 
     const stored = new Uint8Array(await stub.readJournal(run));
     // An unauthenticated writer's bytes are rejected (0 stored).
@@ -253,7 +255,9 @@ describe('journal ingest is offset-addressed (CP-JOURNAL-OFFSET-3)', () => {
     // to the DO while its coalescing buffer still holds the pre-resume bytes).
     sup.journalFrame(run, 0, A);
     sup.journalFrame(run, 0, A);
-    await delay(60);
+    // Both frames land inside one coalescing window (FLUSH_MS = 100); wait past
+    // it so the assertion sees the settled journal.
+    await delay(260);
 
     const stored = new Uint8Array(await stub.readJournal(run));
     expect(stored.length).toBe(4);
@@ -322,7 +326,9 @@ describe('journal ingest is offset-addressed (CP-JOURNAL-OFFSET-3)', () => {
     const OTHER = new TextEncoder().encode('the-FAKE-output');
     expect(OTHER.length).toBe(A.length);
     sup.journalFrame(run, 0, OTHER);
-    await delay(60);
+    // Past one flush window (FLUSH_MS = 100): the conflicting bytes must be
+    // rejected, not merely pending.
+    await delay(260);
 
     // What is durable wins; the journal is untouched...
     const stored = new Uint8Array(await stub.readJournal(run));
@@ -366,7 +372,9 @@ describe('journal ingest is offset-addressed (CP-JOURNAL-OFFSET-3)', () => {
     // offset can tell the DO it already holds these bytes.
     sup1.journalFrame(run, 0, A);
     sup1.journalFrame(run, A.length, B);
-    await delay(80);
+    // Past one flush window (FLUSH_MS = 100) so every in-flight frame has been
+    // ingested and flushed before the journal is read.
+    await delay(260);
 
     const stored = new Uint8Array(await stub.readJournal(run));
     expect(eqBytes(stored, concat(A, B))).toBe(true);

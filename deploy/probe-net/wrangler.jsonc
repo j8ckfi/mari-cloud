@@ -1,0 +1,27 @@
+{
+  // SCRATCH — Gate 2 (outbound WebSocket) probe. Throwaway Worker on
+  // workers.dev; delete with `wrangler delete` when the gate is closed.
+  "$schema": "../../node_modules/.pnpm/wrangler@4.114.0_@cloudflare+workers-types@5.20260724.1/node_modules/wrangler/config-schema.json",
+  "name": "mari-probe-net",
+  "main": "worker.ts",
+  "compatibility_date": "2026-07-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "ProbeDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProbeDO"] }],
+
+  "containers": [
+    {
+      "name": "mari-probe-net",
+      "class_name": "ProbeDO",
+      "image": "./Dockerfile",
+      "image_build_context": ".",
+      "instance_type": "lite",
+      "max_instances": 3
+    }
+  ]
+}

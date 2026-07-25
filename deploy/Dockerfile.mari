@@ -1,0 +1,117 @@
+# The Mari PRODUCTION base image (spec §2: a base image is "a shared manifest
+# (operating system, toolchains)"; the fleet stores each base image once).
+#
+# This is the image the hosted substrate boots: `deploy/Dockerfile.marid` remains
+# the local/private-instance image built for the host architecture, while this one
+# is built for **linux/amd64** because that is what Cloudflare Containers run
+# (measured: kernel 6.18.36-cloudflare-firecracker, x86_64, hostname
+# "cloudchamber", rootfs ext4 on /dev/vdc, 7.3 GB).
+#
+# It contains exactly what a computer needs to exist on a substrate, and nothing
+# else — account image storage is capped at 50 GB, and every megabyte here is
+# multiplied by the base-image catalogue:
+#
+#   * `marid`, the supervisor, built --release for amd64 from this repo. It is the
+#     ENTRYPOINT, so `materialize` needs no command override.
+#   * a plain POSIX userland (`/bin/sh`, coreutils incl. `base64`) because a run is
+#     an arbitrary program the user brought (spec §2 "Agent"), and control-plane
+#     file writes are expressed as `/bin/sh -c … base64 -d > path` runs
+#     (contracts.md Appendix C.2). It is also the driver's readiness probe.
+#   * `ca-certificates`, and this one is load-bearing rather than customary: the
+#     supervisor's journal and control channel are an outbound `wss://` on 443,
+#     verified against this store (measured: TLSv1.3 / TLS_AES_256_GCM_SHA384,
+#     certificate verified, HTTP/1.1 101). Every agent the user brings needs it too.
+#
+# DELIBERATELY ABSENT:
+#   * fuse3 / fuse-overlayfs. Nothing in the storage contract needs them today
+#     (decisions.md v0 deviation 2 defers spec §4.6(b)(c), and kernel overlayfs
+#     mounts fine inside a real container — both bare and under `unshare -Urm` —
+#     so no fuse-overlayfs is required when the lazy mount does land). `/dev/fuse`
+#     is present and writable in the sandbox; when §4.6(b)(c) ships, `fuse3` is the
+#     one package to add here.
+#   * Anything to make restore "work". It already does: mari-core's own 65 tests,
+#     compiled for amd64 and executed INSIDE a real container, pass — including
+#     snapshot → wipe → restore byte-identity with modes, symlinks, empty files and
+#     multi-chunk files, and the whole root-escape attack surface. The manifest
+#     carries no uid/gid and no device/fifo kinds by design, so nothing about the
+#     sandbox's privilege model changes the result.
+#
+# Build (from the repo root; wrangler does this for you via the `containers` block
+# in packages/control-plane/wrangler.jsonc):
+#   docker build --platform linux/amd64 -f deploy/Dockerfile.mari -t mari/base:v0 .
+#
+# The context is the repo (a Cargo workspace build needs the workspace);
+# `deploy/Dockerfile.mari.dockerignore` keeps `target/`, `node_modules/` and
+# `.git/` out of it.
+
+# syntax=docker/dockerfile:1
+
+# Declared before the first FROM so it is usable in one (a global ARG). Pinned
+# through an ARG rather than a literal so the runtime stage is amd64 even when
+# someone builds without `--platform` on an arm64 workstation: the binary from
+# stage 1 is amd64, and a mismatched base would produce an image that cannot run.
+ARG IMAGE_PLATFORM=linux/amd64
+
+# ---- stage 1: build marid for linux/amd64 ------------------------------------
+# Runs NATIVELY on the build host and cross-links for amd64, so an arm64
+# workstation does not pay for a qemu-emulated Rust compile.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+    CARGO_TERM_COLOR=never
+
+WORKDIR /repo
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+
+# AFTER the copy, deliberately: `rust-toolchain.toml` makes rustup switch
+# toolchains inside /repo, and a target added to the image's default toolchain is
+# not installed for the pinned one ("the x86_64-unknown-linux-gnu target may not be
+# installed"). Adding it here adds it to the toolchain that will actually build.
+RUN rustup target add x86_64-unknown-linux-gnu
+
+# Cache mounts keep the cargo registry and target dir out of the image; the binary
+# is copied out inside the same RUN because a cache mount does not survive a layer.
+ARG TARGET=x86_64-unknown-linux-gnu
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/repo/target,sharing=locked \
+    set -eux; \
+    cargo build -p marid --locked --release --target "$TARGET"; \
+    cp "/repo/target/$TARGET/release/marid" /marid; \
+    test -s /marid
+
+# ---- stage 2: the base image (linux/amd64) -----------------------------------
+FROM --platform=${IMAGE_PLATFORM} debian:bookworm-slim
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /work /etc/mari/agents.d
+
+COPY --from=build /marid /usr/local/bin/marid
+
+# Defaults for the marid env contract (contracts.md §5.1, crates/marid/src/config.rs).
+# The control plane overrides MARI_COMPUTER_ID / MARI_EPOCH / MARI_TOKEN /
+# MARI_CONTROL_URL / MARI_RESTORE_MANIFEST (and MARI_ROOT / MARI_STORE) at
+# materialize time.
+#
+# MARI_STORE is deliberately NOT baked in. On this substrate ALL disk is ephemeral
+# — measured, not quoted: a marker written to /work did not survive destroy+start —
+# so a store path on the local filesystem would silently throw away every chunk the
+# computer wrote. The deployment must set STORE_URI to the R2 S3 endpoint
+# (`https://<account>.r2.cloudflarestorage.com`, the path decisions.md's
+# direct-to-R2 rule already commits to and the one Cloudflare's own docs use).
+ENV MARI_ROOT=/work \
+    MARI_AGENTS_DIR=/etc/mari/agents.d \
+    RUST_LOG=info,marid=debug
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/marid"]

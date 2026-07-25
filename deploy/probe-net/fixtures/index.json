@@ -1,0 +1,22 @@
+[
+  {
+    "len": 94,
+    "name": "sup_hello.frame",
+    "sha256": "cebd634144b6d24f4aa208b0d69534ae814e6285f21358aee3bfd23e8e9fb24b"
+  },
+  {
+    "len": 65603,
+    "name": "sup_journal_big.frame",
+    "sha256": "fd7bc444067e0c3ea7a6f908de16d40f6896343365549dd8fcd3fb3e6211e555"
+  },
+  {
+    "len": 100,
+    "name": "ctl_start_run.frame",
+    "sha256": "48c396a4f0d6c0e5fe1dbf9ff681bbac24079be7f59221a00154f972eb3bb806"
+  },
+  {
+    "len": 297,
+    "name": "ctl_input.frame",
+    "sha256": "266f5bf6d38fae6042552e0a5e8f95269b5b5799212886a046bfa224307b9164"
+  }
+]

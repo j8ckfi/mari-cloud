@@ -23,6 +23,18 @@ export interface Env {
   DB: D1Database;
   /** Chunk + manifest + journal-segment object store (spec 3.3). */
   STORE: R2Bucket;
+  /**
+   * The built web application, served as Workers static assets so ONE Worker
+   * serves both the API and the app (spec 1.3 "the user can see the results from
+   * each device" — one origin, one deploy). `wrangler.jsonc` sets
+   * `run_worker_first: true`, so this binding is reached ONLY from the explicit
+   * fallthrough at the end of `worker.ts`: the asset router never gets a chance
+   * to swallow `/api/*`, the WebSocket routes or a preview host.
+   *
+   * Optional because the Node entry (private instances) serves the app itself and
+   * the vitest bindings do not include it.
+   */
+  ASSETS?: Fetcher;
 
   /** Preview/wake-proxy zone, e.g. `mari.sh` (decisions.md). */
   PREVIEW_ZONE?: string;
@@ -30,12 +42,40 @@ export interface Env {
   DEV_AUTH?: string;
   /** `'1'` enables the deterministic seed route used by the web e2e suite. */
   DEV_SEED?: string;
-  /** Better Auth signing secret. */
+  /** Better Auth signing secret. On a production environment this MUST arrive
+   *  from a real secret binding (`wrangler secret put AUTH_SECRET`); `auth.ts`
+   *  throws at startup if it is missing or still a committed placeholder. */
   AUTH_SECRET?: string;
-  /** Better Auth base URL. */
+  /** Better Auth base URL. Also the source of the WebAuthn rpID and, in
+   *  production, of the pinned ceremony origin (`auth.ts`). */
   BASE_URL?: string;
-  /** Substrate driver selector: `'fake'` in tests, else a real driver. */
+  /** Deployment environment name. `'production'` is one of the two triggers for
+   *  the fail-closed auth checks (the other is a deployed https BASE_URL), and
+   *  is what `wrangler.jsonc`'s `env.production` block sets. There is
+   *  deliberately no value that switches those checks OFF. */
+  ENVIRONMENT?: string;
+  /** WebAuthn Relying Party id override. Defaults to BASE_URL's hostname, which
+   *  is correct for `localhost`, `<name>.workers.dev` (workers.dev is a public
+   *  suffix, so the rpID must be the full host) and `app.mari.sh`. */
+  AUTH_RP_ID?: string;
+  /** Human-readable Relying Party name shown by the authenticator UI. */
+  AUTH_RP_NAME?: string;
+  /** Extra comma-separated origins the auth layer trusts, and (in production)
+   *  additionally accepts as a WebAuthn ceremony origin — e.g. a workers.dev
+   *  origin alongside `https://app.mari.sh`. */
+  AUTH_TRUSTED_ORIGINS?: string;
+  /** GitHub OAuth app id. OAuth is configured-but-optional (decisions.md):
+   *  the provider is registered only when BOTH of these are present. */
+  GITHUB_CLIENT_ID?: string;
+  /** GitHub OAuth app secret (secret binding, never a var). */
+  GITHUB_CLIENT_SECRET?: string;
+  /** Substrate driver selector: `'fake'` in tests, `'cloudflare'` for the
+   *  container-backed hosted substrate, else a real injected driver. */
   SUBSTRATE_MODE?: string;
+  /** wrangler `containers[].max_instances` mirrored as a var, so the Cloudflare
+   *  driver's capacity error can name the real cap (it defaults to 20 and ERRORS
+   *  a wake past it — it caps concurrent AWAKE computers, not fleet size). */
+  CF_MAX_INSTANCES?: string;
   /** AWAKE -> WARM idle threshold, ms (default 5 min). */
   WARM_IDLE_MS?: string;
   /** WARM -> COLD idle threshold, ms (default 30 min). */

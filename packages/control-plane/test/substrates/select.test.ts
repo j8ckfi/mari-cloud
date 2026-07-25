@@ -73,11 +73,34 @@ describe('selectSubstrate (spec §3.6)', () => {
 });
 
 describe('registry', () => {
-  it('exposes both substrate names and their profiles', () => {
-    expect([...SUBSTRATE_NAMES].sort()).toEqual(['docker', 'sprites']);
+  it('exposes every substrate name and its profile', () => {
+    expect([...SUBSTRATE_NAMES].sort()).toEqual(['cloudflare', 'docker', 'sprites']);
     expect(SUBSTRATE_PROFILES.docker).toBeDefined();
     expect(SUBSTRATE_PROFILES.sprites).toBeDefined();
+    expect(SUBSTRATE_PROFILES.cloudflare).toBeDefined();
     expect(SUBSTRATE_PROFILES.docker!.usdPerHour).toBe(0);
+    // Every name in the registry must be selectable, or `selectSubstrate` would
+    // silently ignore it (it drops candidates with no profile).
+    for (const name of SUBSTRATE_NAMES) {
+      expect(selectSubstrate([name])).toBe(name);
+    }
+  });
+
+  it('picks Cloudflare over Sprites for a hosted wake (cheaper AND faster)', () => {
+    // The one row with measured numbers behind it: $0.0452/h against Sprites'
+    // unverified $0.06, and ~1 s to a restored computer against 1.5 s.
+    expect(selectSubstrate(['sprites', 'cloudflare'])).toBe('cloudflare');
+  });
+
+  it('createSubstrate("cloudflare") builds synchronously and declares WARM unsupported', () => {
+    // The driver's only dependency is the live `ctx.container`, so unlike docker it
+    // needs no lazy import — and it must not pretend to have a WARM state.
+    const p = createSubstrate('cloudflare', { container: undefined });
+    expect(p.name).toBe('cloudflare');
+    expect(p.supportsWarm).toBe(false);
+    for (const fn of ['materialize', 'destroy', 'sleep', 'wake', 'exec', 'exposePort']) {
+      expect(typeof (p as unknown as Record<string, unknown>)[fn]).toBe('function');
+    }
   });
 
   it('index DOCKER_SUBSTRATE matches the driver constant (no drift)', () => {

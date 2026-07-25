@@ -36,9 +36,36 @@ export class ApiError extends Error {
   }
 }
 
+// ---- session expiry -------------------------------------------------------
+//
+// Every route under `/api/*` (except Better Auth's own) is behind the session
+// guard, so a 401 from ANY of them is the single authoritative signal that the
+// session the app was using has stopped being valid. The auth gate subscribes
+// here rather than polling `get-session`: a session can lapse at any moment
+// (expiry, sign-out in another tab, a revoked session) and the interface must
+// show the sign-in screen the first time the server says so, not one poll later.
+
+const unauthorizedListeners = new Set<() => void>();
+
+/** Subscribe to "the control plane answered 401". Returns a disposer. */
+export function onUnauthorized(fn: () => void): () => void {
+  unauthorizedListeners.add(fn);
+  return () => {
+    unauthorizedListeners.delete(fn);
+  };
+}
+
+/** Pass a response through, announcing a 401 to the gate. */
+function noteAuth<T extends { status: number }>(res: T): T {
+  if (res.status === 401) {
+    for (const fn of Array.from(unauthorizedListeners)) fn();
+  }
+  return res;
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${API_BASE}${path}`;
-  const res = await fetch(url, { signal, headers: { accept: 'application/json' } });
+  const res = noteAuth(await fetch(url, { signal, headers: { accept: 'application/json' } }));
   if (!res.ok) throw new ApiError(`GET ${path} → ${res.status}`, res.status, url);
   return (await res.json()) as T;
 }
@@ -46,13 +73,15 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 /** POST JSON (or nothing) and decode a JSON response. */
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
   const url = `${API_BASE}${path}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: body === undefined
-      ? { accept: 'application/json' }
-      : { accept: 'application/json', 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const res = noteAuth(
+    await fetch(url, {
+      method: 'POST',
+      headers: body === undefined
+        ? { accept: 'application/json' }
+        : { accept: 'application/json', 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  );
   if (!res.ok) throw new ApiError(`POST ${path} → ${res.status}`, res.status, url);
   return (await res.json()) as T;
 }
@@ -82,7 +111,7 @@ export function fetchDir(id: string, path: string, signal?: AbortSignal): Promis
 export async function fetchFile(id: string, path: string, signal?: AbortSignal): Promise<Uint8Array> {
   const q = new URLSearchParams({ path });
   const url = `${API_BASE}/computers/${encodeURIComponent(id)}/file?${q}`;
-  const res = await fetch(url, { signal });
+  const res = noteAuth(await fetch(url, { signal }));
   if (!res.ok) throw new ApiError(`GET file ${path} → ${res.status}`, res.status, url);
   return new Uint8Array(await res.arrayBuffer());
 }
@@ -106,7 +135,7 @@ export async function writeFile(
   const q = new URLSearchParams({ path });
   const url = `${API_BASE}/computers/${seg(id)}/file?${q}`;
   const body = typeof contents === 'string' ? new TextEncoder().encode(contents) : contents;
-  const res = await fetch(url, { method: 'PUT', body: body as BodyInit });
+  const res = noteAuth(await fetch(url, { method: 'PUT', body: body as BodyInit }));
   if (!res.ok) throw new ApiError(`PUT file ${path} → ${res.status}`, res.status, url);
   return (await readJsonOr(res, { ok: true, path, state: 'waking' as const })) as WriteFileResponse;
 }
@@ -134,7 +163,7 @@ export async function uploadFile(id: string, path: string, file: Blob): Promise<
   const form = new FormData();
   form.set('path', path);
   form.set('file', file);
-  const res = await fetch(url, { method: 'POST', body: form });
+  const res = noteAuth(await fetch(url, { method: 'POST', body: form }));
   if (res.status === 404 || res.status === 405 || res.status === 501) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const written = await writeFile(id, path, bytes);
@@ -152,11 +181,13 @@ export function fetchLayout(id: string, signal?: AbortSignal): Promise<LayoutRes
 /** Persist a computer's pane layout to the DO. */
 export async function saveLayout(id: string, layout: SerializedLayout): Promise<void> {
   const url = `${API_BASE}/computers/${encodeURIComponent(id)}/layout`;
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(layout),
-  });
+  const res = noteAuth(
+    await fetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(layout),
+    }),
+  );
   if (!res.ok) throw new ApiError(`PUT layout → ${res.status}`, res.status, url);
 }
 

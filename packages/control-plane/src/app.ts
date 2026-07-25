@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv, Env } from './types';
-import { makeAuth } from './auth';
+import { makeAuth, assertProductionSafety, isProductionEnv } from './auth';
 import { runSeed } from './seed';
 import { toArrayBuffer, toBase64 } from './bytes';
 import {
@@ -235,17 +235,44 @@ function parseLayout(layout: string | null): unknown {
   }
 }
 
-export function createApp(): Hono<AppEnv> {
+/**
+ * The Hono app.
+ *
+ * `env` is optional so the module-scope construction in handler.ts (which has no
+ * Env yet) is unchanged. When it IS supplied, production safety is asserted
+ * EAGERLY and `createApp` throws — that is the deploy-time tripwire. Either way
+ * the same assertion runs per request through `makeAuth` (and the guard
+ * middleware below), so a misconfigured production origin cannot serve a single
+ * request no matter which entry constructed the app.
+ */
+export function createApp(env?: Env): Hono<AppEnv> {
+  if (env) assertProductionSafety(env);
   const app = new Hono<AppEnv>();
+
+  // Fail closed even when the app was constructed without an Env (handler.ts),
+  // and even when the vars lie about where this is running: the request's own
+  // URL is the third production trigger, so `wrangler deploy` with no `--env`
+  // cannot serve the dev block's placeholder secret from a public origin.
+  // `assertProductionSafety` is a handful of string comparisons, not a hot-path
+  // cost.
+  app.use('*', async (c, next) => {
+    assertProductionSafety(c.env, c.req.url);
+    return next();
+  });
 
   app.get('/', (c) => c.json({ service: 'mari-control-plane', ok: true }));
 
-  // ---- Better Auth ----
+  // ---- Better Auth (incl. the passkey ceremonies under /api/auth/passkey/*) ----
   app.on(['GET', 'POST'], '/api/auth/*', (c) => makeAuth(c.env).handler(c.req.raw));
 
   // ---- dev seed (env-gated; unauthenticated: it mints the session) ----
   app.post('/api/dev/seed', async (c) => {
-    if (c.env.DEV_SEED !== '1') return c.json({ error: 'not_found' }, 404);
+    // Two independent gates. The flag must be on AND the environment must not be
+    // production: `assertProductionSafety` already throws for DEV_SEED=1 there,
+    // so this is belt-and-braces against any future path that skips it.
+    if (c.env.DEV_SEED !== '1' || isProductionEnv(c.env, c.req.url)) {
+      return c.json({ error: 'not_found' }, 404);
+    }
     const opts = (await c.req.json().catch(() => ({}))) as {
       email?: string;
       password?: string;

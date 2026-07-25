@@ -1,0 +1,41 @@
+{
+  // LOCAL-ONLY config for developing the S3 facade in src/worker.ts against a
+  // real opendal client (`wrangler dev`, miniflare bindings, nothing deployed).
+  //
+  // It deliberately has NO `containers` block: a container-enabled Durable Object
+  // in local dev runs the image on the local Docker daemon, which would test
+  // Docker rather than Cloudflare. The deployed thesis app is
+  // `wrangler.template.jsonc`.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mari-thesis-e2e-local",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "COMPUTER", "class_name": "ComputerDO" },
+      { "name": "EVENTS", "class_name": "EventsDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ComputerDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["EventsDO"] }
+  ],
+
+  "d1_databases": [
+    { "binding": "DB", "database_name": "mari-thesis-e2e-local", "database_id": "local-only" }
+  ],
+  "r2_buckets": [{ "binding": "STORE", "bucket_name": "mari-thesis-e2e-store" }],
+
+  "vars": {
+    "PREVIEW_ZONE": "mari.sh",
+    "DEV_AUTH": "0",
+    "DEV_SEED": "0",
+    "SUBSTRATE_MODE": "fake",
+    "BASE_URL": "http://localhost:8799",
+    "STORE_BUCKET": "mari-thesis-e2e-store",
+    "STORE_ACCESS_KEY_ID": "localdevkey",
+    "E2E_TOKEN": "localdevtoken"
+  }
+}

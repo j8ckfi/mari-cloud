@@ -1,0 +1,7 @@
+# Everything here is generated per run and holds per-run secrets (the scratch
+# AUTH_SECRET, the store's access key pair, the /__e2e token). None of it belongs
+# in the repository, and the scratch app it belongs to is deleted by the suite.
+ctx/
+wrangler.generated.jsonc
+.state.json
+.wrangler/

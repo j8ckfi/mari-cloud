@@ -1,0 +1,114 @@
+{
+  // TEMPLATE for the Cloudflare THESIS e2e (e2e/cloudflare.e2e.test.ts, gated on
+  // MARI_CF_E2E=1). The suite substitutes every double-underscore placeholder
+  // below (and fails if one is left over), then writes
+  // `wrangler.generated.jsonc` (gitignored) next to this file, because the D1 id,
+  // the worker's own origin and the per-run secrets are only known at run time.
+  //
+  // SCRATCH ONLY. It is `mari-thesis-e2e`, not app.mari.sh: no custom domain, no
+  // DNS record, no route, and it binds a scratch D1 + a scratch R2 bucket rather
+  // than `mari` / `mari-store`. Everything it creates is deleted by the suite.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mari-thesis-e2e",
+  "main": "src/worker.ts",
+  // Same runtime date as packages/control-plane/wrangler.jsonc, so this runs the
+  // control plane production runs: PID namespace on, and binary WebSocket
+  // messages arriving as Blobs (which computer-do.ts pins with
+  // `binaryType = 'arraybuffer'` — if that pin ever regresses, every supervisor
+  // frame here silently decodes to zero bytes).
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "COMPUTER", "class_name": "ComputerDO" },
+      { "name": "EVENTS", "class_name": "EventsDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ComputerDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["EventsDO"] }
+  ],
+
+  // The container is bound to the DO CLASS, so `ComputerDO` must be the
+  // container class — the same structural fact production lives with.
+  "containers": [
+    {
+      "class_name": "ComputerDO",
+      // `ctx/Dockerfile` is deploy/Dockerfile.mari with ONE build flag added
+      // (`--features s3`) and the store's endpoint/credentials as ENV. The suite
+      // asserts the diff is exactly that, so the thesis runs against the
+      // production base image rather than a lookalike.
+      "image": "./ctx/Dockerfile",
+      "image_build_context": "./ctx",
+      "instance_type": "standard-1",
+      // 25, not 5, and this is a FINDING rather than a preference: a container
+      // application's `instances` counter does not fall back promptly when
+      // instances go inactive. Measured on this very app — every instance row
+      // `inactive`, and `instances` still pinned at the cap — after which new
+      // containers die seconds after starting. One COLD wake = one instance row,
+      // so a suite that cycles a computer a dozen times saturates a small cap and
+      // then looks like a platform failure.
+      "max_instances": 25,
+      // Pinned to the scratch bucket's jurisdiction, as production pins to
+      // `mari-store`'s.
+      "constraints": { "regions": ["WEUR"] }
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "__D1_NAME__",
+      "database_id": "__D1_ID__",
+      "migrations_dir": "../../packages/control-plane/migrations"
+    }
+  ],
+
+  "r2_buckets": [{ "binding": "STORE", "bucket_name": "__BUCKET__" }],
+
+  "vars": {
+    "PREVIEW_ZONE": "mari.sh",
+    // Never on a public origin — auth.ts refuses to build with either set here.
+    "DEV_AUTH": "0",
+    "DEV_SEED": "0",
+
+    // THE POINT OF THIS DEPLOY: the real Cloudflare container driver.
+    "SUBSTRATE_MODE": "cloudflare",
+    "CF_MAX_INSTANCES": "25",
+
+    // Auth on a workers.dev origin is production auth (auth.ts trigger #2/#3):
+    // a real 32+ char secret, minted per run, and passkeys as the only credential.
+    "BASE_URL": "__ORIGIN__",
+    "AUTH_RP_ID": "__HOST__",
+    "AUTH_RP_NAME": "Mari thesis e2e",
+    "AUTH_SECRET": "__AUTH_SECRET__",
+
+    // ---- what the DO hands `marid` at materialize (spec 3.5) ---------------
+    "COMPUTER_ROOT": "/work",
+    // The supervisor dials back over PLAIN ws:// on purpose: `marid` has no TLS
+    // backend compiled in (crates/marid/Cargo.toml pulls tokio-tungstenite with
+    // no TLS feature, and reqwest resolves with no TLS backend at all), so
+    // wss:// cannot connect today. workers.dev serves http/ws on port 80.
+    "SUPERVISOR_URL_BASE": "__WS_ORIGIN__",
+    // The chunk store as the SUPERVISOR sees it: path-style S3 against the
+    // facade in src/worker.ts, backed by the scratch R2 bucket that the control
+    // plane's own STORE binding reads manifests from.
+    "STORE_URI": "s3://__BUCKET__",
+
+    // Tier policy (spec 4.4) hurried so a deployed test can reach COLD without
+    // idling for real minutes. On this substrate WARM is unsupported, so
+    // WARM_IDLE_MS is the single AWAKE -> COLD deadline and COLD_IDLE_MS is
+    // unused.
+    "WARM_IDLE_MS": "__WARM_IDLE_MS__",
+    "COLD_IDLE_MS": "600000",
+
+    // ---- test-only additions in src/worker.ts ------------------------------
+    "STORE_BUCKET": "__BUCKET__",
+    "STORE_ACCESS_KEY_ID": "__STORE_KEY_ID__",
+    "E2E_TOKEN": "__E2E_TOKEN__"
+  },
+
+  "observability": { "enabled": true },
+  "workers_dev": true
+}
