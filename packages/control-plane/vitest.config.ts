@@ -28,6 +28,22 @@ export default defineConfig({
           // wall-clock, so exact values are moot.
           WARM_IDLE_MS: '1000',
           COLD_IDLE_MS: '2000',
+          // Liveness / recovery windows (computer-do.ts). The ORDER matters, not
+          // just the magnitudes: the single alarm processes the EARLIEST pending
+          // deadline, so the supervisor-loss grace is deliberately shorter than
+          // the tier deadline (as it is in production: 15 s against 5 min) and a
+          // suite that fires the alarm after a socket close gets the liveness
+          // check rather than the tier policy.
+          SUPERVISOR_GRACE_MS: '400',
+          // Comfortably longer than any AWAKE-with-work window a suite holds
+          // open: the health check must not start probing a computer a test is
+          // still using. Suites that want it drive the alarm themselves.
+          LIVENESS_MS: '3000',
+          // Longer than the tier tests' own polling, so a clean handshake is
+          // never raced by its own deadline; the suite that tests the deadline
+          // fires the alarm instead of waiting.
+          COLD_FINALIZE_MS: '3000',
+          WAKE_TIMEOUT_MS: '2000',
         },
       },
     }),

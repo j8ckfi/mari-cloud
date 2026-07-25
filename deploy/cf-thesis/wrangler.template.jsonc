@@ -103,6 +103,17 @@
     "WARM_IDLE_MS": "__WARM_IDLE_MS__",
     "COLD_IDLE_MS": "600000",
 
+    // Liveness and recovery (computer-do.ts), hurried the same way and in the
+    // same ORDER as production: the supervisor-loss grace must be SHORTER than
+    // the idle deadline, or the tier policy reaches a dead computer before the
+    // liveness check does. A torn-down microVM on this substrate can leave the
+    // DO's supervisor socket open (measured: the platform reported the instance
+    // inactive while D1 still said `awake` 15 minutes later), so LIVENESS_MS —
+    // the health check while work is in flight — is what notices that case.
+    "SUPERVISOR_GRACE_MS": "10000",
+    "LIVENESS_MS": "15000",
+    "COLD_FINALIZE_MS": "20000",
+
     // ---- test-only additions in src/worker.ts ------------------------------
     "STORE_BUCKET": "__BUCKET__",
     "STORE_ACCESS_KEY_ID": "__STORE_KEY_ID__",

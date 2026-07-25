@@ -262,10 +262,6 @@ const wakeToSupervisor = new Samples('cold wake -> supervisor connected (run dis
 const wakeToVerified = new Samples('cold wake -> files byte-identical in a fresh container');
 const awakeToCold = new Samples('idle AWAKE -> COLD (container destroyed)');
 const notes: string[] = [];
-/** How many times an idle AWAKE computer failed to reach COLD on its own and had
- *  to be nudged (see `reachCold`). Reported at the end: it is a control-plane
- *  finding, not a flake. */
-let coldStalls = 0;
 
 function record(line: string): void {
   notes.push(line);
@@ -346,39 +342,28 @@ async function waitState(target: string, timeoutMs = 600_000, id = computerId): 
 }
 
 /**
- * Take a computer to COLD, and report honestly when it cannot get there alone.
+ * Take a computer to COLD, with NOTHING TO HELP IT.
  *
- * THE BUG THIS EXISTS FOR (found by this suite, control-plane lane):
- * `ComputerDO.#beginCold()` sends `prepare_for_cold` to the supervisor, sets
- * `coldPending`, and arms NO fallback alarm. If that supervisor never answers —
+ * THE DEFECT THIS USED TO WORK AROUND (fixed in the control-plane lane):
+ * `ComputerDO.#beginCold()` sent `prepare_for_cold` to the supervisor, set
+ * `coldPending`, and armed NO fallback alarm. If that supervisor never answered —
  * its container was stopped by the platform, or the socket outlived it — the
- * computer stays AWAKE **forever**: no alarm is scheduled, `#wakeInBackground()`
- * early-returns because the DO still believes it holds a live handle, and a run
- * enqueued afterwards sits queued and never dispatches (spec 5.1's "a run is
- * never lost" degrades into "a run is never run"). Observed on a real
- * deployment: the platform reported the instance `inactive` while D1's fleet
- * mirror still said `awake`, 15 minutes later.
+ * computer stayed AWAKE **forever**: no alarm was scheduled, `#wakeInBackground()`
+ * early-returned because the DO still believed it held a live handle, and a run
+ * enqueued afterwards sat queued and never dispatched (spec 5.1's "a run is never
+ * lost" degraded into "a run is never run"). Observed on a real deployment: the
+ * platform reported the instance `inactive` while D1's fleet mirror still said
+ * `awake`, 15 minutes later. This suite used to nudge that transition with
+ * `POST /wake` and count the nudges — and a test helper working around a product
+ * defect IS the defect.
  *
- * `POST /wake` is the one public rescue: on an already-AWAKE computer it takes
- * the early-return path, which calls `#touch()`, which clears `coldPending` and
- * re-arms the tier alarm. So this helper waits, and if the deadline passes it
- * nudges and counts it.
+ * The handshake now has its own deadline (`COLD_FINALIZE_MS`): if the final
+ * snapshot does not arrive, the DO finalizes from the last known head, destroys
+ * the instance, and records a `final_snapshot_missed` incident. So this helper
+ * only waits — no nudge, no rescue call — and a stall is a FAILURE, not a note.
  */
-async function reachCold(id = computerId, budgetMs = 90_000): Promise<number> {
-  const t0 = Date.now();
-  try {
-    return await waitState('cold', budgetMs, id);
-  } catch {
-    coldStalls += 1;
-    const stuck = await computer(id);
-    record(
-      `STALLED: ${id} was still ${stuck.state} ${Math.round((Date.now() - t0) / 1000)} s after ` +
-        `its idle deadline (${WARM_IDLE_MS} ms) — the AWAKE->COLD handshake has no timeout. ` +
-        `Nudging with POST /wake, which is the only public call that re-arms the tier alarm.`,
-    );
-    await client.post(`/api/computers/${id}/wake`);
-    return await waitState('cold', 180_000, id);
-  }
+async function reachCold(id = computerId, budgetMs = 180_000): Promise<number> {
+  return waitState('cold', budgetMs, id);
 }
 
 /** The run's whole journal as the control plane holds it. The tail route caps at
@@ -483,10 +468,6 @@ describe.runIf(GATE)('the thesis, on real Cloudflare Containers', () => {
     for (const s of [wakeToSupervisor, wakeToVerified, awakeToCold]) {
       if (s.n > 0) record(s.line());
     }
-    record(
-      `AWAKE->COLD transitions that stalled and needed a nudge: ${coldStalls} ` +
-        `(see reachCold: #beginCold arms no fallback alarm)`,
-    );
     if (KEEP || !GATE) return;
     // Teardown, narrowly: only resources named mari-thesis-e2e*.
     //
@@ -1020,9 +1001,12 @@ describe.runIf(GATE)('the thesis, on real Cloudflare Containers', () => {
     expect(attach.open).toBe(true);
 
     // ---- what the CONTROL PLANE did -------------------------------------
-    // Nothing tells the DO its container is gone except its own tier alarm, so
-    // this is a measurement, not a wait-for-success: record which state it
-    // reaches inside the budget, and how long recovery takes.
+    // NOTHING IS NUDGED HERE. The DO learns its machine is gone by itself: the
+    // supervisor's socket closing arms a grace deadline, and — because a torn-down
+    // microVM can leave that socket OPEN — a computer with work in flight is
+    // health-checked on a cadence (LIVENESS_MS) and the substrate is ASKED. So
+    // this is a wait-for-success with a budget, not a measurement of whether it
+    // ever happens.
     const RECOVERY_BUDGET_MS = 240_000;
     const stateAfter = await waitFor(
       'the control plane to notice the container is gone (any state but awake)',
@@ -1032,28 +1016,25 @@ describe.runIf(GATE)('the thesis, on real Cloudflare Containers', () => {
       },
       RECOVERY_BUDGET_MS,
       2_000,
-    ).catch(() => 'awake (never noticed)');
+    );
     const noticedMs = Date.now() - killedAt;
-    if (stateAfter === 'awake (never noticed)') {
-      // The `#beginCold` stall (see `reachCold`): the DO asked a dead supervisor
-      // to prepare for COLD and is waiting for an answer that will never come.
-      // Record it, then nudge, so the rest of the recovery contract can still be
-      // asserted rather than lost behind a hang.
-      coldStalls += 1;
-      record(
-        `STALLED: the computer was still AWAKE ${Math.round(noticedMs / 1000)} s after its ` +
-          `machine died — the AWAKE->COLD handshake has no timeout. Nudging with POST /wake.`,
-      );
-      await client.post(`/api/computers/${evictComputerId}/wake`);
-    }
     // Captured HERE, before any later run can move the head for its own reasons:
     // this is the head as of "the container is gone and Mari has reacted".
     const headAfterEviction = (await computer(evictComputerId)).head;
     record(
-      `eviction -> control plane state ${stateAfter} after ${noticedMs} ms ` +
-        `(nothing tells the DO its container died; the tier alarm at ` +
-        `WARM_IDLE_MS=${WARM_IDLE_MS} ms is what notices)`,
+      `eviction -> control plane state ${stateAfter} after ${noticedMs} ms, unaided ` +
+        `(supervisor-loss grace, then the substrate is asked whether the instance exists)`,
     );
+    // The recovery is recorded as what it was, content-free (spec 6.3) — a COLD
+    // reached without the final snapshot spec 4.5 asks for is not a clean success.
+    const incidents = await client.get<{ incidents: { kind: string; epoch: number }[] }>(
+      `/api/computers/${evictComputerId}/incidents`,
+    );
+    expect(incidents.status).toBe(200);
+    expect(
+      incidents.body.incidents.map((i) => i.kind),
+      'the eviction was recorded as an incident',
+    ).toContain('substrate_lost');
 
     // Recovery: the next run must wake a brand-new container and run there.
     // This is the user-visible question — "is my computer usable again?" — and

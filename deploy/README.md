@@ -4,31 +4,90 @@
 > substrate account or local Docker."*
 
 ```sh
-docker compose -f deploy/docker-compose.yml up --build
+./deploy/up.sh
 ```
 
 That is the command. It builds the base image (the `marid` supervisor plus a
-POSIX userland), builds the control plane, and starts it on
-<http://localhost:8787> — REST API, WebSockets and the web application on one
-origin.
+POSIX userland), proves the built binary runs, builds the control plane, creates
+the two named volumes, starts the instance on <http://localhost:8787> — REST API,
+WebSockets and the web application on one origin — and **waits until that origin
+actually answers** before telling you it is up.
+
+**Prerequisites: a Docker daemon and this repository. Nothing else** — no Node,
+no pnpm, no Rust, and no compose plugin on the host. Both images build from this
+repo. First run compiles `marid` in a container, so expect minutes; after that
+the layer cache makes it seconds.
+
+Then, in the browser:
+
+1. open <http://localhost:8787> — use the name `localhost`, not `127.0.0.1`
+   (below);
+2. type an email and press **Create account with a passkey**. Touch ID, Windows
+   Hello or a security key: WebAuthn works over plain http on `localhost`, so a
+   private instance needs no certificate and there is no password to store;
+3. the fleet is empty. Press **New computer** (or <kbd>⌘K</kbd> → *New
+   computer*). It is created in deep sleep — a manifest in the chunk store, no
+   container, no cost;
+4. press <kbd>⌥R</kbd> and run something. The wake happens behind the interface:
+   the request returns in milliseconds with the run queued, a container appears,
+   `marid` restores the filesystem, and the run starts.
 
 Stopping:
 
 ```sh
-docker compose -f deploy/docker-compose.yml down          # stop the control plane
-docker rm -f $(docker ps -aq --filter label=mari.computer)  # and any AWAKE computers
-docker volume rm mari-store mari-data                     # ...and the fleet itself
+./deploy/down.sh              # stop the control plane; computers keep running
+./deploy/down.sh --computers  # ...and destroy every materialized computer
+./deploy/down.sh --purge      # ...and delete the fleet (prompts first)
 ```
 
 A computer is a container the control plane created through the Docker socket,
-not a compose service, so `compose down` leaves an AWAKE one running — by
-design: it keeps its supervisor, and when the control plane comes back that
-supervisor reconnects with the epoch it already holds (spec 4.1). Remove them by
-label when you want the substrate empty. The volumes are the fleet: deleting
-`mari-store` deletes every computer (spec §2 — the chunk store is the home).
+not a service in this stack, so stopping the control plane leaves an AWAKE one
+running — by design: it keeps its supervisor, and when the control plane comes
+back that supervisor reconnects with the epoch it already holds (spec 4.1).
+`--purge` deletes the `mari-store` volume, and that volume is the fleet: the
+chunk store is the home of every computer (spec §2), and there is no other copy.
 
-Prerequisites: a Docker daemon and the repo checked out. Nothing else — no
-Node, no pnpm, no Rust on the host; both images build from this repo.
+## Why a script and not `docker compose`
+
+`docker compose` is a CLI **plugin**. Docker Engine on Linux, Colima, Rancher
+Desktop and Podman all give you a working daemon without it, and Homebrew's
+`docker` formula does not pull it in either — so "one command" cannot be a
+compose command without also being an install step. This was not theoretical:
+the compose path in this file was wrong on the first machine that tried it
+(Colima + the Homebrew `docker` CLI, no plugin — `docker: unknown command:
+docker compose`).
+
+`deploy/docker-compose.yml` is still here, still correct, and describes exactly
+what `up.sh` does: the same two images, the same two named volumes, the same
+environment. If you have the plugin, either path works:
+
+```sh
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+If you want it and do not have it: `apt install docker-compose-plugin` on Debian
+or Ubuntu, `brew install docker-compose` on macOS (Homebrew prints the one-line
+symlink into `~/.docker/cli-plugins` that makes `docker compose` find it), or
+install Docker Desktop, which bundles it.
+
+## Sign-in, and why the URL matters
+
+A private instance uses passkeys, exactly like the hosted one — a WebAuthn
+Relying Party is a *name*, and `localhost` is the one name every browser accepts
+over plain http. So:
+
+* `http://localhost:8787` — works.
+* `http://127.0.0.1:8787` — the ceremony fails. The rpID comes from `BASE_URL`'s
+  hostname, and an IP literal is not a valid rpID; Chrome refuses it.
+* `http://192.168.x.x:8787` or any other LAN address — WebAuthn needs a secure
+  context, so plain http off `localhost` cannot register a passkey at all. Reach
+  the instance over an SSH tunnel (`ssh -L 8787:localhost:8787 host`) or put it
+  behind TLS and set `MARI_BASE_URL` to the https origin.
+
+`MARI_DEV_AUTH=1` additionally enables email + password sign-in. It exists for
+tests and automation — the Playwright suite and `e2e/` use it — and the control
+plane refuses to start with it on a public https origin, so `up.sh` leaves it
+off. Passkeys are the path a person uses.
 
 ## What is running
 
@@ -48,25 +107,39 @@ configuration as environment (`crates/marid/src/config.rs`):
 
 ## Configuration
 
-Every variable is optional; the defaults are the ones in
-`deploy/docker-compose.yml`.
+Every variable is optional, and `up.sh` and `docker-compose.yml` read the same
+ones with the same defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MARI_PORT` | `8787` | Published host port. |
-| `MARI_AUTH_SECRET` | `mari-private-instance-change-me` | Better Auth signing secret. **Set this**: 32+ random characters. The default is a published placeholder, so the control plane REFUSES TO START (`AuthConfigError`) once it is reachable on a public https origin — see "Hosted deployment" below for the rule. On plain `http://localhost` it stays a convenience. |
-| `MARI_BASE_URL` | derived | Public origin, if the instance is behind a proxy or a different hostname. |
-| `MARI_DEV_AUTH` | `1` | Email + password sign-in — the single-user sign-in of a private instance (decisions.md Auth). Also refused on a public https origin: put the instance behind a VPN/tunnel, or use passkeys there. |
+| `MARI_AUTH_SECRET` | generated | Better Auth signing secret. `up.sh` generates 32 random bytes into `~/.mari/auth-secret` (mode 600) on first run and reuses it, because a new secret invalidates every session. Compose instead falls back to a published placeholder, which the control plane REFUSES to start with once it is reachable on a public https origin (`AuthConfigError`) — see "Hosted deployment" below. Set this explicitly to pin it. |
+| `MARI_BASE_URL` | `http://localhost:$MARI_PORT` | Public origin, if the instance is behind a proxy or a different hostname. Also fixes the WebAuthn Relying Party. |
+| `MARI_DEV_AUTH` | `0` from `up.sh`, `1` from compose | Email + password sign-in, for tests and automation (see "Sign-in" above). Refused on a public https origin. |
 | `MARI_DEV_SEED` | `0` | The deterministic seed route (`POST /api/dev/seed`); for demos and the web e2e only. |
 | `MARI_BASE_IMAGE` | `mari/base:v0` | Base image ref. |
 | `MARI_CONTROL_HOST` | auto | Host (optionally `host:port`) a COMPUTER dials to reach the control plane. Auto-detection uses the control plane's own bridge address inside a container, and `host.docker.internal` outside one. Set it when the daemon is remote or the port is forwarded. |
 | `MARI_PREVIEW_ZONE` | `mari.sh` | Wake-proxy zone for `{port}--{computer}--{user}.<zone>` (spec 8.5). |
 | `MARI_WARM_IDLE_MS` | 5 min | AWAKE → WARM idle threshold (spec 4.4). |
 | `MARI_COLD_IDLE_MS` | 30 min | WARM → COLD idle threshold (spec 4.4). |
-| `MARI_DOCKER_SOCK` | `/var/run/docker.sock` | Daemon socket to mount. |
+| `MARI_DOCKER_SOCK` | `/var/run/docker.sock` | Daemon socket to mount. On macOS this path is resolved *inside* the daemon's VM, so it is correct for Docker Desktop and Colima alike. |
 | `SPRITES_TOKEN` | unset | Add `sprites` to `MARI_SUBSTRATES` and the wake decision (spec 3.6) considers it too. |
 
-Storage variables, if you run the control plane outside compose:
+`up.sh` and `down.sh` additionally take:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MARI_CP_IMAGE` | `mari/control-plane:v0` | Control-plane image tag to build and run. |
+| `MARI_CONTAINER` | `mari-control-plane` | Container name, so a second instance can coexist. |
+| `MARI_STORE_VOLUME` | `mari-store` | Chunk-store volume name. Shared BY NAME with every computer. |
+| `MARI_DATA_VOLUME` | `mari-data` | Durable Object + fleet SQLite volume name. |
+| `MARI_HOME` | `~/.mari` | Where the generated session secret is kept. |
+
+`up.sh --no-build` skips both image builds (and fails if they are missing);
+`down.sh --computers` also destroys materialized computers, `--purge` also deletes
+the volumes after a prompt.
+
+Storage variables, if you run the control plane outside a container:
 
 | Variable | Meaning |
 |---|---|
@@ -77,9 +150,10 @@ Storage variables, if you run the control plane outside compose:
 | `MARI_COMPUTER_ROOT` | The computer's filesystem root inside the container (`/work` = `MARI_ROOT`). |
 | `MARI_WEB_DIR` | Built web app to serve at `/`. Unset ⇒ API only. |
 
-## Without compose
+## On the host, with no container at all
 
-The control plane is one bundled file:
+For iterating on the control plane itself. This needs Node and pnpm, which
+`up.sh` deliberately does not. The control plane is one bundled file:
 
 ```sh
 pnpm --filter @mari/control-plane build:node     # -> dist/node.mjs
@@ -134,16 +208,6 @@ containers, and asserts against the Docker daemon directly (paused, destroyed,
 On macOS the suite writes its store under `$HOME/.mari/node-e2e` for the reason
 described above; override with `MARI_NODE_E2E_DIR`.
 
-## Known gap
-
-Browsing a computer's files and diffing its runs work COLD, from the manifest
-alone (spec 8.4). Reading a file's CONTENT through
-`GET /api/computers/:id/file` does not yet work for a computer written by
-`marid`: `mari-core` stores chunk bodies zstd-compressed and the control plane's
-chunk reader does not decompress them, so the response carries the compressed
-bytes. The fix is cross-lane (a decoder that also works on Workers, plus a note
-in `docs/contracts.md` §9) and is tracked in `docs/decisions.md`.
-
 ## Troubleshooting
 
 **`no substrate available`** — the control plane found no Docker socket. Check
@@ -162,6 +226,13 @@ the store at `/store`.
 ---
 
 # Hosted deployment (app.mari.sh)
+
+> **[deploy/DEPLOY.md](DEPLOY.md) is the runbook** — the ordered commands, what
+> the owner does versus what the orchestrator does, a post-deploy smoke
+> checklist with the exact expected responses, and the rollback. It also records
+> the one thing this section does not: **as configured, `SUBSTRATE_MODE` is
+> `"fake"` in production, so a hosted computer cannot wake.** Read DEPLOY.md §1
+> before deploying. What follows is the reference for the pieces.
 
 The hosted control plane is the same Hono app on Cloudflare Workers. Its config
 lives in `packages/control-plane/wrangler.jsonc` under `env.production`:

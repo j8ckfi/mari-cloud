@@ -9,7 +9,7 @@
 
 use std::os::unix::fs::MetadataExt;
 
-use mari_core::{snapshot, ChunkStore, ChunkerConfig, SnapshotOptions};
+use mari_core::{ChunkStore, ChunkerConfig, SnapshotOptions, snapshot};
 
 fn small_chunker() -> ChunkerConfig {
     ChunkerConfig {
@@ -29,7 +29,11 @@ async fn excluded_credentials_leave_no_trace() {
     std::fs::create_dir_all(src.join("home/.aws")).unwrap();
     let secret = b"AWS_SECRET_ACCESS_KEY=super-secret-do-not-store";
     std::fs::write(src.join("home/.aws/credentials"), secret).unwrap();
-    std::fs::write(src.join("home/.aws/config"), b"[default]\nregion=us-east-1\n").unwrap();
+    std::fs::write(
+        src.join("home/.aws/config"),
+        b"[default]\nregion=us-east-1\n",
+    )
+    .unwrap();
     std::fs::write(src.join("home/notes.txt"), b"public notes").unwrap();
 
     let opts = SnapshotOptions {
@@ -49,7 +53,12 @@ async fn excluded_credentials_leave_no_trace() {
         );
     }
     // The normal file survived.
-    assert!(snap.manifest.entries.iter().any(|e| e.path == "/home/notes.txt"));
+    assert!(
+        snap.manifest
+            .entries
+            .iter()
+            .any(|e| e.path == "/home/notes.txt")
+    );
 
     // The secret's bytes were never chunked/uploaded: its chunk id is absent.
     let secret_chunk = ChunkStore::chunk_id(secret);
@@ -85,10 +94,19 @@ async fn default_excludes_cover_ssh_keys() {
     let snap = snapshot(&store, &src, &opts).await.unwrap();
 
     assert!(
-        !snap.manifest.entries.iter().any(|e| e.path.contains(".ssh")),
+        !snap
+            .manifest
+            .entries
+            .iter()
+            .any(|e| e.path.contains(".ssh")),
         "default excludes should drop .ssh"
     );
-    assert!(snap.manifest.entries.iter().any(|e| e.path == "/root/keep.txt"));
+    assert!(
+        snap.manifest
+            .entries
+            .iter()
+            .any(|e| e.path == "/root/keep.txt")
+    );
     assert!(!store.has_chunk(&ChunkStore::chunk_id(key)).await.unwrap());
 }
 
@@ -147,10 +165,12 @@ async fn a_hardlink_to_an_inode_outside_the_root_is_dropped_unread() {
         .find(|e| e.path == "/keep.txt")
         .expect("the ordinary file must still be snapshotted");
     assert_eq!(keep.size, b"ordinary content".len() as u64);
-    assert!(store
-        .has_chunk(&ChunkStore::chunk_id(b"ordinary content"))
-        .await
-        .unwrap());
+    assert!(
+        store
+            .has_chunk(&ChunkStore::chunk_id(b"ordinary content"))
+            .await
+            .unwrap()
+    );
 }
 
 /// The other half, and the reason the check counts names instead of refusing
@@ -169,7 +189,9 @@ async fn hard_links_wholly_inside_the_root_are_both_snapshotted() {
     std::fs::write(root.join("original.bin"), content).unwrap();
     std::fs::hard_link(root.join("original.bin"), root.join("clone/linked.bin")).unwrap();
     assert_eq!(
-        std::fs::metadata(root.join("original.bin")).unwrap().nlink(),
+        std::fs::metadata(root.join("original.bin"))
+            .unwrap()
+            .nlink(),
         2,
         "precondition: one inode, two names, both inside the root"
     );

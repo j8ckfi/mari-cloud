@@ -75,7 +75,11 @@ fn supervisor_read_loop_surfaces_input_and_resize_without_tearing_down() {
 
     marid::ws::decode_payload(&mut reader, &payload, &mut out)
         .expect("first-class input/resize frames must decode, not tear down the session");
-    assert_eq!(out.len(), 2, "both control messages surfaced to the supervisor");
+    assert_eq!(
+        out.len(),
+        2,
+        "both control messages surfaced to the supervisor"
+    );
     assert!(matches!(out[0], ControlMessage::Input { .. }));
     assert!(matches!(out[1], ControlMessage::Resize { .. }));
 }

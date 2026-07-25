@@ -46,14 +46,14 @@
 //! test for the anchored walk.
 
 use std::collections::HashMap;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mari_core::{
-    restore, snapshot, ChunkStore, EntryKind, Error, Manifest, RestoreOptions, RootDir,
-    SnapshotOptions,
+    ChunkStore, EntryKind, Error, Manifest, RestoreOptions, RootDir, SnapshotOptions, restore,
+    snapshot,
 };
 use mari_proto::MANIFEST_VERSION;
 
@@ -205,7 +205,10 @@ fn a_prune_never_deletes_through_a_symlinked_component() {
         "the prune deleted a file outside the root"
     );
     assert_eq!(names_in(&fx.outside), vec!["sentinel", "victim"]);
-    assert!(names_in(&fx.root).is_empty(), "the link itself must be gone");
+    assert!(
+        names_in(&fx.root).is_empty(),
+        "the link itself must be gone"
+    );
 }
 
 /// A hard link is the shape `O_NOFOLLOW` cannot see. It does not matter for
@@ -309,7 +312,11 @@ fn remove_path_rejects_traversal_even_through_real_components() {
     std::fs::create_dir_all(fx.root.join("real")).unwrap();
     let mut rootfs = RootDir::open(&fx.root).unwrap();
 
-    for path in ["/real/../../outside/sentinel", "/../outside/sentinel", "/.."] {
+    for path in [
+        "/real/../../outside/sentinel",
+        "/../outside/sentinel",
+        "/..",
+    ] {
         match rootfs.remove_path(path) {
             Err(Error::PathTraversal { .. }) => {}
             Err(other) => panic!("expected PathTraversal for {path:?}, got {other}"),
@@ -379,7 +386,13 @@ async fn a_revert_must_not_write_through_a_hardlink_the_prune_kept() {
 
     // The revert, in order: prune, then restore (supervisor::revert_to_manifest).
     let out = prune_model(&fx.root, &snap.manifest);
-    let _ = restore(&fx.store, &snap.manifest, &fx.root, &RestoreOptions::default()).await;
+    let _ = restore(
+        &fx.store,
+        &snap.manifest,
+        &fx.root,
+        &RestoreOptions::default(),
+    )
+    .await;
 
     assert_eq!(
         std::fs::read(&victim).unwrap(),
@@ -428,7 +441,9 @@ fn a_prune_must_reach_a_subtree_deeper_than_path_max() {
     let depth = 100usize; // ~3300 characters of path: well past PATH_MAX
 
     // Exactly what a run can do with a shell and no special privileges.
-    let script = format!("cd \"$1\" && for _ in $(seq 1 {depth}); do mkdir {name} && cd {name} || exit 1; done");
+    let script = format!(
+        "cd \"$1\" && for _ in $(seq 1 {depth}); do mkdir {name} && cd {name} || exit 1; done"
+    );
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(&script)
@@ -447,7 +462,10 @@ fn a_prune_must_reach_a_subtree_deeper_than_path_max() {
     let mut rootfs = RootDir::open(&fx.root).unwrap();
     let mut comps: Vec<String> = vec![name.to_string(); depth];
     while !comps.is_empty() {
-        if rootfs.remove_path(&format!("/{}", comps.join("/"))).is_err() {
+        if rootfs
+            .remove_path(&format!("/{}", comps.join("/")))
+            .is_err()
+        {
             break;
         }
         comps.pop();

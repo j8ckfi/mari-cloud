@@ -54,6 +54,11 @@ fn config(cp: &FakeControlPlane, root: &Path, store_root: &Path, agents_dir: &Pa
         restore_manifest: None,
         agents_dir: agents_dir.to_path_buf(),
         segment_bytes: 4 * 1024 * 1024,
+        allow_insecure_ws: false,
+        // Not what these tests are about; `tests_keepalive` covers the keepalive.
+        keepalive_ms: 0,
+        idle_timeout_ms: 0,
+        shutdown_grace_ms: 5_000,
     }
 }
 

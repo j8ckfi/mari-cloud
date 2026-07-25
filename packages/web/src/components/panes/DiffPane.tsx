@@ -67,9 +67,18 @@ export function DiffPane({ computer, spec }: { computer: string; spec: DiffPaneS
 
   if (run === null) {
     // A manifest-to-manifest (fork) diff pane: same view, no run decisions.
+    //
+    // The view is real and the model is shared with the run diff, but there is
+    // no control-plane route yet that diffs two ARBITRARY manifests — only
+    // `runs/:runId/diff`. So this branch says that plainly instead of offering a
+    // picker that cannot resolve (spec 9.2 is listed under LIMITATIONS in the
+    // README until the route lands).
     return (
       <div className="diff-pane" data-testid="diff-pane" data-mode="manifest">
-        <DiffView diff={null} emptyNote="Select two manifests to compare." />
+        <DiffView
+          diff={null}
+          emptyNote="Comparing two manifests (a fork difference, spec 9.2) is not wired up yet. A run's changes are reviewed in that run's own pane — open Runs and pick one."
+        />
       </div>
     );
   }

@@ -15,6 +15,9 @@ import {
 import { createFetchHandler, startServer, type NodeServerHandle } from './server.js';
 import { ensureBaseManifest } from './base-image.js';
 
+/** How long `close()` waits for outstanding background work before abandoning it. */
+const SHUTDOWN_DRAIN_MS = 5_000;
+
 export interface BootOptions extends Partial<NodeConfig> {
   /** Snapshot the base image at boot (spec §2). Default: true with a real
    *  substrate; the `fake` substrate has no container to snapshot. */
@@ -34,6 +37,40 @@ export interface NodeInstance {
   close(): Promise<void>;
 }
 
+/**
+ * Instantiate the Durable Object of every computer the fleet knows about, which
+ * re-arms its persisted alarm (`NodeDurableObjectStorage.rearm`).
+ *
+ * The fleet table is the index of computers; a Durable Object file with no fleet
+ * row belongs to a deleted computer and has nothing left to schedule. Failures
+ * are logged, never fatal: a private instance must boot even if one computer's
+ * storage is unreadable.
+ */
+async function reviveComputers(
+  runtime: NodeRuntimeEnv,
+  log: (message: string) => void,
+): Promise<number> {
+  let ids: string[] = [];
+  try {
+    const rows = await runtime.db.prepare(`SELECT id FROM computers`).all<{ id: string }>();
+    ids = (rows.results ?? []).map((r) => String(r.id));
+  } catch (err) {
+    log(`could not list computers to revive their alarms: ${String(err)}`);
+    return 0;
+  }
+  let revived = 0;
+  for (const id of ids) {
+    try {
+      const state = runtime.computers.stateFor(id);
+      await state.ready();
+      if ((await state.storage.getAlarm()) !== null) revived++;
+    } catch (err) {
+      log(`could not revive computer ${id}: ${String(err)}`);
+    }
+  }
+  return revived;
+}
+
 export async function boot(options: BootOptions = {}): Promise<NodeInstance> {
   const { baseSnapshot, log: logOpt, ...configOverrides } = options;
   const log = logOpt ?? ((m: string) => console.log(`[mari] ${m}`));
@@ -48,6 +85,20 @@ export async function boot(options: BootOptions = {}): Promise<NodeInstance> {
   log(`  substrate     ${runtime.substrate ? runtime.substrate.available.join(', ') : 'fake (no real substrate)'}`);
   log(`  computers dial ${config.supervisorUrlBase}/supervisor/{computer}`);
   log(`  web app       ${config.webDir ?? 'not built (API only)'}`);
+
+  // REVIVE EVERY COMPUTER'S DEADLINES BEFORE ANNOUNCING READY.
+  //
+  // A Durable Object's alarm is persisted, but the Node namespace creates objects
+  // LAZILY — so after a restart the tier deadline, a pending wake retry, the
+  // liveness check and the WAKING watchdog of every computer sit in SQLite and
+  // fire only once something happens to touch that object. A private instance
+  // restarted while a computer was AWAKE or WAKING would therefore leave it in
+  // that state indefinitely, which is the same wedge class as a substrate that
+  // dies without telling anyone: a state that cannot advance without an external
+  // event. Touching each computer re-arms its alarm (namespace.ts), and nothing
+  // else here depends on the result.
+  const revived = await reviveComputers(runtime, log);
+  if (revived > 0) log(`  revived       ${revived} computer alarm(s) after restart`);
 
   const wantsBase = baseSnapshot ?? runtime.substrate !== null;
   const baseManifest = wantsBase
@@ -65,8 +116,20 @@ export async function boot(options: BootOptions = {}): Promise<NodeInstance> {
     baseManifest,
     async close() {
       await server.close();
-      await runtime.computers.drain();
-      await runtime.events.drain();
+      // BOUNDED. `drain()` waits for every outstanding `waitUntil`, and one of
+      // those can be a wake sitting on a substrate call — which has its own budget
+      // (WAKE_TIMEOUT_MS, up to two minutes) but must not hold a shutdown open for
+      // it. Whatever is still pending is abandoned here; the computer's own
+      // persisted deadlines pick it up at the next boot (see reviveComputers and
+      // the WAKING watchdog), which is exactly the crash-recovery path.
+      const drained = Promise.all([runtime.computers.drain(), runtime.events.drain()]);
+      await Promise.race([
+        drained.then(() => undefined),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, SHUTDOWN_DRAIN_MS);
+          timer.unref?.();
+        }),
+      ]);
       runtime.computers.close();
       runtime.events.close();
       runtime.db.close();

@@ -344,15 +344,35 @@ computer, and the control plane joins the default bridge network, because
 computers are sibling containers created through the Docker socket and must be
 able to dial it back.
 
-### Known gap found by this milestone
+### Known gap found by this milestone — CLOSED
 
 `mari-core` stores chunk bodies **zstd-compressed** (`crates/mari-core/src/store.rs`),
-while the control plane's `manifest-store.ts` concatenates chunk bytes as-is.
+while the control plane's `manifest-store.ts` concatenated chunk bytes as-is.
 Manifests themselves are plain CBOR, so browsing and diffing a real computer
-work; reading a real computer's file CONTENT through `GET /api/computers/:id/file`
-returns the compressed bytes. Contracts §9 does not mention compression either.
-This is a cross-lane fix (a Workers-compatible zstd decoder plus a contracts
-note) and is deliberately NOT patched here.
+worked; reading a real computer's file CONTENT through `GET /api/computers/:id/file`
+returned a truncated prefix of a compressed frame. Contracts §9 did not mention
+compression either, which is why the gap existed at all.
+
+**Fixed.** `manifest-store.ts` now decompresses (`fzstd` — pure JS, so one
+implementation serves workerd and Node) and honours `mari-core`'s verify-then-use
+contract on this path too: the blake3 of the DECOMPRESSED bytes is compared to the
+id the manifest named before anything is served, and a malformed id / missing
+object / bad frame / hash mismatch / length disagreement is a typed
+`ChunkReadError` naming the chunk (HTTP 500, no bytes). Contracts §9.1 is now
+normative about all of it, and the dev seed writes real blake3 ids and real zstd
+frames instead of SHA-256 ids and bare bytes. Interoperability is pinned by a
+fixture the RUST side generates (`cargo test -p mari-core --test ts_store_fixture`
+→ `packages/control-plane/test/fixtures/mari-core-store.json`), read back through
+the HTTP routes in `test/chunk-read.test.ts`.
+
+Verification cost, measured rather than assumed: blake3 over 1 MiB is ~11 ms on
+Node 26 and ~69 ms inside workerd as the vitest pool runs it (unminified);
+decoding a 1 MiB frame is ~0.1 ms, so the hash dominates. Cost is linear in file
+size against the path's hard 1 MiB ceiling (`MAX_INLINE_FILE_BYTES`), which puts
+a typical source file well under a millisecond and the worst case at tens of
+milliseconds of a 30 s budget. Verification is therefore unconditional, never
+sampled — a silently corrupt file loaded into the editor gets saved back, turning
+a storage fault into data loss.
 
 ## Appendix — `e2e/`, the 1.3 loop suite
 
@@ -447,3 +467,603 @@ Consequences, all of them simplifications except the last:
   process holding the disk, a substrate that reclaims storage would otherwise
   lose everything since the last snapshot. This is cheap (delta only) and closes
   the window.
+
+## Appendix — Supervisor survivability: TLS, signals, keepalive
+
+_Appended by the supervisor builder (append-only, per directory ownership). Three
+blockers that made `crates/marid` unusable on a substrate that evicts containers
+and reaps idle sockets. All three were verified against HEAD before the fix._
+
+### 1. The control channel is TLS, and plaintext is a policy decision
+
+`tokio-tungstenite` carried no TLS feature, so `connect_async` on a `wss://` URL
+returned `Url(TlsFeatureNotEnabled)` before a packet moved: marid could not reach
+an https control plane at all, and the one Cloudflare end-to-end run that
+"worked" did so by dialing plaintext `ws://` to a `workers.dev` origin — which
+puts the computer's fencing **token** on the wire in cleartext, followed by every
+journal byte of every run.
+
+- `rustls-tls-webpki-roots` is on, and `ws::install_crypto_provider()` installs
+  the `ring` provider at startup. Both halves are required: the rustls that
+  tokio-tungstenite declares has `default-features = false`, so
+  `ClientConfig::builder()` panics ("no process-level CryptoProvider available")
+  without an explicit install. The root store is **compiled in**, so the image
+  needs no `ca-certificates` for marid's own socket (agents the user brings still
+  do), and a private CA is therefore not trusted — a self-hosted control plane
+  behind a private PKI must terminate TLS in front of marid, keep the supervisor
+  hop on loopback/private space, or set the opt-in below.
+- **Scheme policy** (`ws::classify_control_url`): `wss://` always; `ws://` only
+  when the peer is provably off the public internet — an IP literal that is
+  loopback / RFC 1918 / link-local / IPv6 ULA, the name `localhost` (or
+  `*.localhost`), or a name **every** resolved address of which is one of those.
+  One public answer refuses the dial. A verified plaintext dial is pinned to the
+  address that was verified, so a second DNS answer cannot undo the check.
+- A refusal is **fatal**: marid logs one line naming the host and the override,
+  and exits non-zero rather than running in a state where it will leak. A failed
+  *resolution* is not fatal (DNS is often not up yet in a fresh container) and is
+  retried by the connect loop.
+- The override is `--allow-insecure-ws` / `MARI_ALLOW_INSECURE_WS=1` (falsey
+  values do not enable it). It logs what it costs, every connect.
+- **Cross-lane consequence**: any deployment that hands marid a `ws://` URL for a
+  public origin now fails to start. `deploy/cf-thesis/wrangler.template.jsonc`'s
+  `SUPERVISOR_URL_BASE: "__WS_ORIGIN__"` must be substituted with a `wss://`
+  origin. The private instance is unaffected: `node/env.ts` composes
+  `ws://{host.docker.internal|private-ip}:{port}`, which classifies as private.
+
+### 2. SIGTERM is the only warning a computer gets
+
+There was no signal handler at all. With `containers_pid_namespace` on, an init
+process is not killed by a signal it does not handle (a probe confirmed the
+container surviving `kill -TERM 1` **and** `kill -KILL 1` from inside), so
+Cloudflare's ~15-minute eviction grace was spent doing nothing — on the substrate
+where eviction is routine and the disk is wiped on every stop. That is silent
+data loss during *normal* operation.
+
+SIGTERM and SIGINT now run the **same** sequence as `PrepareForCold` — one code
+path, because the durability duty is identical and a second copy is a second
+thing to get wrong: stop each run cleanly, drain completions and journal bytes to
+the control plane, flush journal segments to the store, write the final manifest
+(`SnapshotWritten{reason=final}`), advance the head under the current epoch, exit
+0. A signal that arrives with no connection does the store half anyway
+(`offline_shutdown`); the head lands in the store's head history, which is what
+the next wake reads.
+
+Bounded on purpose (`MARI_SHUTDOWN_GRACE_MS`, default 60 s): the run-stop phase
+gets a third of the budget, capped at **10 s**, because `ComputerDO` gives the
+`prepare_for_cold` handshake `COLD_FINALIZE_MS` (20 s) before it records
+`final_snapshot_missed` and destroys the substrate resources. One stubborn run
+must not cost the computer its manifest.
+
+Found while testing this: `main` used to fall out of `async main`, and tokio's
+runtime drop **waits for blocking tasks** — a run that ignored the clean stop
+leaves its PTY reader parked in `read()`, so the process hung forever after a
+shutdown that had already written everything durable. `main` now exits
+explicitly. This bug applied to `PrepareForCold` too, and was latent only because
+every test run so far exited on its own.
+
+### 3. A keepalive that exists without a run
+
+Spec 5.4's heartbeat holds the machine awake **while a run is active**. A probe
+measured an idle WebSocket through the edge killed at ~270 s (1006, no close
+frame) while the container kept running, so an AWAKE computer with no run lost
+its control channel about four and a half minutes after the last run ended and
+then churned.
+
+- `MARI_KEEPALIVE_MS` (default 60 s) sends a WebSocket ping independent of runs.
+- `MARI_IDLE_TIMEOUT_MS` (default 240 s) declares a socket dead when **nothing**
+  inbound arrives in that window — not even a pong. This is the silent-death case
+  a keepalive alone does not fix: a flow dropped without an RST leaves reads
+  hanging forever and the supervisor offline with no error to show. The check
+  rides the connection loop's own tick, so it works with the keepalive disabled.
+- Reconnect logging distinguishes the two: a drop after ≥ the idle window is
+  reported as an idle timeout at INFO ("not a failure"), anything else as a WARN
+  with its reason. Attributing a reaped idle socket to a failure is what makes a
+  real failure impossible to spot.
+
+Tested at both scales against a real local server that reaps silent connections:
+a 600 ms reaper with a 100 ms keepalive held for 5.8 reaper windows (the default
+suite), and — under `MARI_SLOW_TESTS=1`, run and passing — the literal article: a
+270 s reaper, the shipped 60 s keepalive, **320 s** of real idleness, one
+connection, the channel still carrying commands afterwards. The negative control
+runs by default too: with the keepalive off, the same server reaps the socket and
+marid reconnects.
+
+## Appendix — Substrate death and the wedge class
+
+_Appended by the substrate-death lane (append-only, per directory ownership).
+Closes the defect the orchestrator reproduced by hand: a computer whose container
+was removed could never run anything again._
+
+### The reproduction, and what was actually missing
+
+1. Private instance, Docker substrate, computer AWAKE with a real container; a run
+   completed, exit 0.
+2. `docker rm -f` that container — a substrate eviction. On Cloudflare this is not
+   exotic: instances are evicted routinely and the disk is wiped on every stop.
+3. `POST /api/computers/:id/runs` → `200`, run queued, computer `"awake"`,
+   `activeRuns: 1` — and **nothing happened**. No container was re-materialized.
+   The run stayed `pending` indefinitely.
+4. `POST /api/computers/:id/wake` → `200 {"state":"awake","epoch":1}` and did
+   nothing, because the Durable Object believed it was already awake.
+
+Every primitive needed to recover already existed — snapshot, epoch fencing,
+restore, agent-adapter resume. **The trigger did not.** The bug class is: _a state
+that cannot advance without an external event_. The DO's `state` is a record of
+what it last asked for, not an observation, and nothing ever compared the two.
+
+### Liveness: an optional capability, not a seventh function
+
+Spec 3.5 fixes the provider interface at six functions and forbids using any other
+substrate capability. Liveness is expressed **through** that surface, not beside
+it: the control plane can ask spec 3.5's `exec` to run `/bin/sh -c 'exit 0'`, and
+either it runs inside the instance or it does not.
+
+What `exec` cannot do is tell _"this instance is gone"_ apart from _"I could not
+reach the substrate API"_, and that distinction decides whether a computer is
+recovered or left alone. So `provider.ts` gained one **optional declaration** in
+the same family as `supportsWarm`, `holdAwake`, `proxyFetch` and
+`resumeBeforeCold`:
+
+```ts
+instanceStatus?(handle): Promise<'alive' | 'gone' | 'unknown'>
+```
+
+- It is a **read** of state Mari already asked for, never a state change; a driver
+  that implements it must not start or stop anything, and must not throw.
+- `alive` means the resources exist (a `docker pause`d container is `alive`), not
+  that a process is running.
+- `unknown` is **not** `gone`. A driver that omits the method is probed through
+  `exec` and reports `unknown` on refusal; no caller may require the method.
+- Implemented by Docker (`inspect`; a removed container is a 404 → `gone`, anything
+  else → `unknown`) and Cloudflare (`running`, then the platform's own "no
+  container instance" refusal → `gone`; `running` alone is untrustworthy — it
+  reports a stale `true` for minutes after `destroy()`). Sprites falls back to the
+  `exec` probe.
+
+Against spec 1.2: this is the emulator. A computer is data whose home is the chunk
+store (spec 2, 4.1); "does the substrate still hold the copy I asked it to hold" is
+the emulator's own question, and without an answer spec 4.1's "exactly one writable
+copy" cannot be distinguished from **zero**.
+
+### One alarm, five deadlines
+
+A Durable Object has exactly one alarm (spec 3.2's single coordination point), and
+before this change every new deadline had to fight the tier policy for it — which
+is why several transitions had no deadline at all. `computer-do.ts` now multiplexes
+named slots onto that alarm (`wakeRetry`, `waking`, `liveness`, `cold`, `tier`),
+processes every slot that is due, and — when the alarm fires ahead of schedule,
+which is exactly what `runDurableObjectAlarm` and the Node shim's `runAlarmNow` do
+to simulate idle time — processes the earliest pending one.
+
+| Slot | Exists because |
+|---|---|
+| `liveness` | The supervisor's socket closing arms a grace window; a computer with work in flight is health-checked on a cadence. A supervisor that spoke inside the window is its own proof, so a healthy computer costs an alarm and **no** substrate call. |
+| `cold` | The AWAKE/WARM→COLD handshake asks a supervisor for a final manifest; a dead supervisor never answers. |
+| `waking` | WAKING is a transition, not a resting place, and nothing else acts on it. |
+| `wakeRetry` | A refused wake with work pending, bounded (see below). |
+| `tier` | Spec 4.4, unchanged in meaning. |
+
+Tunable per deployment, defaults in production shape:
+`SUPERVISOR_GRACE_MS` 15 s, `LIVENESS_MS` 30 s, `COLD_FINALIZE_MS` 20 s,
+`WAKE_TIMEOUT_MS` 120 s. **The order matters, not just the magnitudes**: the grace
+window must be shorter than the idle deadline, or the tier policy reaches a dead
+computer before the liveness check does.
+
+### Recovery, and what it is allowed to assume
+
+A closed supervisor socket is the FIRST signal and never sufficient — a network
+blip is not a dead container, and marid reconnects with the same epoch and token.
+It arms the grace window; only after it, with no supervisor back, is the substrate
+asked. Two signals reach the same place, because on Cloudflare a torn-down microVM
+left the DO's socket **open** (the platform reported the instance inactive while
+D1's mirror still said `awake` 15 minutes later): the socket close, and a health
+check that finds a computer with work in flight whose supervisor has said nothing
+for a whole window.
+
+When the instance is gone (or, after a bounded number of `unknown`s, cannot be
+asked):
+
+- the resources are destroyed best-effort — a destroy that fails records
+  `destroy_failed` and the transition continues, because a handle nobody can
+  destroy must not wedge a computer;
+- the computer becomes **COLD at its last manifest head**. The head is not
+  touched: its truth is the chunk store (spec 4.1), and nothing is invented;
+- one content-free `state` event goes out (spec 6.2/6.3) — the UI's whole
+  notification of this;
+- in-flight runs take spec 5.6's degradation (below);
+- if work was in flight or is queued, the computer is **woken again**: a FRESH
+  instance under a **NEW epoch**, restoring from the head, so the dead generation
+  can never advance anything even if it turns out to be alive somewhere.
+
+`POST /wake` is honest in every outcome: `200` when the computer is really up,
+`202 {error:"wake_retrying", retryAt}` when the substrate refused but a bounded
+retry is armed, `503` when it refused and nothing is waiting. It never answers
+"already awake" without either a live supervisor or a fresh instance behind it, and
+every substrate call on the path is bounded (`WAKE_TIMEOUT_MS`) so a driver that
+hangs — dockerode has no timeout of its own, and Cloudflare's over-capacity failure
+mode is a hang — cannot hang a client request (spec 8.3).
+
+### Runs in flight (spec 5.6, applied by the control plane)
+
+The line is whether the run **provably never began** — no `startedAt`, no pre-run
+manifest, not one journal byte:
+
+- **Never began** → re-queued and the dispatch latch released. Starting it now is
+  indistinguishable from starting it the first time, which is the same rule marid
+  uses for a replay after a rollback. Before this it stayed `dispatched = 1`
+  forever and no supervisor was ever handed it again — a run silently lost.
+  **Once**, though (`MAX_RUN_REQUEUES = 1`): a run whose machine dies every time it
+  is dispatched may be the reason it died (the Cloudflare e2e tears its microVM
+  down from inside a run), and re-queueing forever would spend instances in a loop.
+- **It ran** → the journal is left exactly as it is (spec 4.2) and the run is
+  `interrupted`: a new `RunStatus`, projected onto the client's five states as
+  `failed`, because no completion is fabricated. One content-free attention event
+  (`kind: "interrupted"`) tells the user. marid raises the same event when it
+  restarts and finds the run unfinished, so the DO de-duplicates on an
+  **undismissed** `interrupted` badge — one interruption, one notification. A
+  resume (marid's agent adapter, same run id) puts the run back to `running`.
+
+Recovery itself is bounded: `RECOVERY_STREAK_MAX = 3` consecutive recoveries with
+no successful `hello` in between, then the computer sits COLD with its work still
+queued and `recovery_exhausted` in the incident log. A broken image must not
+materialize instances forever.
+
+### Incidents: a content-free record of what Mari had to do
+
+Attention events belong to a RUN (spec 6.2); "your computer's instance was gone, so
+it is COLD at its last snapshot" belongs to no run. A per-computer `incident` table
+(kind, time, epoch — nothing else can be put in it) records `substrate_lost`,
+`substrate_unknown`, `supervisor_lost`, `final_snapshot_missed`, `destroy_failed`,
+`wake_abandoned`, `recovery_exhausted`, and is served by
+`GET /api/computers/:id/incidents`. It exists so that a transition which completed
+**without** the thing it asked for cannot be read as a clean success.
+
+### The two observed stalls
+
+**(a) `#beginCold` stalled.** The Cloudflare thesis e2e had to nudge a hung
+AWAKE→COLD handshake with `POST /wake` and count the nudges. That nudge is gone
+from `e2e/cloudflare.e2e.test.ts`: the handshake has its own deadline, and on
+expiry the DO finalizes from the last known head, destroys the instance, and
+records `final_snapshot_missed` — honest about the work since the last snapshot
+genuinely not being in the chunk store, rather than reporting a clean COLD.
+
+**(b) Cloudflare refuses `destroy()`→`start()` on the same Durable Object for
+minutes** (measured >563 s and ~300 s; a freshly deployed container application is
+likewise unschedulable for a while, with the same "no container instance" message
+an over-capacity account gives). Mari's tier policy makes AWAKE→COLD→AWAKE exactly
+that sequence.
+
+What this lane did about it, all of it above the platform:
+
+- the wake never claims success it cannot deliver and never hangs (above);
+- `WAKE_RETRY_MS` spans ~12 minutes in six bounded steps (5 s, 20 s, 60 s, 120 s,
+  240 s, 300 s) while work is pending, so a queued run outlives the refusal
+  window; the fleet view keeps saying COLD, which is the truth, and the client is
+  told when the next attempt is due;
+- proven with the REAL driver over a fake `ctx.container` returning the platform's
+  own refusal (`test/cloudflare_stall.test.ts`): honest 202, bounded latency, run
+  preserved, then a new epoch and a dispatch when the platform relents.
+
+**What is NOT measured, and the orchestrator has to decide it.** This lane did not
+deploy: it never ran `wrangler deploy`, so the two experiments that would settle
+the platform question are still open —
+
+1. whether stopping **without** `destroy()` (`ctx.container.signal(SIGTERM)`, which
+   is what `@cloudflare/containers`' `stop()` does) avoids the refusal window,
+   letting the platform reclaim the instance instead of tearing it down. If it
+   does, the substrate lane should make `sleep`/the tier path signal-stop and keep
+   `destroy` for the cases that need it. This is a substrate-lane change.
+2. Cloudflare cold-wake p50/p99 immediately after a COLD, i.e. how long the window
+   really is at fleet scale.
+
+`packages/control-plane/test/substrates/cloudflare.e2e.test.ts`'s
+`MARI_CF_E2E_SLOW=1` case (re-materialize after `sleep`) therefore remains unrun in
+this lane — it needs a real deploy, a real image push and up to 15 minutes of
+platform patience. **If the window really is minutes on every AWAKE→COLD→AWAKE,
+Cloudflare is not fit to be the DEFAULT substrate** and Sprites should be, with
+Cloudflare kept for computers that idle rarely. That is a product decision, and it
+belongs to whoever can run the deploy — the control plane's conduct during the
+window is now defensible either way.
+
+### Also fixed while auditing the class
+
+- The epoch mint is persisted **before** the substrate call. A crash in between
+  used to let the next wake hand the same epoch number to a different generation,
+  and the whole fencing argument rests on monotonicity (contracts.md §6).
+- The materialize handle is persisted **immediately**, so a failure or eviction
+  after it cannot leave an instance nobody can destroy — on Cloudflare that orphan
+  holds the computer's only slot.
+- A computer found in WAKING when its Durable Object is CONSTRUCTED gets a fresh,
+  short watchdog window: the wake it was waiting for belonged to a process that no
+  longer exists.
+- The Node runtime re-arms every computer's persisted alarm at boot
+  (`reviveComputers`). Objects are created lazily there, so a restarted private
+  instance used to leave tier deadlines, wake retries and watchdogs sitting in
+  SQLite until something happened to touch that object.
+- `close()` on a private instance drains background work with a 5 s bound: a
+  shutdown must not wait out a substrate call, and the persisted deadlines are the
+  crash-recovery path anyway.
+- `sleepNow()` no longer records WARM when the substrate refused the sleep, and it
+  arms the WARM→COLD deadline it always should have.
+- A journal flush that cannot write (shutdown, closed storage) warns with offsets
+  instead of taking the process down with an unhandled rejection.
+
+### Tests
+
+- `packages/control-plane/test/liveness.test.ts` — the repro end to end against a
+  real ComputerDO: eviction → recovery → fresh instance, NEW epoch, the queued run
+  runs, journal byte-identical with an empty anomaly ledger, the dead generation's
+  head advance refused and its credentials unable to handshake; the interrupted-run
+  degradation (exactly one content-free attention event, journal preserved, resume
+  puts it back to `running`); the never-acked run re-queued and run exactly once;
+  the poison-run bound; the self-completing COLD handshake; the tier alarm against
+  a gone substrate; a hanging wake bounded and retried; the WAKING watchdog not
+  fighting a live wake; a healthy computer never probed.
+- `packages/control-plane/test/cloudflare_stall.test.ts` — the destroy→start
+  refusal, with the real Cloudflare driver.
+- `packages/control-plane/test/node/liveness.test.ts` — the same recovery on the
+  private instance with **no alarm harness at all** (real timers), plus a computer
+  left WAKING by a hard restart of the whole control plane.
+- `packages/control-plane/test/node/substrate-death.e2e.test.ts`
+  (`MARI_NODE_E2E=1`) — the orchestrator's manual repro against **real Docker**:
+  `docker rm -f`, then a fresh container, a restored file read back with
+  `docker exec`, the queued run executed exactly once, and the in-flight-run
+  degradation. This is the case the whole suite missed, so it drives the daemon
+  rather than a fake.
+
+## Appendix — Data loss, the preview surface, and the vault (blocker-closing lane)
+
+_Appended by the blocker-closing lane (append-only, per directory ownership).
+Everything here was verified broken against HEAD before the fix, and each item
+carries the test that would have caught it._
+
+### 1. A file write is no longer allowed to lie
+
+`MAX_ARG_STRLEN` is 32 pages (131072 bytes, NUL included) — the Linux ceiling on
+ONE `execve` argument. The write run carried the whole base64 payload as a single
+argv element, so **every write above 96 KiB of raw bytes failed at spawn** while
+`PUT /file` and `POST /upload` had already answered `202 {"ok":true,"bytes":N}`.
+Measured: the file never appeared, the run ended `signal=6`, and editor Save and
+the files pane's Upload both reported success and discarded the user's work.
+
+- The payload now travels in the script's POSITIONAL PARAMETERS, split into
+  32 KiB pieces and re-joined by `printf '%s' "$@"` (POSIX reuses the format for
+  every operand). `MAX_ARGV_ELEMENT_BYTES` / `MAX_ARGV_TOTAL_BYTES` in
+  `src/runs.ts` state the kernel arithmetic, and a test asserts the worst case
+  (a write at the cap) against both numbers — so raising the cap cannot silently
+  re-create the defect.
+- **`MAX_WRITE_BYTES` is now equal to `MAX_INLINE_FILE_BYTES` (1 MiB).** A file the
+  editor can open is a file the editor can save; the previous 1 MiB read / 256 KiB
+  write split meant the Save button was structurally unable to work on a file the
+  Open button had just loaded.
+- The decode writes a sibling `.mari-{run}.part` and `mv`s it over the target, so a
+  failed decode leaves the previous content intact. `> target` truncated the file
+  before `base64` produced a byte.
+- Two lanes' work meets here: the control plane no longer composes an argv that can
+  trip `E2BIG`, but **marid must still (a) not abort on a spawn failure and (b) not
+  redact-fail the log** — `crates/marid` logs the composed write argv, so a write's
+  full base64 content lands in `docker logs` (1,063,564 bytes for four failed
+  writes) and a credentials file written through the editor is recoverable in
+  plaintext from any log sink. That is a supervisor change and is NOT done here.
+- Tests: `test/runs-argv.test.ts` (the arithmetic), `test/writes.test.ts` (every
+  size on the reported curve through the real route and a real `ComputerDO`),
+  `test/node/write-argv.test.ts` (a REAL `/bin/sh`: the round trip, the pre-fix
+  single-element form failing to spawn at all, and the atomic-replace property).
+
+### 2. A run's working directory is inside the computer
+
+`DEFAULT_CWD` was `/` — the container's root, while `MARI_ROOT` (`/work`) is the
+only tree that is snapshotted. A run's default output was therefore absent from
+every manifest and destroyed at deep sleep (`git clone && npm i` in the default
+directory was silently discarded). marid's own empty-cwd fallback covers a
+RESUMED run only, so the control plane must send a concrete directory.
+
+`resolveRunCwd(root, requested)` (`src/runs.ts`) is the whole rule: no request ⇒
+the root; a path already inside the root ⇒ verbatim (callers that speak substrate
+paths are unaffected); any other absolute path ⇒ interpreted in the COMPUTER's
+filesystem space — the space the file browser, the editor and every manifest path
+use — and joined onto the root. `/project` on a `/work`-rooted computer is
+`/work/project`.
+
+### 3. The credential vault is wired end to end (spec 10.1)
+
+The vault was **write-only**: `PUT /secrets/:name` stored a value, `GET /secrets`
+listed the name, and `listSecretNames` was the only reader in the repository. marid
+resolves a run's `env_names` from its OWN process environment
+(`crates/marid/src/run.rs`), and `ComputerDO#maridEnv` composed `MARI_*` only — so
+`echo $ANTHROPIC_API_KEY` in a run printed nothing and no agent that needs an API
+key could work.
+
+- `#maridEnv` now reads the computer's vault (`listSecrets`) and merges the values
+  into the `materialize` environment, which IS the supervisor's process
+  environment. Values therefore never travel in `start_run` (contracts.md §5.2
+  stays name-only), never enter an HTTP response, an event or a journal.
+- Vault entries are written FIRST and `MARI_*` names are refused at the route and
+  skipped at the merge: a computer whose vault held `MARI_TOKEN` could otherwise
+  fence itself out or hand its own fencing token to a run.
+- A name must be a valid environment variable (`[A-Za-z_][A-Za-z0-9_]*`), and
+  `DELETE /api/computers/:id/secrets/:name` exists so a key can be rotated out.
+- Not done: spec 10.1's "configured credential paths are excluded from manifests"
+  (the `excludeGlobs` column exists and is passed to marid, but nothing in the
+  product sets it), and the web app still has no vault UI — `packages/web` was
+  being edited by another lane during this run (see §7).
+
+### 4. The wake proxy is authorized (SEC-03)
+
+`tryWakeProxy` did no session check and discarded the parsed `user` label. Two
+consequences on a hosted instance: any port a computer published was readable by
+anyone who knew the computer id, and an anonymous GET on a COLD computer called
+`ComputerDO.wake()` and MATERIALIZED substrate resources — unbounded
+denial-of-wallet against a stranger's computer. `test/proxy.test.ts` asserted
+`200` for exactly that request, so the suite encoded the hole as correct.
+
+The model now, all of it in `src/preview.ts` + `src/handler.ts`:
+
+| Rule | Why |
+|---|---|
+| the `user` label is `SHA-256(userId)[0..12]` and is CHECKED against the computer's owner | the label is part of the address, so it must authorize something; a hash because a preview hostname ends up in DNS logs, referrers and screenshots |
+| a request must carry a capability (`mari_preview` cookie, or once in the query) **or** an owning session | the preview surface both reads a port and spends substrate budget |
+| the capability is an HMAC over `computer:port:expiry` (12 h), minted only by `GET /api/computers/:id/preview?port=` for a computer the caller owns | scoped: a token for port 3000 is not a token for port 22, and not a token for another computer |
+| a token in the query becomes a host-scoped `HttpOnly` cookie and is redirected out of the URL | the iframe's later asset requests carry it; the token does not linger in the address bar |
+| every refusal happens BEFORE the Durable Object is addressed | a refused request costs no substrate call — which is what makes the denial-of-wallet fix testable |
+| `Cookie` is filtered before the request reaches the guest | whatever the user is running on their computer has no business receiving Mari's session cookie or the capability |
+| unknown computer and wrong label answer the SAME 404 | the preview host of a computer that exists must not be distinguishable from one that does not |
+
+**Spec 10.3 (CPU-hour and egress limits) is still not implemented** — zero hits for
+`cpuHour`/`egressLimit` in `packages/control-plane/src`. The anonymous
+denial-of-wallet path is closed, but an authenticated user can still hold their own
+computers AWAKE without a ceiling. It belongs in the fleet/tier code and is a
+deliberate gap, not an oversight.
+
+### 5. Preview URLs come from the server
+
+The pane composed `https://{port}--{computer}--user.mari.sh` from a hardcoded
+scheme, a BUILD-time `VITE_PREVIEW_ZONE`, and the literal string `'user'`
+(`Shell.tsx`'s `VITE_USER ?? 'user'`, whose comment claimed the control plane set
+the real one). It could not work on a private instance at all, and an operator
+could not configure it without editing source and rebuilding.
+
+- `GET /api/config` (unauthenticated, content-free) serves `previewZone`,
+  `previewScheme`, `previewPort`, `devAuth`, `devSeed` and the write/read caps.
+- `GET /api/computers/:id/preview?port=` serves the host, the capability URL and
+  the stable URL; `BrowserPreviewPane` frames what it is given and validates the
+  one-label shape with the client mirror of the proxy's parser.
+- The Node runtime's default `PREVIEW_ZONE` is now **`localhost`**, not `mari.sh`:
+  `*.localhost` resolves to loopback in Chrome and Firefox with no DNS, so a
+  private instance's preview pane works out of the box.
+- Every proxy failure is now a 502 with a reason (`expose_port`,
+  `upstream_unreachable`, `proxy_fetch`), the driver's own message, and one log
+  line. It used to be a bare 500 with an empty body and no log — indistinguishable
+  from a control-plane fault, for the two most common cases (a port that was never
+  published, and a port with nothing listening).
+
+### 6. Smaller honesty fixes
+
+- **Sleep on demand** (`POST /api/computers/:id/sleep`, `{deep:true}` for spec
+  4.4's deep sleep). There was no route at all, so an AWAKE computer billed until
+  the idle timer. The response reports `settled`, because AWAKE→COLD waits for the
+  supervisor's final manifest (spec 4.5) and claiming `cold` before it arrives
+  would be a lie.
+- **A brand-new computer is browsable.** `POST /api/computers` seeds the head with
+  the fleet's `BASE_MANIFEST` (spec §2), and a computer with no manifest at all
+  lists an EMPTY root instead of `404 no_manifest` — a new computer looked like a
+  broken file browser.
+- **Actionable error shapes.** `dismiss` answers `400 bad_event_id` for a
+  non-numeric id and `404 attention_not_found` for a miss (it used to answer
+  `200 {ok:false}` for both, which `res.ok` reads as success); `stop` on a run that
+  never started reports `status:"cancelled"` beside the client's `failed`, so a
+  user's own cancellation is not recorded as a failure.
+- **The Node alarm no longer swallows throws.** `node/state.ts` deleted the alarm
+  row before running the handler and caught every error silently, so a computer
+  whose transition threw consumed its deadline FOREVER with no log line. It now
+  logs and re-arms with bounded backoff (1 s, 5 s, 15 s, 60 s), never overwriting a
+  re-arm the handler itself performed.
+- **`MARI_`-prefixed environment variables work.** `deploy/README.md` documents
+  `MARI_AUTH_SECRET`, `MARI_DEV_AUTH`, `MARI_DEV_SEED`, `MARI_PREVIEW_ZONE`,
+  `MARI_WARM_IDLE_MS`, `MARI_COLD_IDLE_MS`, `MARI_PORT`, `MARI_BASE_URL`; the Node
+  entry read only the unprefixed forms, so the README's own "without compose"
+  recipe silently ignored the auth secret and the tier thresholds. Both spellings
+  are accepted, the documented one winning.
+- **`+ Terminal` opens a real terminal.** It (and the palette's "New terminal
+  pane") bound the pane to the literal run id `'shell'`, which no supervisor has
+  ever heard of: the pane was permanently blank. It now starts `/bin/sh -i` as a
+  run and binds the pane to the id the control plane returned (spec 7.1: a terminal
+  pane is a view OF a run).
+
+### 7. v0 deviation: spec 8.5 "Browser, computer mode" does not exist
+
+Spec 8.5's second browser pane — a Chromium instance ON the computer, streamed
+into the pane, with a persistent profile, agent-drivable, with the user able to
+take control — **is not implemented anywhere in this repository.** `grep -rn
+'computer mode|chromium|CDP|devtools'` over `packages/web`,
+`packages/control-plane` and `crates` returns nothing, and `wm/pane.ts` declares
+only `terminal`/`files`/`editor`/`preview`/`runs`/`diff`.
+
+Spec 10.2 is therefore unimplemented too, in all three of its parts: the default
+fork does not exclude a browser profile (there is none), profile chunks are not
+encrypted, and a difference view has no cookie content to hide.
+
+This is recorded as a v0 deviation rather than a bug: preview mode (a stable URL
+per port, spec 8.5's first browser pane) is real and now works end to end, and
+"computer mode" is a separate build — a browser in the base image, a stream
+protocol, an input path, and a profile-exclusion rule in the snapshotter. Whoever
+picks it up should read it as new work, not as a repair.
+
+### 8. Not fixed by this lane, and why
+
+- **`crates/marid`**: the write-argv log leak and the abort-on-spawn-failure
+  (§1). Supervisor lane.
+- **`packages/web` fleet controls, the vault UI and attention dismissal**: another
+  lane was editing `FleetHome.tsx`, `Shell.tsx`, `api/client.ts`, `EditorPane.tsx`
+  and `FilesPane.tsx` while this one ran, so the only web changes made here are in
+  files that lane had not touched (`BrowserPreviewPane.tsx`, `PaneHost.tsx`,
+  `runs/shell.ts`, `Workspace.tsx`, `commands.ts`, plus additive functions at the
+  end of `api/client.ts`). The `user` prop chain from `Shell.tsx` is now inert and
+  should be deleted by whoever next owns that file.
+- **The passkey-only sign-in screen**: `GET /api/config` now reports `devAuth`, so
+  the screen CAN offer the email+password path a private instance documents, but
+  the screen itself was not changed — that needs `AuthApi`, the auth machine and
+  the gate, and the private instance is usable with passkeys on `localhost` today.
+- **Spec 10.3 CPU-hour/egress limits** (§4).
+- **Layout minimum pane width, header overflow, and Super+1..9 vs Alt/Meta+1..9**:
+  cosmetic, and in the contested files.
+- **Two findings from the sweep were already fixed and are recorded here as such**:
+  `manifest-store.readFile` DOES verify blake3 and refuse a short chunk
+  (`decodeChunkBody`, `ChunkLengthMismatch`, `ManifestSizeMismatch`), and the dev
+  seed DOES write real zstd frames (`encodeChunkBody`) — both landed with the
+  compression fix that this file's private-instance appendix already describes.
+
+## Appendix — Deploy preflight: a deployment may not claim a substrate it lacks
+
+_Appended by the deploy-preflight lane (append-only, per directory ownership).
+`deploy/DEPLOY.md` is the runbook; this records the one behavioural rule that lane
+added and the reason it is a rule and not a README paragraph._
+
+`wrangler.jsonc`'s `env.production` ships `SUBSTRATE_MODE: "fake"` on purpose — a
+real substrate must not be switched on by the change that first defines it, and
+whether Cloudflare Containers should be Mari's DEFAULT substrate is still an open
+product decision (see "the two observed stalls": `destroy()`→`start()` on the same
+Durable Object is refused for minutes, and Mari's tier policy makes
+AWAKE→COLD→AWAKE exactly that sequence).
+
+But the fake driver hands out handles, reports every instance `alive`, and starts
+no process. Deployed, that is the wedge class the substrate-death lane closed,
+wearing a success costume: `POST /wake` answers `200 {"state":"awake"}`, the fleet
+shows `activeRuns`, no supervisor ever connects, and nothing appears in the logs —
+for the life of the deployment.
+
+So: **on a production environment (auth.ts's `isProductionEnv`, the same three
+OR'd triggers the auth layer uses) a `ComputerDO` holding a `FakeSubstrate`
+refuses to wake** — `substrate_not_configured`, HTTP 503, no state touched, no
+epoch spent, no substrate call. Everything a computer can serve without a
+substrate keeps working: sign-in, the fleet view, browsing the manifest head
+(spec 8.4). The verdict is taken in the constructor, from `instanceof
+FakeSubstrate` rather than a second reading of `SUBSTRATE_MODE`, because the
+driver selection has already answered that question and two sources for one
+verdict is how they drift.
+
+Two tests, both with the failure they exist for:
+
+- `test/node/unbacked-substrate.test.ts` — a REAL production-shaped `Env` on the
+  Node runtime (the Workers pool cannot make a Durable Object's own environment
+  production-shaped; its `env` comes from wrangler.jsonc). The refusal, a queued
+  run left `queued` with the computer COLD, and the polarity control: the same
+  fake still wakes a dev origin. Neutralise the guard and the first two fail with
+  `expected 'awake' to be 'cold'`.
+- `test/deploy-preflight.test.ts` — the production config's substrate wiring must
+  be internally consistent: a real `SUBSTRATE_MODE` requires a `wss://`
+  `SUPERVISOR_URL_BASE` (marid's `MARI_CONTROL_URL` has no default, so an absent
+  one kills every container at startup) and a `STORE_URI` that is not a
+  substrate-local `fs://` path (that disk is wiped on every stop). Plus the
+  `CF_MAX_INSTANCES` ↔ `containers[].max_instances` mirror, the two container
+  blocks being copies, the migration list creating each DO class exactly once, and
+  `AUTH_RP_ID` being the app host rather than the preview zone.
+
+**Still missing before a hosted computer can wake, and NOT fixed by this lane**
+(all four are in `deploy/DEPLOY.md` §1): the mode flip; `SUPERVISOR_URL_BASE`; a
+chunk store the container can reach — which needs `--features s3` in
+`deploy/Dockerfile.mari`, an R2-credential seam in `ComputerDO.#maridEnv`, and an
+R2 API token, the three things `e2e/cloudflare.e2e.test.ts` works around and
+declares in its header; and a `BASE_MANIFEST` bootstrap for the Workers entry
+(`src/node/base-image.ts` has no Workers equivalent, so hosted computers get no
+base-image dedup).

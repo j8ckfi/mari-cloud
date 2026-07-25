@@ -104,10 +104,94 @@ export interface StartRunResponse {
   state: RunState;
 }
 
-/** `POST /api/computers/:id/runs/:runId/stop` response. */
+/** `POST /api/computers/:id/runs/:runId/stop` response.
+ *
+ *  `status` is the control plane's own run status, which carries one distinction
+ *  the five client states cannot: a run stopped BEFORE it ever reached a
+ *  supervisor is `cancelled`, not `failed`. The interface says "cancelled"
+ *  because recording a user's own cancellation as a failure is a lie. */
 export interface StopRunResponse {
   runId: RunId;
   state: RunState;
+  status?: string;
+  cancelled?: boolean;
+  sent?: boolean;
+}
+
+/** `GET /api/config` — what this deployment IS, which the bundle cannot know.
+ *
+ *  The preview pane used to hardcode `https`, a build-time zone and the literal
+ *  user label `'user'`, so it could not work anywhere but a hypothetical hosted
+ *  instance; the sign-in screen had no way to learn whether email+password
+ *  sign-in exists. Both read this instead. */
+export interface ConfigResponse {
+  previewZone: string;
+  previewScheme: string;
+  previewPort: string;
+  devAuth: boolean;
+  devSeed: boolean;
+  /** Largest body the file-write route accepts (spec 8.5). */
+  maxWriteBytes: number;
+  /** Largest file the read route inlines; equal to `maxWriteBytes`. */
+  maxReadBytes: number;
+}
+
+/** `POST /api/computers` and `POST /api/computers/:id/fork` (spec 9.1). */
+export interface ComputerCreated {
+  id: ComputerId;
+  name: string;
+  state: ComputerState;
+  head: ManifestId | null;
+  parentComputer?: ComputerId | null;
+}
+
+/** `POST /api/computers/:id/wake`. Honest in every outcome (spec 8.3). */
+export interface WakeResponse {
+  state: ComputerState;
+  epoch?: number;
+  error?: string;
+  retrying?: boolean;
+  retryAt?: number;
+}
+
+/** `POST /api/computers/:id/sleep` — `deep` is spec 4.4's deep sleep (COLD). */
+export interface SleepResponse {
+  computer: ComputerId;
+  state: ComputerState;
+  deep: boolean;
+  /** False while the transition is still waiting on the supervisor (spec 4.5). */
+  settled: boolean;
+}
+
+/** `GET /api/computers/:id/secrets` — NAMES only (spec 10.1). */
+export interface SecretNamesResponse {
+  names: string[];
+}
+
+/** `GET /api/computers/:id/preview?port=` (spec 8.5). */
+export interface PreviewResponse {
+  computer: ComputerId;
+  port: number;
+  host: string;
+  /** URL carrying the one-shot capability; load this in the iframe. */
+  url: string;
+  /** The stable address to bookmark or paste (no capability). */
+  stableUrl: string;
+  expiresAt: number;
+}
+
+/** One waiting attention event (spec 6.2). Content-free by construction. */
+export interface AttentionRecord {
+  id: number;
+  run: RunId;
+  kind: AttentionKind;
+  at: number;
+  dismissed?: boolean;
+}
+
+/** `GET /api/computers/:id/attention`. */
+export interface AttentionListResponse {
+  attention: AttentionRecord[];
 }
 
 /** How one path changed between two manifests. */

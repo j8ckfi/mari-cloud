@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useUiStore, defaultLayout } from '../store/ui';
 import { useLayout } from '../api/queries';
 import { saveLayout } from '../api/client';
+import { openShellTerminal } from '../runs/shell';
 import { serializeLayout, deserializeLayout } from '../wm/serialize';
 import { TileView } from './TileView';
 
@@ -50,7 +51,14 @@ export function Workspace({ computer, user }: { computer: string; user: string }
     <div className="app" style={{ height: '100%' }} data-testid="workspace" data-computer={computer}>
       <div className="topbar" style={{ height: 30 }}>
         <span className="hint">panes:</span>
-        <button type="button" onClick={() => addPane({ kind: 'terminal', run: 'shell' })}>
+        {/* A terminal pane is a view of a RUN (spec 7.1), so this starts one —
+            it used to open a pane bound to the fictional run id 'shell', which
+            attached to nothing and stayed blank forever. */}
+        <button
+          type="button"
+          data-testid="add-terminal-pane"
+          onClick={() => void openShellTerminal()}
+        >
           + Terminal
         </button>
         <button type="button" onClick={() => addPane({ kind: 'files', path: '/' })}>

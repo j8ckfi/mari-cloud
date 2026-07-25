@@ -75,7 +75,14 @@ describe('EditorPane save (spec 8.4 write wakes / 8.3 never blocks)', () => {
     const user = userEvent.setup();
     wrap(<EditorPane computer="c1" spec={{ kind: 'editor', path: '/a.md' }} />);
     await user.click(screen.getByTestId('editor-save'));
-    await waitFor(() => expect(screen.getByTestId('editor-status').textContent).toBe('Save failed'));
+    // The wording must state the file's ACTUAL state ("nothing was written"),
+    // not merely that an operation failed — a user who cannot tell whether a
+    // partial write landed has to go and look.
+    await waitFor(() =>
+      expect(screen.getByTestId('editor-status').textContent).toBe(
+        'Save failed — nothing was written. Try again.',
+      ),
+    );
   });
 
   it('Run brief saves first, then starts the run and opens its terminal (spec 8.5)', async () => {

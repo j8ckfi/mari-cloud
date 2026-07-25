@@ -131,14 +131,14 @@ pub struct FakeState {
 impl FakeState {
     /// The reassembled journal bytes for a run (contiguous received bytes).
     pub fn journal(&self, run: &RunId) -> Vec<u8> {
-        self.journals.get(run).map(|r| r.buf.clone()).unwrap_or_default()
+        self.journals
+            .get(run)
+            .map(|r| r.buf.clone())
+            .unwrap_or_default()
     }
 
     /// The completed-run record for `run`, if any.
-    pub fn completion(
-        &self,
-        run: &RunId,
-    ) -> Option<&(RunId, ExitStatus, ManifestId, DiffSummary)> {
+    pub fn completion(&self, run: &RunId) -> Option<&(RunId, ExitStatus, ManifestId, DiffSummary)> {
         self.run_completed.iter().find(|(r, ..)| r == run)
     }
 
@@ -374,7 +374,11 @@ async fn handle_sup(
             run,
             pre_run_manifest,
         } => {
-            state.lock().unwrap().run_started.push((run, pre_run_manifest));
+            state
+                .lock()
+                .unwrap()
+                .run_started
+                .push((run, pre_run_manifest));
         }
         SupervisorMessage::RunCompleted {
             run,
@@ -393,7 +397,11 @@ async fn handle_sup(
             epoch,
             reason,
         } => {
-            state.lock().unwrap().snapshots.push((manifest, epoch, reason));
+            state
+                .lock()
+                .unwrap()
+                .snapshots
+                .push((manifest, epoch, reason));
         }
         SupervisorMessage::HeadAdvanceRequest { manifest, epoch } => {
             // Compare-and-swap on the epoch (spec 4.1 / decisions.md fencing).

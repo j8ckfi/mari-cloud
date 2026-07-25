@@ -31,3 +31,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_continuation;
+
+#[cfg(test)]
+mod tests_keepalive;

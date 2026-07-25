@@ -98,25 +98,25 @@ impl RunState {
     /// PTY the supervisor owns). A no-op once the writer has been dropped at
     /// completion.
     pub fn write_input(&self, bytes: &[u8]) {
-        if let Some(writer) = self.writer.lock().unwrap().as_mut() {
-            if let Err(e) = writer.write_all(bytes).and_then(|()| writer.flush()) {
-                debug!(run = %self.id, "pty input write failed: {e}");
-            }
+        if let Some(writer) = self.writer.lock().unwrap().as_mut()
+            && let Err(e) = writer.write_all(bytes).and_then(|()| writer.flush())
+        {
+            debug!(run = %self.id, "pty input write failed: {e}");
         }
     }
 
     /// Resize the run's PTY window (spec 7.5). A no-op once the master has been
     /// dropped at completion.
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Some(master) = self.master.lock().unwrap().as_ref() {
-            if let Err(e) = master.resize(PtySize {
+        if let Some(master) = self.master.lock().unwrap().as_ref()
+            && let Err(e) = master.resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
-            }) {
-                debug!(run = %self.id, "pty resize failed: {e}");
-            }
+            })
+        {
+            debug!(run = %self.id, "pty resize failed: {e}");
         }
     }
 }
@@ -437,7 +437,12 @@ impl RunManager {
         );
 
         // --- housekeeping task: silence detection + segment uploads. ---
-        spawn_housekeeping(self.ctx.clone(), run.clone(), journal.clone(), state.clone());
+        spawn_housekeeping(
+            self.ctx.clone(),
+            run.clone(),
+            journal.clone(),
+            state.clone(),
+        );
 
         // --- completion task: wait for exit, finalize journal, post snapshot,
         // diff, emit RunCompleted. ---
@@ -494,12 +499,11 @@ impl RunManager {
     /// then snapshots and emits `RunCompleted` as for any exit.
     pub fn stop_run(&self, run: &RunId) {
         let state = self.ctx.runs.lock().unwrap().get(run).cloned();
-        if let Some(state) = state {
-            if let Some(mut killer) = state.killer.lock().unwrap().take() {
-                if let Err(e) = killer.kill() {
-                    warn!(%run, "kill failed: {e}");
-                }
-            }
+        if let Some(state) = state
+            && let Some(mut killer) = state.killer.lock().unwrap().take()
+            && let Err(e) = killer.kill()
+        {
+            warn!(%run, "kill failed: {e}");
         }
     }
 

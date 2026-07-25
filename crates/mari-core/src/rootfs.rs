@@ -77,8 +77,8 @@ use std::path::{Component, Path, PathBuf};
 
 use mari_proto::EntryKind;
 use rustix::fs::{
-    fchmod, fstat, ftruncate, mkdirat, openat, readlinkat, statat, symlinkat, unlinkat, AtFlags,
-    Dir, FileType, Mode, OFlags, RawMode, Stat, CWD,
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, RawMode, Stat, fchmod, fstat, ftruncate, mkdirat,
+    openat, readlinkat, statat, symlinkat, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -421,10 +421,9 @@ impl RootDir {
                 // (ENOTDIR) occupies this component.
                 Err(e) if e == Errno::LOOP || e == Errno::NOTDIR => {
                     if !create {
-                        return Err(self.unsafe_err(
-                            path,
-                            "path component is a symlink or not a directory",
-                        ));
+                        return Err(
+                            self.unsafe_err(path, "path component is a symlink or not a directory")
+                        );
                     }
                 }
                 Err(e) => return Err(self.io_err(path, e)),
@@ -542,10 +541,7 @@ impl RootDir {
                     match openat(
                         self.tip(),
                         name,
-                        OFlags::WRONLY
-                            | OFlags::NOFOLLOW
-                            | OFlags::CLOEXEC
-                            | OFlags::NONBLOCK,
+                        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                         Mode::empty(),
                     ) {
                         Ok(fd) => match self.vet_for_write(comps, &fd)? {
@@ -662,7 +658,7 @@ impl RootDir {
             // The path no longer leads anywhere inside the root: a missing
             // component, or one that is now a symlink or a non-directory.
             Err(Error::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None)
+                return Ok(None);
             }
             Err(Error::UnsafePath { .. }) => return Ok(None),
             Err(e) => return Err(e),
@@ -709,8 +705,8 @@ impl RootDir {
     pub fn read_link(&mut self, comps: &[String]) -> Result<Vec<u8>> {
         let (dirs, name) = self.split(comps)?;
         self.descend(dirs, false)?;
-        let target = readlinkat(self.tip(), name, Vec::<u8>::new())
-            .map_err(|e| self.io_err(comps, e))?;
+        let target =
+            readlinkat(self.tip(), name, Vec::<u8>::new()).map_err(|e| self.io_err(comps, e))?;
         Ok(target.into_bytes())
     }
 

@@ -83,6 +83,7 @@ import type {
   SubstrateProvider,
   ExecOptions,
   ExecResult,
+  InstanceStatus,
 } from './provider.js';
 
 /** The registry name of this driver. */
@@ -508,6 +509,50 @@ export class CloudflareProvider implements SubstrateProvider {
     assertPort(port);
     this.#requireRunning(container, handle, `proxyFetch(${port})`);
     return container.getTcpPort(port).fetch(request);
+  }
+
+  // ── Optional capability: instanceStatus (liveness) ───────────────────────────
+
+  /**
+   * Does this computer's container instance still exist?
+   *
+   * `running` alone is NOT the answer, and this is measured, not theoretical: it
+   * keeps reporting a stale `true` for minutes after `destroy()` resolves, while
+   * `exec()` on the same object fails with "no container instance". So a `true`
+   * flag is CONFIRMED with the cheapest possible exec, and the platform's own
+   * refusal is what settles it:
+   *
+   *   * `running === false`      → `gone`. On this substrate a stopped instance has
+   *     no disk ("All disk is ephemeral"), so there is nothing left to come back
+   *     to — which is exactly what the caller needs to know.
+   *   * probe succeeds           → `alive`.
+   *   * probe says "no container instance" → `gone`. Over `max_instances` the same
+   *     message appears, but then this Durable Object has no instance either, so
+   *     the verdict is the same from where the computer is standing.
+   *   * anything else / a hang   → `unknown`. Never guessed at.
+   *
+   * Never throws, never starts anything (provider.ts's contract for this method).
+   */
+  async instanceStatus(handle: SubstrateHandle): Promise<InstanceStatus> {
+    if (handle.substrate !== CLOUDFLARE_SUBSTRATE) return 'unknown';
+    const container = this.#cfg.container;
+    if (!container) return 'unknown';
+    try {
+      if (!container.running) return 'gone';
+    } catch {
+      return 'unknown';
+    }
+    const probe = this.#cfg.readyProbe === undefined ? DEFAULT_READY_PROBE : this.#cfg.readyProbe;
+    if (!probe || probe.length === 0) return 'alive';
+    try {
+      await this.#execRaw(container, probe, {}, PROBE_EXEC_TIMEOUT_MS);
+      return 'alive';
+    } catch (err) {
+      // A non-zero exit still proves a process ran, so only a REFUSAL counts.
+      const kind = err instanceof CloudflareSubstrateError ? err.kind : 'platform';
+      if (kind === 'capacity' || kind === 'not_running') return 'gone';
+      return 'unknown';
+    }
   }
 
   // ── Optional capability: holdAwake (spec §5.4 run hold) ─────────────────────

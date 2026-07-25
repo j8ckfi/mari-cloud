@@ -140,6 +140,11 @@ impl FrameReader {
     }
 
     /// Decode the next complete frame into `T`, or `None` if incomplete.
+    // Not `Iterator::next`, and cannot be: the item type is chosen per CALL
+    // (each frame is deserialized into whatever the caller expects at that point
+    // in the protocol), and it is fallible. An `Iterator` impl would have to fix
+    // one item type for the whole reader.
+    #[allow(clippy::should_implement_trait)]
     pub fn next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, Error> {
         match self.next_body()? {
             Some(body) => Ok(Some(from_cbor(&body)?)),

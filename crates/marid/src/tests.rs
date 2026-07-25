@@ -46,7 +46,11 @@ fn build_manager(
         silence,
         segment,
         Arc::new(crate::adapters::AdapterSet::default()),
-        Arc::new(crate::state::DurableState::new(store, computer, Epoch::new(1))),
+        Arc::new(crate::state::DurableState::new(
+            store,
+            computer,
+            Epoch::new(1),
+        )),
     ));
     (m, rx)
 }
@@ -186,7 +190,11 @@ async fn real_pty_run_captures_exact_bytes_and_exit_three() {
     .await;
 
     let (exit, _post, _diff) = run_completed(&msgs, &run).expect("run must complete");
-    assert_eq!(*exit, ExitStatus::Exited { code: 3 }, "exit status must be 3");
+    assert_eq!(
+        *exit,
+        ExitStatus::Exited { code: 3 },
+        "exit status must be 3"
+    );
 
     // Journal bytes must equal the program's output exactly.
     assert_eq!(state.journal.snapshot_bytes(), marker.as_bytes());
@@ -425,6 +433,7 @@ fn ws_config(cp: &FakeControlPlane, root: &Path, store_dir: &Path) -> Config {
     Config {
         computer_id: "comp-ws".into(),
         control_url: cp.url().to_string(),
+        allow_insecure_ws: false,
         token: "secret-token".into(),
         epoch: 7,
         root: root.to_path_buf(),
@@ -434,6 +443,11 @@ fn ws_config(cp: &FakeControlPlane, root: &Path, store_dir: &Path) -> Config {
         restore_manifest: None,
         agents_dir: store_dir.join("agents.d"),
         segment_bytes: 4 * 1024 * 1024,
+        // These tests are not about the keepalive; the tests that are set their
+        // own timings (see `tests_keepalive`).
+        keepalive_ms: 0,
+        idle_timeout_ms: 0,
+        shutdown_grace_ms: 5_000,
     }
 }
 
@@ -501,7 +515,10 @@ async fn ws_handshake_ack_and_full_journal_transfer() {
                 .any(|(_, _, reason)| *reason == SnapshotReason::PreRun),
             "a pre-run snapshot must be reported"
         );
-        assert!(!s.head_advances.is_empty(), "a head advance must be requested");
+        assert!(
+            !s.head_advances.is_empty(),
+            "a head advance must be requested"
+        );
         assert!(
             s.run_started.iter().any(|(rr, _)| *rr == run),
             "RunStarted must be reported"
@@ -650,8 +667,12 @@ async fn ws_client_input_reaches_the_pty_and_resize_does_not_tear_down() {
         bytes: b"mari-typed\n".to_vec(),
     });
     assert!(
-        cp.wait_until(Duration::from_secs(8), |s| journal_has(s, &run, b"mari-typed"))
-            .await,
+        cp.wait_until(Duration::from_secs(8), |s| journal_has(
+            s,
+            &run,
+            b"mari-typed"
+        ))
+        .await,
         "typed input must reach the PTY and echo into the journal"
     );
 
@@ -668,8 +689,12 @@ async fn ws_client_input_reaches_the_pty_and_resize_does_not_tear_down() {
         bytes: b"after-resize\n".to_vec(),
     });
     assert!(
-        cp.wait_until(Duration::from_secs(8), |s| journal_has(s, &run, b"after-resize"))
-            .await,
+        cp.wait_until(Duration::from_secs(8), |s| journal_has(
+            s,
+            &run,
+            b"after-resize"
+        ))
+        .await,
         "input after a resize must still reach the PTY"
     );
 

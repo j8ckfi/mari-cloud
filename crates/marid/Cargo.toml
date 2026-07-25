@@ -16,7 +16,18 @@ path = "src/main.rs"
 mari-core = { path = "../mari-core" }
 mari-proto = { path = "../mari-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "fs", "signal"] }
-tokio-tungstenite = "0.30"
+# TLS is not optional: the control plane is an https origin in every deployment
+# that is not a loopback private instance, and the Hello carries the wake token.
+# Without a TLS feature `connect_async` returns `Url(TlsFeatureNotEnabled)` for a
+# `wss://` URL, i.e. marid cannot reach a public control plane at all.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# tokio-tungstenite declares `rustls` with `default-features = false`, so the
+# rustls it builds has NO crypto provider and `ClientConfig::builder()` panics
+# ("no process-level CryptoProvider available"). Naming rustls here unifies the
+# `ring` feature onto that same rustls and gives us the provider to install
+# explicitly at startup (see `ws::install_crypto_provider`). `ring` rather than
+# `aws-lc-rs`: it needs no cmake/nasm in the container build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 portable-pty = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
@@ -44,10 +55,14 @@ s3 = ["mari-core/s3"]
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "fs", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "fs", "process", "signal"] }
 # e2e_docker harness (tests/common): a control plane bound on 0.0.0.0 speaking the
 # real framed-CBOR wire, plus manifest/store access to seed and verify snapshots.
 mari-proto = { path = "../mari-proto" }
 mari-core = { path = "../mari-core" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-tokio-tungstenite = "0.30"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# The `wss://` handshake test serves TLS from a real local listener, so it needs
+# the server half of rustls plus a self-signed leaf to trust.
+tokio-rustls = { version = "0.26", default-features = false }
+rcgen = "0.14"

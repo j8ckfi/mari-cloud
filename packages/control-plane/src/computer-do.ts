@@ -30,7 +30,9 @@ import {
 } from '@mari/shared';
 import type { Env } from './types';
 import {
+  FakeSubstrate,
   makeSubstrate,
+  type InstanceStatus,
   type SubstrateProvider,
   type SubstrateHandle,
 } from './substrate';
@@ -42,11 +44,16 @@ import {
   CLOUDFLARE_SUBSTRATE,
   createCloudflareProvider,
 } from './substrates/cloudflare';
+// ONE definition of "this is a deployed origin" for the whole control plane
+// (auth.ts's three OR'd triggers). A second copy here is the drift that would let
+// the auth layer and the substrate layer disagree about what production means.
+import { isProductionEnv } from './auth';
 import { MiniVtEngine } from './grid';
-import { updateComputerState } from './db/fleet';
+import { updateComputerState, listSecrets } from './db/fleet';
 import {
   DEFAULT_CWD,
   JOURNAL_TAIL_BYTES,
+  resolveRunCwd,
   writeRunArgv,
   type RunDetail,
   type RunDisposition,
@@ -91,8 +98,120 @@ const FLUSH_MS = 100;
  * because a substrate that is out of capacity must not be hammered forever; once
  * the budget is spent the computer sits COLD with its run still queued (spec 5.1
  * — a run is never lost) and the next request or user action retries.
+ *
+ * THE SCHEDULE SPANS ~12 MINUTES ON PURPOSE. On Cloudflare Containers a
+ * `destroy()` followed by a `start()` on the SAME Durable Object is refused for
+ * MINUTES — measured >563 s and ~300 s, both eventually recovering, with the
+ * platform reporting "no container instance" (the same message as an
+ * over-capacity account) while `container.running` still says `true`. Mari's tier
+ * policy makes AWAKE→COLD→AWAKE exactly that sequence, so a computer that just
+ * went COLD can be unwakeable for several minutes through no fault of the control
+ * plane. The answer here is the only honest one available above the platform:
+ * never claim success, never hang the client, and keep the queued work moving on
+ * a bounded retry while the fleet view reports the truth (COLD, with a retry
+ * pending). See docs/decisions.md, "Substrate death and the wedge class".
  */
-const WAKE_RETRY_MS = [5_000, 20_000, 60_000];
+const WAKE_RETRY_MS = [5_000, 20_000, 60_000, 120_000, 240_000, 300_000];
+
+/**
+ * Grace after the supervisor's socket closes while AWAKE, before the substrate is
+ * asked whether the instance is still alive.
+ *
+ * A closed socket is the FIRST signal that a computer's supervisor is gone, and
+ * it is not sufficient: a network blip is not a dead container, and marid
+ * reconnects with the same epoch and token (contracts.md §6). So the socket close
+ * schedules this deadline; only after it, with no supervisor back, does the DO
+ * ask the substrate — and only a substrate that says the instance is gone (or
+ * cannot say, twice) moves the computer.
+ */
+const DEFAULT_SUPERVISOR_GRACE_MS = 15_000;
+
+/**
+ * How often an AWAKE computer with work in flight is health-checked.
+ *
+ * A closed socket cannot be the only trigger: on Cloudflare a torn-down microVM
+ * left the DO's supervisor socket OPEN and the computer read `awake` 15 minutes
+ * later (measured on a real deployment). So while work is pending the DO keeps a
+ * deadline armed; if the supervisor has said nothing for a whole window — marid
+ * heartbeats every 5 s during a run (crates/marid/src/supervisor.rs) — the
+ * substrate is asked. A healthy computer costs one alarm per window and NO
+ * substrate call, because a supervisor that spoke recently is its own liveness
+ * proof.
+ */
+const DEFAULT_LIVENESS_MS = 30_000;
+
+/**
+ * How long the AWAKE/WARM → COLD handshake waits for the supervisor's final
+ * snapshot before finalizing anyway.
+ *
+ * `#beginCold` asks the supervisor to stop cleanly and write the final manifest
+ * (spec 4.5). If that supervisor is already dead — its container stopped, or the
+ * socket outlived it — the answer never comes, and before this deadline existed
+ * the computer stayed AWAKE forever with no alarm armed: a run enqueued
+ * afterwards sat queued and never dispatched (spec 5.1's "a run is never lost"
+ * degraded into "a run is never run"). The e2e suite had to nudge that transition
+ * with POST /wake and count the nudges; a test helper working around a product
+ * defect IS the defect.
+ */
+const DEFAULT_COLD_FINALIZE_MS = 20_000;
+
+/**
+ * Budget for ONE substrate call on the wake path (materialize or resume), and the
+ * watchdog window for a WAKING computer.
+ *
+ * Two failure modes, one number. A driver whose platform call hangs (dockerode
+ * has no timeouts of its own) must not hang the client request behind it (spec
+ * 8.3), and a computer whose Durable Object was evicted mid-materialize must not
+ * be left in WAKING, which is a transition and not a resting place.
+ */
+const DEFAULT_WAKE_TIMEOUT_MS = 120_000;
+
+/** Watchdog window given to a computer found in WAKING at object construction —
+ *  short, because the wake it was waiting for belonged to a process that is gone.
+ *  Not zero, so a restart loop does not fight itself. */
+const WAKING_REVIVE_MS = 500;
+
+/**
+ * How many inconclusive liveness answers are tolerated before the computer is
+ * recovered anyway.
+ *
+ * `unknown` is not `gone` (provider.ts), so it is never treated as one directly —
+ * but a computer whose supervisor is gone AND whose substrate cannot be asked is
+ * unusable either way, and leaving it AWAKE forever is the wedge this whole path
+ * exists to remove. Recovery is safe under exactly the same rules as any other:
+ * the resources are destroyed best-effort, the head is untouched (the chunk store
+ * holds the truth, spec 4.1), and the next wake mints a NEW epoch, so the old
+ * generation can never advance anything even if it turns out to be alive.
+ */
+const LIVENESS_STRIKES_MAX = 2;
+
+/**
+ * How many recoveries in a row are attempted before the computer is left COLD
+ * with its work still queued.
+ *
+ * Reset by any successful `hello`. Without it a container that dies at boot every
+ * time (a broken image, a substrate refusing to run it) would be re-materialized
+ * forever, which costs money and never converges. When the streak is spent the
+ * computer sits COLD, the run is still there (spec 5.1), and the incident log
+ * says why.
+ */
+const RECOVERY_STREAK_MAX = 3;
+
+/**
+ * How many times a run that provably never began may be re-queued by a recovery.
+ *
+ * One. A run whose machine dies before it produces a byte is indistinguishable
+ * from one that was never started, so starting it again is safe — but a run that
+ * does this repeatedly may be the reason the machine died (the Cloudflare e2e
+ * tears its microVM down from INSIDE a run), and re-queueing it forever would
+ * spend instances until the recovery budget ran out. After the retry it takes the
+ * same degradation an interrupted run takes: recorded, notified once, not lost.
+ */
+const MAX_RUN_REQUEUES = 1;
+
+/** The cheapest possible "can this instance run a process" (spec 3.5 `exec`),
+ *  used when a driver declares no liveness capability of its own. */
+const LIVENESS_PROBE_ARGV = ['/bin/sh', '-c', 'exit 0'] as const;
 
 /** Journal bytes buffered for one run, and the offset they start at. The start
  *  is the durable head at the moment the buffer opened, so `start + len` is the
@@ -162,6 +281,75 @@ interface AttentionEvent {
   at: number;
   dismissed: boolean;
 }
+
+/**
+ * A computer-level incident, recorded when Mari had to act on a fact it did not
+ * choose: the substrate instance was gone, a final snapshot never arrived, a wake
+ * was abandoned. Attention events are per-RUN (spec 6.2) and cannot carry these,
+ * and an operator (and a test) must be able to see that a transition completed
+ * WITHOUT the thing it asked for rather than reading it as a clean success.
+ *
+ * CONTENT-FREE, exactly like the attention log (spec 6.3): a kind, a time, and
+ * the epoch it happened under. No terminal bytes, no paths, no messages.
+ */
+export type IncidentKind =
+  /** The substrate says the instance behind the handle no longer exists. */
+  | 'substrate_lost'
+  /** The substrate could not be asked, repeatedly, so the computer was recovered
+   *  anyway rather than left wedged. */
+  | 'substrate_unknown'
+  /** The instance was alive but no supervisor of the current generation was
+   *  reachable within the grace window, with work pending. */
+  | 'supervisor_lost'
+  /** COLD was finalized from the last known head because the supervisor never
+   *  delivered its final snapshot (spec 4.5's manifest was MISSED). */
+  | 'final_snapshot_missed'
+  /** A destroy the control plane asked for did not succeed; the computer still
+   *  moved on, because a handle nobody can destroy must not wedge a computer. */
+  | 'destroy_failed'
+  /** A wake was left mid-flight (the object was evicted, or the substrate call
+   *  exceeded its budget) and had to be rolled back. */
+  | 'wake_abandoned'
+  /** Recovery was attempted RECOVERY_STREAK_MAX times without a supervisor ever
+   *  authenticating; the computer is left COLD with its work queued. */
+  | 'recovery_exhausted';
+
+/** One recorded incident (kinds and times only — never content). */
+export interface Incident {
+  id: number;
+  kind: IncidentKind;
+  at: number;
+  epoch: number;
+}
+
+/** How many incident rows a computer keeps (newest win). */
+const INCIDENT_KEEP = 100;
+
+/**
+ * What one liveness check concluded (see `ComputerDO.healthCheck`).
+ *
+ * `supervised` and `idle` cost nothing: a supervisor that spoke inside the window
+ * is its own proof. `inconclusive` and `mute` are the BOUNDED middle — the
+ * substrate could not be asked, or a socket is open but silent — and repeat until
+ * the strike budget runs out. `recovered` means the computer was moved.
+ */
+export type LivenessVerdict =
+  | 'not_awake'
+  | 'idle'
+  | 'supervised'
+  | 'unsupervised_idle'
+  | 'inconclusive'
+  | 'mute'
+  | 'recovered';
+
+/** The deadline slots multiplexed onto the Durable Object's ONE alarm.
+ *
+ *  A DO has exactly one alarm (spec 3.2's single coordination point), and before
+ *  this every new deadline had to fight the tier policy for it — which is why
+ *  several transitions had no deadline at all and could never advance without an
+ *  external event. Processing order is the order below: recovery before policy. */
+const DEADLINES = ['wakeRetry', 'waking', 'liveness', 'cold', 'tier'] as const;
+type DeadlineName = (typeof DEADLINES)[number];
 
 /** What `describe()` returns to the REST layer (spec 8.2 fleet/detail data). */
 export interface ComputerSnapshot {
@@ -233,6 +421,17 @@ export interface WakeResult {
   state: ComputerState;
   epoch: number;
   token: string;
+  /**
+   * True when the substrate refused but the DO has ARMED A RETRY: the wake is
+   * still in progress from the user's point of view and the queued work will be
+   * taken as soon as the substrate accepts it. This is what makes a refusal
+   * honest instead of either a lie ("awake") or a dead end ("failed") on a
+   * substrate whose own recovery takes minutes — Cloudflare's destroy→start
+   * refusal being the measured case (see WAKE_RETRY_MS).
+   */
+  retrying: boolean;
+  /** When that retry is due (ms since epoch), or null when none is armed. */
+  retryAt: number | null;
 }
 
 interface Meta {
@@ -248,11 +447,33 @@ interface Meta {
   armedIdleSince: number | null;
   coldPending: boolean;
   /** When a failed wake is to be retried by the alarm, or null when none is
-   *  pending. The alarm slot is only claimed for this while the computer is
-   *  COLD, where the tier policy has nothing scheduled. */
+   *  pending. One of the deadline slots multiplexed onto the single alarm. */
   wakeRetryAt: number | null;
   /** Consecutive failed wakes; reset by any successful one. Bounds the retry. */
   wakeFailures: number;
+  /** Tier-policy deadline (spec 4.4), or null when none is pending. */
+  tierAt: number | null;
+  /** Liveness deadline: the supervisor-loss grace window, and the recurring
+   *  health check while work is in flight. */
+  livenessAt: number | null;
+  /** Deadline for the AWAKE/WARM → COLD handshake to complete on its own. */
+  coldAt: number | null;
+  /** Watchdog for a computer left in WAKING (a transition, not a state). */
+  wakingAt: number | null;
+  /** When the CURRENT wake generation reached AWAKE, or null when not AWAKE.
+   *  A generation younger than the grace window is still allowed to be booting. */
+  generationAt: number | null;
+  /** True once a supervisor completed `hello` in the CURRENT generation. Reset
+   *  when a new epoch is minted. */
+  supervisorSeen: boolean;
+  /** When the last current-generation supervisor socket closed while AWAKE. */
+  supervisorLostAt: number | null;
+  /** Consecutive inconclusive liveness answers (an `unknown` verdict, or a live
+   *  socket that has gone mute). Reset by any supervisor message. */
+  livenessStrikes: number;
+  /** Consecutive recoveries with no successful `hello` in between. Bounds the
+   *  recover→wake→recover loop a permanently broken image would otherwise cause. */
+  recoveryStreak: number;
   /** Owning user id, cached from the D1 fleet row for event fan-out. */
   ownerId: string | null;
   /** Lifetime AWAKE milliseconds, closed out on each exit from AWAKE. */
@@ -278,6 +499,15 @@ function initialMeta(): Meta {
     coldPending: false,
     wakeRetryAt: null,
     wakeFailures: 0,
+    tierAt: null,
+    livenessAt: null,
+    coldAt: null,
+    wakingAt: null,
+    generationAt: null,
+    supervisorSeen: false,
+    supervisorLostAt: null,
+    livenessStrikes: 0,
+    recoveryStreak: 0,
     ownerId: null,
     awakeMs: 0,
     awakeSince: null,
@@ -349,6 +579,45 @@ export class ComputerDO extends DurableObject<Env> {
   // proxy request) materialize the computer ONCE (spec 4.1: one writable copy).
   #wakeInFlight: Promise<WakeResult> | null = null;
 
+  // When the active supervisor last said ANYTHING on an authenticated socket.
+  // In memory only, and deliberately: it is read by the liveness deadline within
+  // one object lifetime, and persisting it would add a storage write per journal
+  // frame — the most expensive thing this object does (see FLUSH_MS). If the
+  // object is re-created the sockets died with it, so 0 correctly means "nothing
+  // has spoken to me yet".
+  #lastSupervisorAt = 0;
+
+  // A recovery in progress, so a liveness deadline, a wake and a REST call cannot
+  // each tear the same dead generation down (the mirror of #wakeInFlight).
+  #recoveryInFlight: Promise<void> | null = null;
+
+  // How many liveness probes this object has asked the substrate for. Reported by
+  // `healthCheck`, so a test can assert that a HEALTHY computer costs none.
+  #probeCount = 0;
+
+  /**
+   * This deployment's substrate is the IN-MEMORY FAKE and this is a production
+   * environment — so nothing this object asks for can ever exist.
+   *
+   * The fake answers `materialize` with a handle, reports every instance `alive`,
+   * and starts no process. On a dev origin that is exactly what the suites want.
+   * On a deployed origin it is a LIE with the same shape as the wedge the
+   * liveness lane closed: the computer reads AWAKE, `POST /wake` answers 200, the
+   * fleet shows `activeRuns`, and no supervisor will ever connect to take the
+   * work — for as long as the deployment lives, with nothing in the logs.
+   *
+   * So `wake` refuses instead (`substrate_not_configured`, HTTP 503) and the
+   * computer stays at the state it really is in. Everything a COLD computer can
+   * serve without a substrate — sign-in, the fleet view, browsing the manifest
+   * head (spec 8.4) — keeps working, which is what makes this a refusal rather
+   * than a dead deployment. Read-only honesty is not a substitute for a
+   * substrate; it is what makes the missing one visible.
+   *
+   * Decided in the constructor because that is where the driver is chosen: the
+   * verdict is a property of the deployment, never of a request.
+   */
+  readonly #unbackedInProduction: boolean;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.substrate =
@@ -372,10 +641,26 @@ export class ComputerDO extends DurableObject<Env> {
             },
           })
         : makeSubstrate(env.SUBSTRATE_MODE, env);
+    // `instanceof FakeSubstrate` rather than re-reading SUBSTRATE_MODE: the
+    // question is what driver this object actually holds, and the selection above
+    // has already answered it (an unknown mode also lands on the fake). Two
+    // sources for one verdict is how they drift.
+    this.#unbackedInProduction = isProductionEnv(env) && this.substrate instanceof FakeSubstrate;
     ctx.blockConcurrencyWhile(async () => {
       this.#initSql();
       const stored = await ctx.storage.get<Meta>('meta');
       if (stored) this.#meta = { ...initialMeta(), ...stored };
+      // A computer found in WAKING when this object is CREATED had its wake in
+      // flight inside a process that no longer exists — this instance is new, so
+      // nothing is in flight now. That is the private-instance restart and the
+      // Durable Object eviction, and nothing else in the system acts on WAKING
+      // (the tier policy does not), so it gets a fresh, short watchdog window
+      // rather than waiting out a deadline the dead process wrote.
+      if (this.#meta.state === 'waking') {
+        this.#meta.wakingAt = Date.now() + WAKING_REVIVE_MS;
+        await ctx.storage.put('meta', this.#meta);
+        await this.#armAlarm();
+      }
     });
   }
 
@@ -421,6 +706,16 @@ export class ComputerDO extends DurableObject<Env> {
          at INTEGER NOT NULL
        )`,
     );
+    // Computer-level incidents (see IncidentKind). Content-free by construction:
+    // there is nowhere in this table to put a byte of a user's data.
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS incident (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         kind TEXT NOT NULL,
+         at INTEGER NOT NULL,
+         epoch INTEGER NOT NULL
+       )`,
+    );
     sql.exec(
       `CREATE TABLE IF NOT EXISTS attention (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -460,9 +755,19 @@ export class ComputerDO extends DurableObject<Env> {
          dispositionAt INTEGER,
          epoch INTEGER NOT NULL DEFAULT 0,
          writePath TEXT,
-         seq INTEGER NOT NULL DEFAULT 0
+         seq INTEGER NOT NULL DEFAULT 0,
+         requeues INTEGER NOT NULL DEFAULT 0
        )`,
     );
+    // Additive migration for objects created before `requeues` existed (a private
+    // instance's Durable Object storage outlives a deploy). SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`, so the second attempt throwing "duplicate
+    // column name" IS the success case.
+    try {
+      sql.exec(`ALTER TABLE runs ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Already present.
+    }
   }
 
   async #persist(): Promise<void> {
@@ -481,6 +786,13 @@ export class ComputerDO extends DurableObject<Env> {
 
   #setComputerId(id: string | null | undefined): void {
     if (id && !this.#meta.computerId) this.#meta.computerId = id;
+  }
+
+  /** The computer's filesystem root inside the substrate (`MARI_ROOT`). Every
+   *  run's working directory is resolved against it (spec 2: ONE filesystem). */
+  #computerRoot(): string {
+    const root = (this.env.COMPUTER_ROOT ?? DEFAULT_COMPUTER_ROOT).replace(/\/+$/, '');
+    return root === '' ? '/' : root;
   }
 
   // ---------------------------------------------------------------------------
@@ -597,29 +909,77 @@ export class ComputerDO extends DurableObject<Env> {
   }
 
   /** Start a wake in the BACKGROUND (spec 8.3: the interface must not wait for
-   *  a computer). Returns immediately; `state` is already `waking`. */
+   *  a computer). Returns immediately; `state` is already `waking`.
+   *
+   *  It must NOT early-return on the DO's own belief that it is AWAKE — that
+   *  belief is exactly what a dead substrate invalidates, and trusting it is what
+   *  wedged a computer whose container had been removed: the run was queued, the
+   *  state read `awake`, and nothing ever materialized an instance to run it. A
+   *  live supervisor is the only proof of AWAKE that costs nothing; without one
+   *  the full `wake()` path runs and verifies liveness. */
   #wakeInBackground(): void {
-    if (this.#meta.state === 'awake' && this.#meta.token && this.#meta.handle) return;
+    if (this.#meta.state === 'awake' && this.#meta.token && this.#meta.handle) {
+      if (this.#liveSupervisor()) return;
+    }
     if (this.#wakeInFlight) return;
     const p = this.wake();
     this.ctx.waitUntil(p.then(() => undefined).catch(() => undefined));
   }
 
   async #wakeInner(): Promise<WakeResult> {
-    if (this.#meta.state === 'awake' && this.#meta.token && this.#meta.handle) {
-      await this.#touch();
-      await this.#persist();
+    // No substrate, no wake, and say so — BEFORE any state is touched. See
+    // `#unbackedInProduction`: the alternative is a deployment that reports AWAKE
+    // for the rest of its life and runs nothing.
+    if (this.#unbackedInProduction) {
+      console.error(
+        `mari: refusing to wake computer=${this.#meta.computerId ?? '?'}: ` +
+          `SUBSTRATE_MODE=${this.env.SUBSTRATE_MODE ?? '(unset)'} selects the in-memory fake ` +
+          'substrate on a production environment, so no instance can exist. Deploy with a real ' +
+          'substrate (deploy/DEPLOY.md).',
+      );
       return {
-        ok: true,
-        error: null,
-        state: 'awake',
+        ok: false,
+        error: 'substrate_not_configured',
+        state: this.#meta.state,
         epoch: this.#meta.epoch,
-        token: this.#meta.token,
+        token: '',
+        retrying: false,
+        retryAt: null,
       };
+    }
+    if (this.#meta.state === 'awake' && this.#meta.token && this.#meta.handle) {
+      const verdict = await this.#verifyAwake();
+      if (verdict === 'supervised' || verdict === 'booting') {
+        await this.#touch();
+        await this.#persist();
+        return {
+          ok: true,
+          error: null,
+          state: 'awake',
+          epoch: this.#meta.epoch,
+          token: this.#meta.token,
+          retrying: false,
+          retryAt: null,
+        };
+      }
+      // AWAKE was a claim this control plane can no longer stand behind. Recover
+      // honestly (COLD at the last manifest head — its truth is the chunk store,
+      // spec 4.1) and fall through to materialize a FRESH instance below under a
+      // NEW epoch, so the dead generation can never advance anything.
+      //
+      // This is what makes POST /wake honest: before it, an AWAKE computer whose
+      // container had been removed answered `{"state":"awake"}` and did nothing.
+      await this.#recover(verdict, { rewake: false });
     }
 
     const wasWarm = this.#meta.state === 'warm' && this.#meta.handle !== null;
     this.#meta.state = 'waking';
+    // WAKING is a transition, and a transition needs a deadline: if this object is
+    // evicted (or the runtime restarted) between here and the substrate's answer,
+    // nothing else would ever move the computer again. The watchdog below is what
+    // makes that recoverable instead of terminal.
+    this.#setDeadline('waking', Date.now() + this.#wakeTimeoutMs() * 2);
+    await this.#armAlarm();
     await this.#persist();
     // The interface shows the transition immediately and never waits for it
     // (spec 8.3) — a write- or run-triggered wake announces itself here.
@@ -629,6 +989,12 @@ export class ComputerDO extends DurableObject<Env> {
     // the booting supervisor receives them (in its env) and echoes the epoch in
     // `hello` (contracts.md §6).
     this.#meta.epoch += 1;
+    // A NEW generation: nothing the previous supervisor did or said counts, and
+    // the grace/liveness bookkeeping starts over.
+    this.#meta.supervisorSeen = false;
+    this.#meta.supervisorLostAt = null;
+    this.#meta.livenessStrikes = 0;
+    this.#lastSupervisorAt = 0;
     // A wake supersedes any in-flight WARM->COLD finalize: the machine is coming
     // UP, not going down. Without this reset, a stale `snapshot_written{final}`
     // from the pre-wake generation would tear down the computer the user just
@@ -638,20 +1004,39 @@ export class ComputerDO extends DurableObject<Env> {
     const token = crypto.randomUUID().replace(/-/g, '');
     this.#meta.token = token;
     const computer = this.#meta.computerId ?? 'unknown';
+    // PERSIST THE MINT BEFORE THE SUBSTRATE CALL. The epoch is monotonic by
+    // contract (contracts.md §6) and the whole fencing argument rests on it, so a
+    // crash between here and the substrate's answer must not let the NEXT wake
+    // hand out the same number to a different generation — the supervisor this
+    // wake is booting already has it in its environment.
+    await this.#persist();
 
     try {
       if (wasWarm && this.#meta.handle) {
         // WARM -> AWAKE: resume the slept resource in place (returns void).
-        await this.substrate.wake(this.#meta.handle);
+        // BOUNDED: a driver whose platform call hangs (dockerode has no timeout of
+        // its own, and Cloudflare's over-capacity failure mode is a HANG rather
+        // than an error) must not hang the request behind it — spec 8.3.
+        await this.#bounded(this.substrate.wake(this.#meta.handle), this.#wakeTimeoutMs(), 'resume');
       } else {
         // COLD -> AWAKE: materialize from the base image; marid restores the
         // delta from the manifest head using the injected config env.
-        this.#meta.handle = await this.substrate.materialize({
-          computer,
-          image: this.env.BASE_IMAGE ?? BASE_IMAGE,
-          env: this.#maridEnv(computer, token),
-          ports: [],
-        });
+        const handle = await this.#bounded(
+          this.substrate.materialize({
+            computer,
+            image: this.env.BASE_IMAGE ?? BASE_IMAGE,
+            env: await this.#maridEnv(computer, token),
+            ports: [],
+          }),
+          this.#wakeTimeoutMs(),
+          'materialize',
+        );
+        // PERSIST THE HANDLE FIRST, before anything else can fail. Everything
+        // after this point can throw or be evicted, and a handle this object
+        // never wrote down is a substrate resource nobody can destroy — an
+        // orphan holding the computer's single instance slot.
+        this.#meta.handle = handle;
+        await this.#persist();
       }
     } catch (err) {
       // A substrate that refuses is an OUTCOME of a wake, not an exception in
@@ -665,6 +1050,19 @@ export class ComputerDO extends DurableObject<Env> {
         `mari: wake failed computer=${computer} epoch=${this.#meta.epoch} ` +
           `path=${wasWarm ? 'resume' : 'materialize'}: ${err instanceof Error ? err.message : String(err)}`,
       );
+      // A RESUME that failed asks a second question: is the resource still there
+      // at all? If the substrate says it is GONE, WARM was a claim no future wake
+      // could ever honour — every attempt would resume something that does not
+      // exist. That is the eviction path, not a refusal: recover (COLD at the last
+      // manifest head) and materialize a FRESH instance in this same call, because
+      // a usable computer is what the caller asked for. `unknown` keeps WARM — the
+      // resource may well be there, and a resume is cheaper than a restore.
+      if (wasWarm && this.#meta.handle !== null && (await this.#probeInstance()) === 'gone') {
+        await this.#recover('substrate_lost', { rewake: false });
+        // One retry, now on the COLD path (state cold, no handle). A failure there
+        // ends in `#failWake` with `wasWarm` false, so this cannot recurse again.
+        return this.#wakeInner();
+      }
       await this.#failWake(wasWarm);
       return {
         ok: false,
@@ -672,11 +1070,15 @@ export class ComputerDO extends DurableObject<Env> {
         state: this.#meta.state,
         epoch: this.#meta.epoch,
         token: '',
+        retrying: this.#meta.wakeRetryAt !== null,
+        retryAt: this.#meta.wakeRetryAt,
       };
     }
     this.#meta.state = 'awake';
     this.#meta.wakeFailures = 0;
     this.#meta.wakeRetryAt = null;
+    this.#meta.generationAt = Date.now();
+    this.#setDeadline('waking', null);
     // Open a new AWAKE stretch for the cost meter (spec 8.2). Only compute time
     // accrues; WARM and COLD are storage, not compute.
     if (this.#meta.awakeSince === null) this.#meta.awakeSince = Date.now();
@@ -684,7 +1086,49 @@ export class ComputerDO extends DurableObject<Env> {
     await this.#persist();
     await this.#syncFleetState();
     this.#emit({ type: 'state', state: 'awake' });
-    return { ok: true, error: null, state: 'awake', epoch: this.#meta.epoch, token };
+    return {
+      ok: true,
+      error: null,
+      state: 'awake',
+      epoch: this.#meta.epoch,
+      token,
+      retrying: false,
+      retryAt: null,
+    };
+  }
+
+  /**
+   * Is this computer's AWAKE actually true?
+   *
+   * The DO's own `state` is a record of what it last asked for, not an
+   * observation. A substrate evicts an instance (routine on Cloudflare, one
+   * `docker rm -f` on Docker) without telling anyone, and then AWAKE is a claim
+   * about a machine that does not exist: runs queue behind a supervisor that will
+   * never connect, and `POST /wake` answers "already awake".
+   *
+   * Three answers, in the order they cost:
+   *
+   *  1. A live current-generation supervisor is proof. It costs nothing and it is
+   *     the case in every healthy computer.
+   *  2. A generation younger than the grace window is still allowed to be
+   *     booting; marid dials in within ~115 ms measured, but a substrate under
+   *     load is slower and tearing that wake down would fight the caller.
+   *  3. Otherwise ASK THE SUBSTRATE (provider.ts's liveness capability, or spec
+   *     3.5's `exec` as the probe). Only `alive` keeps a computer AWAKE — and not
+   *     even that when there is nothing to serve the work with, because an
+   *     instance with no supervisor cannot run anything.
+   */
+  async #verifyAwake(): Promise<'supervised' | 'booting' | IncidentKind> {
+    if (this.#liveSupervisor()) return 'supervised';
+    const age = Date.now() - (this.#meta.generationAt ?? 0);
+    if (age < this.#supervisorGraceMs()) return 'booting';
+    const status = await this.#probeInstance();
+    if (status === 'gone') return 'substrate_lost';
+    if (status === 'unknown') return 'substrate_unknown';
+    // `alive` with no supervisor past the grace window is a machine that cannot
+    // serve its computer. It is replaced rather than reported as AWAKE: its disk
+    // is a cache (spec §2) and the head in the chunk store is the truth.
+    return 'supervisor_lost';
   }
 
   /**
@@ -711,30 +1155,42 @@ export class ComputerDO extends DurableObject<Env> {
     const state: ComputerState = resumable ? 'warm' : 'cold';
     this.#meta.state = state;
     if (!resumable) {
-      this.#meta.handle = null;
+      // A handle recorded by a materialize that then failed (the readiness probe
+      // timed out, the platform call exceeded its budget) names a resource that
+      // may well exist. Destroy it best-effort before dropping it: an instance
+      // this object forgets is an orphan holding the computer's slot, and on
+      // Cloudflare that slot is the only one there is.
+      await this.#tearDownInstance('failed wake');
       // A supervisor that somehow booted from the failed materialize is an
       // orphan this DO cannot manage: without the token it cannot handshake, so
       // it can neither write the journal nor advance the head (spec 4.1).
       this.#meta.token = null;
     }
+    this.#meta.generationAt = null;
+    this.#meta.supervisorSeen = false;
+    this.#setDeadline('waking', null);
+    this.#setDeadline('liveness', null);
     this.#closeAwakeStretch();
     this.#meta.wakeFailures += 1;
     this.#meta.wakeRetryAt = null;
 
     // A run queued behind this wake must not sit there because the substrate
     // hiccuped once (spec 5.1: a run is never lost). Retry on the alarm, with a
-    // bounded backoff, and only while COLD — a WARM computer's alarm slot
-    // belongs to the tier policy's WARM->COLD deadline.
+    // bounded backoff — long enough to outlast Cloudflare's measured
+    // destroy→start refusal (see WAKE_RETRY_MS), bounded so a substrate that is
+    // genuinely out of capacity is not hammered forever.
     const attempt = this.#meta.wakeFailures - 1;
-    if (state === 'cold' && attempt < WAKE_RETRY_MS.length && this.#hasQueuedRuns()) {
+    if (attempt < WAKE_RETRY_MS.length && this.#pendingWork() > 0) {
       this.#meta.wakeRetryAt = Date.now() + (WAKE_RETRY_MS[attempt] as number);
-      await this.ctx.storage.setAlarm(this.#meta.wakeRetryAt);
-    } else if (state === 'warm') {
+    }
+    if (state === 'warm') {
       // Back to WARM with its deadline restored: the tier policy (spec 4.4) must
       // still be able to take this computer COLD, even though the alarm that was
       // pending may have fired (to no effect) while the state read WAKING.
-      await this.#armTier(this.#coldIdleMs());
+      this.#setDeadline('tier', Date.now() + this.#coldIdleMs());
+      this.#meta.armedIdleSince = this.#meta.idleSince;
     }
+    await this.#armAlarm();
 
     await this.#persist();
     await this.#syncFleetState();
@@ -751,6 +1207,444 @@ export class ComputerDO extends DurableObject<Env> {
     return Number(row?.n ?? 0) > 0;
   }
 
+  /** Runs that still need a live computer: queued, handed over, running, or being
+   *  stopped. This is what "there is something at stake here" means — it decides
+   *  whether the DO keeps a liveness deadline armed and whether a failed or lost
+   *  wake is retried. */
+  #pendingWork(): number {
+    const row = [
+      ...this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM runs WHERE status IN ('queued','dispatched','running','stopping')`,
+      ),
+    ][0];
+    return Number(row?.n ?? 0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Liveness and recovery
+  //
+  // THE BUG CLASS THIS SECTION EXISTS FOR: a state that cannot advance without an
+  // external event. A substrate evicts an instance — routine on Cloudflare, one
+  // `docker rm -f` locally — and tells nobody. Everything Mari needs in order to
+  // come back already existed (snapshot, epoch fencing, restore, adapter resume);
+  // what did not exist was the TRIGGER. So: the supervisor's socket closing arms a
+  // grace deadline, a computer with work in flight is health-checked on a cadence,
+  // and a computer whose instance the substrate says is gone is recovered — COLD
+  // at its last manifest head (its truth is the chunk store, spec 4.1), one
+  // content-free state event, in-flight runs degraded honestly (spec 5.6), and a
+  // fresh instance under a NEW epoch when there is work to do.
+  // ---------------------------------------------------------------------------
+
+  /** True when a socket that completed `hello` for the CURRENT epoch is attached.
+   *  The cheapest and strongest proof that a computer is really AWAKE. */
+  #liveSupervisor(): boolean {
+    return this.#supervisor !== null && this.#isCurrentSupervisor(this.#supervisor);
+  }
+
+  #supervisorGraceMs(): number {
+    return numberVar(this.env.SUPERVISOR_GRACE_MS) ?? DEFAULT_SUPERVISOR_GRACE_MS;
+  }
+
+  #livenessMs(): number {
+    return numberVar(this.env.LIVENESS_MS) ?? DEFAULT_LIVENESS_MS;
+  }
+
+  #coldFinalizeMs(): number {
+    return numberVar(this.env.COLD_FINALIZE_MS) ?? DEFAULT_COLD_FINALIZE_MS;
+  }
+
+  #wakeTimeoutMs(): number {
+    return numberVar(this.env.WAKE_TIMEOUT_MS) ?? DEFAULT_WAKE_TIMEOUT_MS;
+  }
+
+  /** Race `promise` against a budget. The loser is never awaited again, and its
+   *  rejection is swallowed so a hung platform call cannot surface later as an
+   *  unhandled rejection crossing the DO boundary. */
+  async #bounded<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`substrate ${what} exceeded ${ms} ms`)), ms);
+    });
+    try {
+      promise.catch(() => undefined);
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Ask the substrate whether this computer's instance still exists.
+   *
+   * A driver that declares provider.ts's liveness capability answers precisely
+   * (Docker: `inspect`, where a removed container is a 404; Cloudflare: `running`
+   * plus the platform's own refusal). A driver that does not is probed through
+   * spec 3.5's `exec` — the cheapest command that proves a process can run there.
+   * A refusal from that probe cannot be classified without the driver's help, so
+   * it is `unknown`, never `gone`: the caller bounds how many `unknown`s it will
+   * take (LIVENESS_STRIKES_MAX) instead of guessing that a user's computer was
+   * destroyed.
+   */
+  async #probeInstance(): Promise<InstanceStatus> {
+    const handle = this.#meta.handle;
+    if (!handle) return 'gone';
+    this.#probeCount++;
+    const budget = Math.max(1_000, Math.min(this.#wakeTimeoutMs(), 15_000));
+    const declared = this.substrate.instanceStatus;
+    try {
+      if (declared) {
+        return await this.#bounded(declared.call(this.substrate, handle), budget, 'instanceStatus');
+      }
+      await this.#bounded(
+        this.substrate.exec(handle, LIVENESS_PROBE_ARGV, { cwd: '/' }),
+        budget,
+        'liveness exec',
+      );
+      // Any answer at all — including a non-zero exit — means a process ran.
+      return 'alive';
+    } catch (err) {
+      console.warn(
+        `mari: liveness probe inconclusive computer=${this.#meta.computerId ?? '?'} ` +
+          `epoch=${this.#meta.epoch}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 'unknown';
+    }
+  }
+
+  /** Destroy the recorded instance, best effort, and forget it. A destroy that
+   *  fails must not wedge the computer: the resource is unusable to Mari either
+   *  way (its supervisor is fenced out by the next epoch, spec 4.1), so the
+   *  failure is RECORDED and the transition continues. */
+  async #tearDownInstance(context: string): Promise<void> {
+    const handle = this.#meta.handle;
+    if (!handle) return;
+    try {
+      await this.#bounded(this.substrate.destroy(handle), this.#wakeTimeoutMs(), 'destroy');
+    } catch (err) {
+      this.#recordIncident('destroy_failed');
+      console.warn(
+        `mari: destroy failed computer=${this.#meta.computerId ?? '?'} handle=${handle.id} ` +
+          `context=${context}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    this.#meta.handle = null;
+  }
+
+  /**
+   * The computer's instance is gone (or unusable). Land the computer where it
+   * truthfully is and get the work moving again.
+   *
+   * WHAT RECOVERY IS: the chunk store is the home of the computer (spec §2), so a
+   * computer whose substrate resources have vanished is COLD **at its last
+   * manifest head** — the head is not touched, and nothing is invented. The
+   * resources are destroyed best-effort, the fencing token is dropped, one
+   * content-free `state` event goes out (spec 6.2/6.3), in-flight runs take the
+   * defined degradation (see `#degradeInFlightRuns`), and if there is work to do
+   * the computer is woken again — which materializes a FRESH instance and mints a
+   * NEW epoch, so the dead generation can never advance the head even if it turns
+   * out to be alive somewhere (spec 4.1, contracts.md §6).
+   */
+  async #recover(
+    reason: IncidentKind,
+    options: { rewake?: boolean } = {},
+  ): Promise<void> {
+    const inFlight = this.#recoveryInFlight;
+    if (inFlight) return inFlight;
+    const p = this.#recoverInner(reason, options.rewake ?? true);
+    this.#recoveryInFlight = p;
+    try {
+      await p;
+    } finally {
+      this.#recoveryInFlight = null;
+    }
+  }
+
+  async #recoverInner(reason: IncidentKind, rewake: boolean): Promise<void> {
+    const computer = this.#meta.computerId ?? 'unknown';
+    const deadEpoch = this.#meta.epoch;
+    const hadWork = this.#pendingWork() > 0;
+    this.#recordIncident(reason);
+    console.warn(
+      `mari: recovering computer=${computer} epoch=${deadEpoch} reason=${reason} ` +
+        `state=${this.#meta.state} pendingWork=${hadWork}`,
+    );
+
+    await this.#tearDownInstance(`recover:${reason}`);
+    this.#meta.token = null;
+    this.#meta.state = 'cold';
+    this.#meta.coldPending = false;
+    this.#meta.generationAt = null;
+    this.#meta.supervisorSeen = false;
+    this.#meta.supervisorLostAt = null;
+    this.#meta.livenessStrikes = 0;
+    this.#meta.recoveryStreak += 1;
+    this.#closeAwakeStretch();
+    this.#setDeadline('liveness', null);
+    this.#setDeadline('cold', null);
+    this.#setDeadline('waking', null);
+    this.#setDeadline('tier', null);
+    // The dead generation's socket, if it is somehow still open, is finished here:
+    // it cannot authenticate again (the token is gone) and it must not be handed
+    // work by `#dispatchQueued`.
+    this.#dropSupervisorSockets('substrate lost');
+    await this.#persist();
+    await this.#syncFleetState();
+    // Content-free, and the UI's whole notification of this (spec 6.2/6.3): the
+    // computer is COLD now, at the head the fleet view already renders from.
+    this.#emit({ type: 'state', state: 'cold' });
+
+    // Runs never silently disappear (spec 5.1).
+    this.#degradeInFlightRuns();
+    await this.#persist();
+
+    if (!rewake) return;
+    if (this.#meta.recoveryStreak > RECOVERY_STREAK_MAX) {
+      // Recovering again would materialize an instance that has failed to produce
+      // a supervisor RECOVERY_STREAK_MAX times running (a broken image, a
+      // substrate refusing to run it). Stop spending money on it: the computer is
+      // COLD, its work is still queued (spec 5.1), and the incident log says why.
+      this.#recordIncident('recovery_exhausted');
+      console.warn(
+        `mari: recovery budget spent computer=${computer} streak=${this.#meta.recoveryStreak}; ` +
+          `leaving it COLD with ${this.#pendingWork()} run(s) queued`,
+      );
+      await this.#persist();
+      await this.#armAlarm();
+      return;
+    }
+    if (hadWork || this.#hasQueuedRuns()) {
+      // Work was in flight or is waiting: bring the computer up again on a fresh
+      // instance. A run that a resume can continue needs the computer for that
+      // (spec 5.6), and a queued run has never run at all.
+      this.#wakeInBackground();
+      return;
+    }
+    await this.#armAlarm();
+  }
+
+  /**
+   * Runs that were in flight when the computer's instance died (spec 5.6's
+   * degradation, applied by the control plane because the supervisor that owned
+   * them no longer exists).
+   *
+   * Two cases, and the line between them is whether the run PROVABLY never began:
+   *
+   *  - **No start, no journal byte, no pre-run manifest** — it was handed to a
+   *    supervisor that died before acking it, so it never ran. It is RE-QUEUED and
+   *    the dispatch latch released: starting it now is indistinguishable from
+   *    starting it the first time, which is exactly the rule marid uses for a
+   *    replay after a rollback (decisions.md appendix, "safe to replay"). Without
+   *    this the run is lost forever — `dispatched = 1` and no supervisor will ever
+   *    be handed it again.
+   *  - **It ran** — the journal is left EXACTLY as it is (spec 4.2: the journal in
+   *    the control plane is the truth) and the run is marked `interrupted`, with
+   *    one content-free attention event so the user is told (spec 6.2). No
+   *    completion is fabricated: the run did not complete. If a wake follows and
+   *    the run's agent adapter declares a resume, marid continues it under the
+   *    same run id and `run_started` puts it back to `running`.
+   */
+  #degradeInFlightRuns(): void {
+    const rows = [
+      ...this.ctx.storage.sql.exec<SqlRow>(
+        `SELECT id, startedAt, preManifest, requeues FROM runs WHERE status IN ('dispatched','running','stopping')`,
+      ),
+    ];
+    const now = Date.now();
+    for (const row of rows) {
+      const id = String(row['id']);
+      const ran =
+        row['startedAt'] != null ||
+        row['preManifest'] != null ||
+        this.#runHead(id).nextOffset > 0 ||
+        // Bytes still in the coalescing buffer count: they are output this run
+        // produced, they are simply younger than one flush window (FLUSH_MS).
+        (this.#pending.get(id)?.len ?? 0) > 0;
+      // A run that never began is re-queued — ONCE. A run whose machine dies every
+      // time it is handed over is not a run that keeps deserving a fresh machine:
+      // it may well be what killed it (the e2e that tears a microVM down does it
+      // from inside a run), and re-queueing forever would materialize instances
+      // until the recovery budget ran out. One retry, then the same honest
+      // degradation an interrupted run gets.
+      const retriable = Number(row['requeues'] ?? 0) < MAX_RUN_REQUEUES;
+      if (!ran && retriable) {
+        this.ctx.storage.sql.exec(
+          `UPDATE runs SET status = 'queued', dispatched = 0, dispatchedAt = NULL, epoch = 0,
+             requeues = requeues + 1
+            WHERE id = ? AND status IN ('dispatched','running','stopping')`,
+          id,
+        );
+        this.#emit({ type: 'run', runId: id, state: 'pending' });
+        continue;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE runs SET status = 'interrupted', endedAt = COALESCE(endedAt, ?) WHERE id = ?`,
+        now,
+        id,
+      );
+      this.#raiseInterrupted(id);
+      this.#emit({ type: 'run', runId: id, state: 'failed' });
+    }
+  }
+
+  /** One content-free attention event for an interrupted run, at most one badge
+   *  at a time. marid raises the same event when it restarts and finds the run
+   *  unfinished (decisions.md appendix); the user must not get two notifications
+   *  for one interruption, and `#onAttention` applies the same rule from the other
+   *  direction. */
+  #raiseInterrupted(run: string): void {
+    if (this.#hasUndismissedInterrupted(run)) return;
+    this.#onAttention(run, 'interrupted');
+  }
+
+  #hasUndismissedInterrupted(run: string): boolean {
+    const row = [
+      ...this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM attention WHERE run = ? AND kind = 'interrupted' AND dismissed = 0`,
+        run,
+      ),
+    ][0];
+    return Number(row?.n ?? 0) > 0;
+  }
+
+  /** Close every supervisor socket and forget the generation's authentication. */
+  #dropSupervisorSockets(why: string): void {
+    for (const socket of [...this.#authEpoch.keys()]) {
+      try {
+        socket.close(1001, why);
+      } catch {
+        // Already closed; the map entry below is what matters.
+      }
+    }
+    this.#authEpoch.clear();
+    if (this.#supervisor) {
+      try {
+        this.#supervisor.close(1001, why);
+      } catch {
+        // Already closed.
+      }
+    }
+    this.#supervisor = null;
+  }
+
+  /** Record a content-free incident (see {@link IncidentKind}). */
+  #recordIncident(kind: IncidentKind): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO incident (kind, at, epoch) VALUES (?, ?, ?)`,
+      kind,
+      Date.now(),
+      this.#meta.epoch,
+    );
+    this.ctx.storage.sql.exec(
+      `DELETE FROM incident WHERE id NOT IN (SELECT id FROM incident ORDER BY id DESC LIMIT ?)`,
+      INCIDENT_KEEP,
+    );
+  }
+
+  /** Recorded incidents, newest first (ops, the detail view, and tests). */
+  async listIncidents(limit = 50): Promise<Incident[]> {
+    const rows = [
+      ...this.ctx.storage.sql.exec<{ id: number; kind: string; at: number; epoch: number }>(
+        `SELECT id, kind, at, epoch FROM incident ORDER BY id DESC LIMIT ?`,
+        Math.max(1, Math.min(INCIDENT_KEEP, Math.trunc(limit))),
+      ),
+    ];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      kind: String(r.kind) as IncidentKind,
+      at: Number(r.at),
+      epoch: Number(r.epoch),
+    }));
+  }
+
+  // ---- deadline slots (one alarm, several policies) ----
+
+  #deadlineAt(name: DeadlineName): number | null {
+    switch (name) {
+      case 'wakeRetry':
+        return this.#meta.wakeRetryAt;
+      case 'waking':
+        return this.#meta.wakingAt;
+      case 'liveness':
+        return this.#meta.livenessAt;
+      case 'cold':
+        return this.#meta.coldAt;
+      case 'tier':
+        return this.#meta.tierAt;
+    }
+  }
+
+  #setDeadline(name: DeadlineName, at: number | null): void {
+    switch (name) {
+      case 'wakeRetry':
+        this.#meta.wakeRetryAt = at;
+        return;
+      case 'waking':
+        this.#meta.wakingAt = at;
+        return;
+      case 'liveness':
+        this.#meta.livenessAt = at;
+        return;
+      case 'cold':
+        this.#meta.coldAt = at;
+        return;
+      case 'tier':
+        this.#meta.tierAt = at;
+        return;
+    }
+  }
+
+  /** How long to wait before re-running a deadline whose handler threw. */
+  #retryWindowFor(name: DeadlineName): number {
+    switch (name) {
+      case 'liveness':
+        return this.#livenessMs();
+      case 'cold':
+        return this.#coldFinalizeMs();
+      case 'waking':
+        return this.#wakeTimeoutMs();
+      case 'wakeRetry':
+        return WAKE_RETRY_MS[0] as number;
+      case 'tier':
+        return this.#warmIdleMs();
+    }
+  }
+
+  /** Point the ONE alarm at the earliest pending deadline (or clear it). */
+  async #armAlarm(): Promise<void> {
+    let earliest: number | null = null;
+    for (const name of DEADLINES) {
+      const at = this.#deadlineAt(name);
+      if (at !== null && (earliest === null || at < earliest)) earliest = at;
+    }
+    if (earliest === null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(earliest);
+  }
+
+  /** Arm the recurring liveness check, but only when something is at stake: work
+   *  in flight, or a supervisor that has gone. An idle AWAKE computer with a
+   *  healthy supervisor needs no probe — the tier deadline collects it. */
+  #armLiveness(): void {
+    if (this.#meta.state !== 'awake') {
+      this.#setDeadline('liveness', null);
+      return;
+    }
+    const atStake = this.#meta.supervisorLostAt !== null || this.#pendingWork() > 0;
+    if (!atStake) {
+      this.#setDeadline('liveness', null);
+      return;
+    }
+    const window =
+      this.#meta.supervisorLostAt !== null ? this.#supervisorGraceMs() : this.#livenessMs();
+    const at = Date.now() + window;
+    const current = this.#deadlineAt('liveness');
+    // Keep the earliest pending check rather than pushing it out on every event.
+    if (current !== null && current <= at) return;
+    this.#setDeadline('liveness', at);
+  }
+
   /**
    * The supervisor's whole configuration, handed to `materialize` as process
    * environment (crates/marid/src/config.rs; spec 3.5's materialize carries it).
@@ -762,14 +1656,45 @@ export class ComputerDO extends DurableObject<Env> {
    * that has none yet, the fleet's base-image manifest (spec §2), so a first
    * wake starts from the base image's root rather than an empty one.
    */
-  #maridEnv(computer: string, token: string): Record<string, string> {
-    const env: Record<string, string> = {
-      MARI_COMPUTER_ID: computer,
-      MARI_EPOCH: String(this.#meta.epoch),
-      MARI_TOKEN: token,
-      MARI_ROOT: this.env.COMPUTER_ROOT ?? DEFAULT_COMPUTER_ROOT,
-      MARI_STORE: this.env.STORE_URI ?? DEFAULT_STORE_URI,
-    };
+  async #maridEnv(computer: string, token: string): Promise<Record<string, string>> {
+    const env: Record<string, string> = {};
+
+    // ---- the credential vault (spec 10.1) --------------------------------
+    //
+    // "Agent credentials stay in the control plane vault. The supervisor injects
+    // credentials at run start." The injection point is marid: `start_run`
+    // carries `env_names` and marid resolves each name out of its OWN process
+    // environment (crates/marid/src/run.rs), which is exactly what keeps VALUES
+    // off the wire message (contracts.md §5.2). So the values have to arrive
+    // here, in the supervisor's process configuration, and nowhere else.
+    //
+    // Written FIRST so no vault entry can shadow a MARI_* variable: a computer
+    // whose vault held `MARI_TOKEN` or `MARI_EPOCH` would otherwise fence itself
+    // out (or hand its own token to a run). The vault is per computer, so this is
+    // also the ownership boundary — a computer never sees another's credentials.
+    if (this.#meta.computerId) {
+      try {
+        for (const s of await listSecrets(this.env.DB, this.#meta.computerId)) {
+          if (s.name.startsWith('MARI_')) continue;
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.name)) continue;
+          env[s.name] = s.value;
+        }
+      } catch (err) {
+        // A vault read that fails must not block the wake; the run then fails on
+        // a missing variable, which the agent reports, rather than the computer
+        // never coming up at all.
+        console.warn(
+          `mari: vault read failed computer=${computer}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    env.MARI_COMPUTER_ID = computer;
+    env.MARI_EPOCH = String(this.#meta.epoch);
+    env.MARI_TOKEN = token;
+    env.MARI_ROOT = this.env.COMPUTER_ROOT ?? DEFAULT_COMPUTER_ROOT;
+    env.MARI_STORE = this.env.STORE_URI ?? DEFAULT_STORE_URI;
     const base = this.env.SUPERVISOR_URL_BASE;
     if (base) {
       env.MARI_CONTROL_URL = `${base.replace(/\/+$/, '')}/supervisor/${encodeURIComponent(computer)}`;
@@ -780,16 +1705,55 @@ export class ComputerDO extends DurableObject<Env> {
   }
 
   /** AWAKE -> WARM now (used by the tier alarm and by the epoch-fencing flow to
-   *  simulate a supervisor generation change). */
+   *  simulate a supervisor generation change).
+   *
+   *  A sleep that the substrate refuses does NOT record WARM: the resources are
+   *  not in the state that claim describes, and the next wake would resume
+   *  something that is not there. WARM also gets its WARM->COLD deadline armed
+   *  here — a computer parked in WARM by anything other than the tier alarm used
+   *  to have no deadline at all, and a state with no deadline is a wedge. */
   async sleepNow(): Promise<ComputerState> {
     if (this.#meta.state === 'awake' && this.#meta.handle) {
-      await this.substrate.sleep(this.#meta.handle);
+      try {
+        await this.#bounded(this.substrate.sleep(this.#meta.handle), this.#wakeTimeoutMs(), 'sleep');
+      } catch (err) {
+        console.warn(
+          `mari: sleep refused computer=${this.#meta.computerId ?? '?'}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        const status = await this.#probeInstance();
+        if (status === 'gone') await this.#recover('substrate_lost');
+        return this.#meta.state;
+      }
       this.#meta.state = 'warm';
       this.#closeAwakeStretch();
+      this.#setDeadline('liveness', null);
+      this.#meta.supervisorLostAt = null;
+      this.#meta.armedIdleSince = this.#meta.idleSince;
+      this.#setDeadline('tier', Date.now() + this.#coldIdleMs());
+      await this.#armAlarm();
       await this.#persist();
       await this.#syncFleetState();
       this.#emit({ type: 'state', state: 'warm' });
     }
+    return this.#meta.state;
+  }
+
+  /**
+   * Deep sleep NOW on a user command: AWAKE/WARM -> COLD through the same clean
+   * path the tier alarm uses (spec 4.4 names COLD "deep sleep", spec 4.5 requires
+   * the clean stop + final manifest). A COLD computer costs only its delta in
+   * object storage, so this is the one action that actually stops a computer
+   * costing anything — waiting out the idle timer keeps paying for resources the
+   * user has already finished with.
+   *
+   * Returns the state it reached: `cold` when the transition completed inline,
+   * `awake`/`warm` while the supervisor's final-snapshot handshake is still in
+   * flight (it has its own deadline, see `#onColdDeadline`).
+   */
+  async deepSleepNow(): Promise<ComputerState> {
+    if (this.#meta.state === 'cold') return 'cold';
+    await this.#beginCold();
     return this.#meta.state;
   }
 
@@ -874,7 +1838,11 @@ export class ComputerDO extends DurableObject<Env> {
       input.runId,
       input.kind ?? 'command',
       JSON.stringify(input.argv),
-      input.cwd ?? DEFAULT_CWD,
+      // NEVER the container's `/`: a run's working directory must be inside the
+      // computer's own filesystem, the only tree that is snapshotted (spec 2,
+      // 4.1). `resolveRunCwd` maps an unset or computer-space path onto
+      // `MARI_ROOT` and leaves an already-rooted one alone.
+      resolveRunCwd(this.#computerRoot(), input.cwd),
       JSON.stringify(input.envNames ?? []),
       input.agent ?? null,
       now,
@@ -895,7 +1863,16 @@ export class ComputerDO extends DurableObject<Env> {
     if (this.#supervisor && this.#isCurrentSupervisor(this.#supervisor)) {
       dispatched = this.#dispatchQueued(this.#supervisor);
     }
-    if (dispatched === 0) this.#wakeInBackground();
+    if (dispatched === 0) {
+      this.#wakeInBackground();
+    } else {
+      // Work is in flight now, so the computer is health-checked until it is done:
+      // a supervisor that took the run and then died with its machine must not
+      // leave the run pending forever (spec 5.1).
+      this.#armLiveness();
+      await this.#armAlarm();
+      await this.#persist();
+    }
 
     return {
       runId: input.runId,
@@ -929,8 +1906,10 @@ export class ComputerDO extends DurableObject<Env> {
       computerId: input.computerId,
       runId: input.runId,
       kind: 'write',
-      argv: writeRunArgv(target, input.contentBase64),
-      cwd: root === '' ? DEFAULT_CWD : root,
+      // The run id is the staging-file token, so two writes racing on one path
+      // cannot clobber each other's temp file (runs.ts).
+      argv: writeRunArgv(target, input.contentBase64, input.runId),
+      cwd: DEFAULT_CWD,
       envNames: input.envNames ?? [],
       writePath: input.path,
     });
@@ -942,7 +1921,9 @@ export class ComputerDO extends DurableObject<Env> {
     const row = this.#runRow(runId);
     if (!row) return { ok: false, status: null, sent: false };
     const status = String(row['status'] ?? 'queued') as RunStatus;
-    if (status === 'completed' || status === 'cancelled') {
+    if (status === 'completed' || status === 'cancelled' || status === 'interrupted') {
+      // Terminal: there is no process left to stop. An interrupted run's journal
+      // and attention event stay exactly as they are (spec 5.6).
       return { ok: true, status, sent: false };
     }
     if (Number(row['dispatched'] ?? 0) === 0) {
@@ -1038,7 +2019,13 @@ export class ComputerDO extends DurableObject<Env> {
     if (!row.preManifest) {
       return this.#disposition(false, 'no_pre_run_manifest', 'pending', false);
     }
-    if (row.status !== 'completed' && row.status !== 'cancelled') {
+    if (
+      row.status !== 'completed' &&
+      row.status !== 'cancelled' &&
+      // An interrupted run is over (its supervisor and its machine are gone), and
+      // its half-finished changes are exactly what a user wants to revert.
+      row.status !== 'interrupted'
+    ) {
       return this.#disposition(false, 'run_active', 'pending', false);
     }
 
@@ -1139,7 +2126,9 @@ export class ComputerDO extends DurableObject<Env> {
       id: String(row['id']),
       kind: String(row['kind'] ?? 'command') as RunKind,
       argv: parseStringArray(row['argv']),
-      cwd: String(row['cwd'] ?? DEFAULT_CWD),
+      // The same resolution `#dispatchQueued` sends, so what a client is shown is
+      // what the supervisor was told.
+      cwd: resolveRunCwd(this.#computerRoot(), row['cwd'] == null ? '' : String(row['cwd'])),
       envNames: parseStringArray(row['envNames']),
       agent: strOrNull(row['agent']),
       status: String(row['status'] ?? 'queued') as RunStatus,
@@ -1200,7 +2189,11 @@ export class ComputerDO extends DurableObject<Env> {
             run: id,
             argv: parseStringArray(row['argv']),
             env_names: parseStringArray(row['envNames']),
-            cwd: String(row['cwd'] ?? DEFAULT_CWD),
+            // Resolved again on the way out so a row written before the root was
+            // configured (or with a NULL cwd) still names a directory inside the
+            // computer. marid's own empty-cwd fallback covers a RESUMED run only
+            // (crates/marid/src/run.rs), so an empty string must never go out.
+            cwd: resolveRunCwd(this.#computerRoot(), row['cwd'] == null ? '' : String(row['cwd'])),
           },
         });
         sent++;
@@ -1304,19 +2297,59 @@ export class ComputerDO extends DurableObject<Env> {
     // WebSocket cannot be serialized across the Worker→DO RPC boundary, so a stub
     // call could never carry a preview app's socket. This also keeps the control
     // plane a mandatory hop, which an edge tunnel to the container would not.
+    // EVERY failure below is reported, and reported as itself. A port that was
+    // never published, a port with nothing listening, and a driver that refused
+    // are three different things the user can act on; all three used to surface
+    // as an empty HTTP 500 with no log line, which is indistinguishable from a
+    // bug in the control plane.
     const proxyFetch = this.substrate.proxyFetch;
     if (proxyFetch) {
       const forwarded = new Request(request, { headers });
-      return proxyFetch.call(this.substrate, this.#meta.handle, port, forwarded);
+      try {
+        return await proxyFetch.call(this.substrate, this.#meta.handle, port, forwarded);
+      } catch (err) {
+        return this.#proxyFailed('proxy_fetch', port, err);
+      }
     }
 
-    const exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
+    let exposedUrl: string;
+    try {
+      exposedUrl = await this.substrate.exposePort(this.#meta.handle, port);
+    } catch (err) {
+      // The Docker driver's message is actionable ("include it in
+      // MaterializeSpec.ports"), so it is carried through rather than swallowed.
+      return this.#proxyFailed('expose_port', port, err);
+    }
     const target = exposedUrl.replace(/\/$/, '') + url.pathname + url.search;
     const init: RequestInit = { method: request.method, headers };
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       init.body = await request.arrayBuffer();
     }
-    return this.upstreamFetch(target, init);
+    try {
+      return await this.upstreamFetch(target, init);
+    } catch (err) {
+      // Nothing is listening on the port, or it closed the connection. This is
+      // the single most common preview failure and the user has to be able to
+      // tell it from a Mari fault.
+      return this.#proxyFailed('upstream_unreachable', port, err);
+    }
+  }
+
+  /** One shape for every preview-proxy failure: a 502 (the upstream is the thing
+   *  that failed, not this hop), a stable machine-readable reason header, the
+   *  substrate's own message, and exactly one log line. */
+  #proxyFailed(reason: string, port: number, err: unknown): Response {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `mari: preview proxy ${reason} computer=${this.#meta.computerId ?? '?'} port=${port}: ${detail}`,
+    );
+    return new Response(`preview ${reason} on port ${port}: ${detail}\n`, {
+      status: 502,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-mari-preview-error': reason,
+      },
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1350,10 +2383,29 @@ export class ComputerDO extends DurableObject<Env> {
       }
     });
     server.addEventListener('close', () => {
+      const wasCurrent = this.#authEpoch.get(server) === this.#meta.epoch;
       this.#authEpoch.delete(server);
       if (this.#supervisor === server) this.#supervisor = null;
+      // THE FIRST SIGNAL that a computer's supervisor is gone — and deliberately
+      // not treated as proof: a network blip is not a dead container, and marid
+      // reconnects with the same epoch and token. So this only schedules the
+      // grace deadline; `#onLivenessDeadline` is what asks the substrate.
+      if (wasCurrent && !this.#liveSupervisor() && this.#meta.state === 'awake') {
+        this.ctx.waitUntil(this.#onSupervisorLost());
+      }
     });
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** The current generation's supervisor socket closed while the computer is
+   *  AWAKE. Arm the grace window; nothing else changes yet. */
+  async #onSupervisorLost(): Promise<void> {
+    if (this.#meta.state !== 'awake') return;
+    if (this.#liveSupervisor()) return;
+    this.#meta.supervisorLostAt = Date.now();
+    this.#setDeadline('liveness', Date.now() + this.#supervisorGraceMs());
+    await this.#armAlarm();
+    await this.#persist();
   }
 
   /** Send to the active (last-handshook) supervisor: DO-initiated messages
@@ -1384,6 +2436,13 @@ export class ComputerDO extends DurableObject<Env> {
     // (SEC-01, CP-FENCE-INGEST-2).
     if (msg.t === 'hello') return this.#onHello(msg.c, socket);
     if (!this.#authEpoch.has(socket)) return;
+
+    // The supervisor said something on an authenticated socket. This is the
+    // liveness signal that keeps a healthy computer from ever being probed: a
+    // journal frame or a heartbeat (every 5 s during a run) is proof that the
+    // machine and its supervisor are both there. In memory only — see the field.
+    this.#lastSupervisorAt = Date.now();
+    this.#meta.livenessStrikes = 0;
 
     // `head_advance_request` is fenced by the CAS itself (contracts.md §6): an
     // authenticated-but-stale supervisor still receives `accepted:false` +
@@ -1468,6 +2527,18 @@ export class ComputerDO extends DurableObject<Env> {
     // (and a future generation's wake fences it out automatically).
     this.#supervisor = socket;
     this.#authEpoch.set(socket, this.#meta.epoch);
+    // A supervisor of the current generation is here: this computer is genuinely
+    // AWAKE, the grace window is closed, and the recovery budget is restored
+    // (a recovery that produced a working generation is not part of a loop).
+    this.#lastSupervisorAt = Date.now();
+    this.#meta.supervisorSeen = true;
+    this.#meta.supervisorLostAt = null;
+    this.#meta.livenessStrikes = 0;
+    this.#meta.recoveryStreak = 0;
+    this.#meta.wakeFailures = 0;
+    if (this.#meta.generationAt === null) this.#meta.generationAt = Date.now();
+    this.#armLiveness();
+    await this.#armAlarm();
     await this.#persist();
     // Reply with the durably-acked offset per run so it resumes correctly.
     const acked: RunOffset[] = this.#allRunHeads();
@@ -1666,7 +2737,23 @@ export class ComputerDO extends DurableObject<Env> {
 
   async #flushAll(): Promise<void> {
     const runs = [...this.#pending.keys()];
-    for (const run of runs) this.#flushRun(run);
+    for (const run of runs) {
+      try {
+        this.#flushRun(run);
+      } catch (err) {
+        // A flush that cannot write must not take the runtime down with it. The
+        // case that actually happens is shutdown: this timer is scheduled 100 ms
+        // out, and a private instance whose storage has already been closed
+        // answers "statement has been finalized". The bytes are not lost — marid
+        // re-sends from the offset the last `journal_ack` named (contracts.md
+        // §5.2) — but the operator has to know the tail did not land, and the
+        // offsets are all that is said about it (spec 6.3: never content).
+        console.warn(
+          `mari: journal flush failed computer=${this.#meta.computerId ?? '?'} run=${run}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     // Persisting head counters is done inside #flushRun via SQL; nothing else.
     void runs;
   }
@@ -1842,6 +2929,13 @@ export class ComputerDO extends DurableObject<Env> {
 
   #onAttention(run: string, kind: string): void {
     const at = Date.now();
+    // ONE badge per interruption. marid raises `attention{interrupted}` when it
+    // restarts and finds a run it cannot continue (decisions.md appendix), and the
+    // control plane raises the same event when it recovers a computer whose
+    // substrate died under that run — the same interruption seen from both sides.
+    // A user must be told once, not twice; once the badge is dismissed, a NEW
+    // interruption raises a new one.
+    if (kind === 'interrupted' && this.#hasUndismissedInterrupted(run)) return;
     this.ctx.storage.sql.exec(
       `INSERT INTO attention (run, kind, at, dismissed) VALUES (?, ?, ?, 0)`,
       run,
@@ -1878,20 +2972,7 @@ export class ComputerDO extends DurableObject<Env> {
     if (this.#meta.coldPending && reason === 'final') {
       // The supervisor stopped cleanly and wrote the final manifest: record it
       // as the head, tear down the substrate, and go COLD (spec 4.4/4.5).
-      this.#setHead(manifest);
-      this.#meta.coldPending = false;
-      if (this.#meta.handle) {
-        await this.substrate.destroy(this.#meta.handle);
-        this.#meta.handle = null;
-      }
-      this.#meta.token = null;
-      this.#meta.state = 'cold';
-      this.#closeAwakeStretch();
-      await this.#persist();
-      await this.#syncFleetState();
-      this.#emit({ type: 'state', state: 'cold' });
-      this.#supervisor?.close(1000, 'cold');
-      this.#supervisor = null;
+      await this.#finalizeCold(manifest);
     }
   }
 
@@ -2001,31 +3082,234 @@ export class ComputerDO extends DurableObject<Env> {
       // tearing the computer down when the supervisor's `snapshot_written{final}`
       // lands. The next idle deadline asks again.
       this.#meta.coldPending = false;
+      this.#setDeadline('cold', null);
       await this.#armTier(this.#warmIdleMs());
     }
   }
 
-  /** Arm the next tier alarm and AWAIT its scheduling (the alarm write must be
-   *  durable before callers return, else `runDurableObjectAlarm` may race it). */
+  /** Arm the next tier deadline and AWAIT the alarm write (it must be durable
+   *  before callers return, else `runDurableObjectAlarm` may race it). */
   async #armTier(afterMs: number): Promise<void> {
     this.#meta.armedIdleSince = this.#meta.idleSince;
-    await this.ctx.storage.setAlarm(Date.now() + afterMs);
+    this.#setDeadline('tier', Date.now() + afterMs);
+    this.#armLiveness();
+    await this.#armAlarm();
   }
 
+  /**
+   * The one alarm, several deadlines (see DEADLINES).
+   *
+   * Each slot is a policy that must be able to advance WITHOUT an external event:
+   * a wake retry, the WAKING watchdog, the liveness check, the COLD handshake
+   * deadline, the tier policy. Every one of them was, at some point, either absent
+   * or fighting the tier policy for the single alarm slot — which is precisely how
+   * a computer ends up in a state nothing can move it out of.
+   */
   override async alarm(): Promise<void> {
-    // A failed wake with a run still queued owns this alarm (armed only while
-    // COLD, where the tier policy has nothing scheduled). Retry the wake behind
-    // the request, exactly as the original trigger did (spec 8.3).
-    if (this.#meta.wakeRetryAt !== null) {
-      this.#meta.wakeRetryAt = null;
-      await this.#persist();
-      if (this.#meta.state !== 'awake' && this.#hasQueuedRuns()) this.#wakeInBackground();
-      return;
+    const now = Date.now();
+    let due: DeadlineName[] = DEADLINES.filter((name) => {
+      const at = this.#deadlineAt(name);
+      return at !== null && at <= now;
+    });
+    if (due.length === 0) {
+      // Fired ahead of its scheduled time. Both test harnesses do exactly this —
+      // `runDurableObjectAlarm` (workers pool) and `runAlarmNow` (Node) are how a
+      // suite simulates the passage of idle time — and the platform is free to fire
+      // early too. The earliest pending deadline is the one this alarm was for.
+      let earliest: DeadlineName | null = null;
+      for (const name of DEADLINES) {
+        const at = this.#deadlineAt(name);
+        if (at === null) continue;
+        const best = earliest === null ? null : this.#deadlineAt(earliest);
+        if (best === null || at < best) earliest = name;
+      }
+      if (earliest === null) return;
+      due = [earliest];
     }
 
-    // Only progress if no activity happened since the alarm was armed. Under the
-    // test harness `runDurableObjectAlarm` fires this regardless of wall-clock,
-    // which is exactly how idle-time passage is simulated.
+    for (const name of due) {
+      // Clear the slot BEFORE running the handler: a handler that re-arms (the
+      // tier's WARM->COLD, the recurring liveness check) sets it again, and a
+      // handler that throws must not leave a deadline that can never be reached
+      // pinned in front of every other policy.
+      this.#setDeadline(name, null);
+      await this.#persist();
+      try {
+        switch (name) {
+          case 'wakeRetry':
+            await this.#onWakeRetryDeadline();
+            break;
+          case 'waking':
+            await this.#onWakingDeadline();
+            break;
+          case 'liveness':
+            await this.#onLivenessDeadline();
+            break;
+          case 'cold':
+            await this.#onColdDeadline();
+            break;
+          case 'tier':
+            await this.#onTierDeadline();
+            break;
+        }
+      } catch (err) {
+        // A policy that throws must not silently take its own deadline with it —
+        // that is the wedge again, one level up. Log it and put the deadline back
+        // one window out, so the policy keeps running.
+        console.warn(
+          `mari: ${name} deadline failed computer=${this.#meta.computerId ?? '?'}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        if (this.#deadlineAt(name) === null) {
+          this.#setDeadline(name, Date.now() + this.#retryWindowFor(name));
+        }
+      }
+    }
+    await this.#persist();
+    await this.#armAlarm();
+  }
+
+  /** A wake that failed with work still pending: try again, behind the request,
+   *  exactly as the original trigger did (spec 8.3). */
+  async #onWakeRetryDeadline(): Promise<void> {
+    if (this.#meta.state === 'awake') return;
+    if (this.#pendingWork() > 0) this.#wakeInBackground();
+  }
+
+  /**
+   * A computer left in WAKING. WAKING is a transition, not a resting place: no
+   * tier deadline acts on it, so without this watchdog an object evicted (or a
+   * private instance restarted) between "state = waking" and the substrate's
+   * answer leaves a computer nothing can ever move again.
+   */
+  async #onWakingDeadline(): Promise<void> {
+    if (this.#meta.state !== 'waking') return;
+    if (this.#wakeInFlight) {
+      // A wake IS running (a slow materialize, or a driver retrying a platform
+      // that is refusing). Give it another window rather than fighting it.
+      this.#setDeadline('waking', Date.now() + this.#wakeTimeoutMs());
+      return;
+    }
+    this.#recordIncident('wake_abandoned');
+    console.warn(
+      `mari: WAKING with no wake in flight computer=${this.#meta.computerId ?? '?'} ` +
+        `epoch=${this.#meta.epoch}; rolling it back`,
+    );
+    // Roll back to the state the substrate is actually in, retry if work is
+    // pending, and tell the fleet — the same path a refused wake takes.
+    await this.#failWake(false);
+  }
+
+  /**
+   * Run the liveness check NOW and report what it concluded.
+   *
+   * The same code the liveness deadline runs, exposed as an RPC: an operator
+   * asking "is this computer really alive?" and the alarm asking it are the same
+   * question, and there must not be two implementations of the answer.
+   */
+  async healthCheck(): Promise<{ state: ComputerState; verdict: LivenessVerdict; probes: number }> {
+    const before = this.#probeCount;
+    const verdict = await this.#onLivenessDeadline();
+    await this.#persist();
+    await this.#armAlarm();
+    return { state: this.#meta.state, verdict, probes: this.#probeCount - before };
+  }
+
+  /**
+   * The liveness deadline: either the grace window after the supervisor's socket
+   * closed, or the recurring health check while work is in flight.
+   *
+   * The cheap answers come first. A supervisor that spoke inside the last window
+   * is its own proof (marid heartbeats every 5 s during a run), so a healthy
+   * computer never costs a substrate call. Only silence gets one.
+   */
+  async #onLivenessDeadline(): Promise<LivenessVerdict> {
+    if (this.#meta.state !== 'awake') return 'not_awake';
+    const live = this.#liveSupervisor();
+    const pending = this.#pendingWork();
+    if (live && pending === 0) {
+      // Nothing at stake: the tier deadline collects an idle computer.
+      this.#meta.supervisorLostAt = null;
+      return 'idle';
+    }
+    const spokeRecently =
+      this.#lastSupervisorAt > 0 && Date.now() - this.#lastSupervisorAt < this.#livenessMs();
+    if (live && spokeRecently) {
+      this.#meta.livenessStrikes = 0;
+      this.#armLiveness();
+      return 'supervised';
+    }
+
+    const status = await this.#probeInstance();
+    if (status === 'gone') {
+      await this.#recover('substrate_lost');
+      return 'recovered';
+    }
+    if (status === 'unknown') {
+      this.#meta.livenessStrikes += 1;
+      if (this.#meta.livenessStrikes >= LIVENESS_STRIKES_MAX) {
+        // Not a guess that it is gone (provider.ts is explicit that `unknown` is
+        // not `gone`): a computer whose supervisor is absent AND whose substrate
+        // cannot be asked is unusable, and recovery is safe under the epoch rule.
+        await this.#recover('substrate_unknown');
+        return 'recovered';
+      }
+      this.#armLiveness();
+      return 'inconclusive';
+    }
+
+    // The instance is alive.
+    if (!live) {
+      if (pending > 0) {
+        // A machine with no supervisor cannot run the work that is waiting: the
+        // generation is replaced (fresh instance, new epoch, restore from the head)
+        // rather than left to look AWAKE while nothing happens.
+        await this.#recover('supervisor_lost');
+        return 'recovered';
+      }
+      // Nothing to run: leave it to the tier deadline instead of paying for a
+      // materialize nobody asked for.
+      this.#meta.supervisorLostAt = null;
+      return 'unsupervised_idle';
+    }
+    // A socket that is open but has said nothing for a whole window while work is
+    // in flight — the shape a torn-down microVM took on a real deployment, where
+    // the DO's supervisor socket stayed open and the computer read `awake` 15
+    // minutes later. Bounded, then recovered.
+    this.#meta.livenessStrikes += 1;
+    if (this.#meta.livenessStrikes >= LIVENESS_STRIKES_MAX) {
+      await this.#recover('supervisor_lost');
+      return 'recovered';
+    }
+    this.#armLiveness();
+    return 'mute';
+  }
+
+  /**
+   * The AWAKE/WARM → COLD handshake did not complete on its own.
+   *
+   * `#beginCold` asked the supervisor for a clean stop and a final manifest (spec
+   * 4.5). If that supervisor is dead the answer never comes — and before this
+   * deadline the computer stayed AWAKE with NO alarm armed, forever: the e2e suite
+   * had to nudge it with `POST /wake` and count the nudges. Finalize from the last
+   * known head instead, and record that the final snapshot was MISSED rather than
+   * reporting a clean transition.
+   */
+  async #onColdDeadline(): Promise<void> {
+    if (!this.#meta.coldPending) return; // completed, or superseded by activity
+    if (this.#meta.state === 'cold') return;
+    this.#recordIncident('final_snapshot_missed');
+    console.warn(
+      `mari: cold finalize timed out computer=${this.#meta.computerId ?? '?'} ` +
+        `epoch=${this.#meta.epoch}; finalizing from head=${this.#meta.head ?? 'none'} ` +
+        `WITHOUT the supervisor's final snapshot (spec 4.5)`,
+    );
+    await this.#finalizeCold(null);
+  }
+
+  /** The tier policy (spec 4.4). */
+  async #onTierDeadline(): Promise<void> {
+    // Only progress if no activity happened since the deadline was armed.
     if (this.#meta.armedIdleSince !== this.#meta.idleSince) {
       // Stale (activity reset the timer): re-arm from the current idle mark.
       if (this.#meta.state === 'awake') await this.#armTier(this.#warmIdleMs());
@@ -2047,11 +3331,32 @@ export class ComputerDO extends DurableObject<Env> {
         await this.#beginCold();
         return;
       }
-      // AWAKE -> WARM.
-      if (this.#meta.handle) await this.substrate.sleep(this.#meta.handle);
+      // AWAKE -> WARM. A substrate that cannot even be asked to sleep is not
+      // WARM, whatever this object would like to record: the failure is checked
+      // rather than thrown out of the alarm, because an alarm that throws leaves
+      // the computer exactly where it was — AWAKE, with the deadline consumed.
+      if (this.#meta.handle) {
+        try {
+          await this.#bounded(this.substrate.sleep(this.#meta.handle), this.#wakeTimeoutMs(), 'sleep');
+        } catch (err) {
+          console.warn(
+            `mari: sleep failed computer=${this.#meta.computerId ?? '?'} ` +
+              `epoch=${this.#meta.epoch}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          // Is the instance even there? If it is gone this is the eviction path;
+          // if it is alive but unsleepable, take the computer COLD instead — the
+          // chunk store holds it either way (spec 4.1) and a wedge is not an
+          // option.
+          const status = await this.#probeInstance();
+          if (status === 'gone') await this.#recover('substrate_lost');
+          else await this.#beginCold();
+          return;
+        }
+      }
       this.#meta.state = 'warm';
       this.#closeAwakeStretch();
-      // Arm the WARM -> COLD alarm (idle mark unchanged => next alarm matches).
+      this.#setDeadline('liveness', null);
+      // Arm the WARM -> COLD deadline (idle mark unchanged => next one matches).
       await this.#armTier(this.#coldIdleMs());
       await this.#persist();
       await this.#syncFleetState();
@@ -2073,7 +3378,7 @@ export class ComputerDO extends DurableObject<Env> {
    *  Reached from WARM on a substrate that has WARM, and from AWAKE directly on
    *  one that does not. */
   async #beginCold(): Promise<void> {
-    if (this.#supervisor) {
+    if (this.#liveSupervisor()) {
       // Spec 4.5: the supervisor stops each agent session in a clean state
       // before COLD. It can only do that while it is RUNNING, so a substrate
       // whose WARM state freezes the guest is resumed first (Docker `pause`;
@@ -2081,23 +3386,80 @@ export class ComputerDO extends DurableObject<Env> {
       // frozen socket buffer and the computer would never reach COLD.
       const handle = this.#meta.handle;
       if (handle && (this.substrate as FreezingSubstrate).resumeBeforeCold?.(handle)) {
-        await this.substrate.wake(handle);
+        try {
+          await this.#bounded(this.substrate.wake(handle), this.#wakeTimeoutMs(), 'resume for cold');
+        } catch (err) {
+          // The resource cannot be resumed, so no supervisor can write the final
+          // manifest from it. Finalize from the head rather than waiting for an
+          // answer that cannot come.
+          console.warn(
+            `mari: resume-before-cold failed computer=${this.#meta.computerId ?? '?'}: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+          this.#recordIncident('final_snapshot_missed');
+          await this.#finalizeCold(null);
+          return;
+        }
       }
       this.#meta.coldPending = true;
+      // THE HANDSHAKE GETS A DEADLINE. Everything after this point depends on a
+      // supervisor answering, and a supervisor whose container is already gone
+      // never will — that is the stall the e2e suite had to nudge around.
+      this.#setDeadline('cold', Date.now() + this.#coldFinalizeMs());
+      await this.#armAlarm();
       await this.#persist();
       this.#sendControl({ t: 'prepare_for_cold' });
       return;
     }
-    if (this.#meta.handle) {
-      await this.substrate.destroy(this.#meta.handle);
-      this.#meta.handle = null;
+    // Nobody can write a manifest: finalize from the last known head. This is not
+    // a silent success — a COLD reached without the snapshot spec 4.5 asks for is
+    // recorded, because work since the last snapshot is genuinely not in the
+    // chunk store.
+    if (this.#meta.state === 'awake' && this.#meta.handle) {
+      this.#recordIncident('final_snapshot_missed');
     }
+    await this.#finalizeCold(null);
+  }
+
+  /**
+   * Complete the transition to COLD: record the final manifest if there is one,
+   * destroy the substrate resources, drop the fencing token, and settle.
+   *
+   * Shared by every road to COLD — the supervisor's `snapshot_written{final}`, the
+   * handshake deadline, and a `#beginCold` with no supervisor to ask — so a COLD
+   * computer always looks the same afterwards: no handle, no token, one `state`
+   * event, and a wake retry armed if work is still queued (otherwise a run
+   * enqueued during the transition would sit there with nothing to run it).
+   */
+  async #finalizeCold(finalManifest: ManifestId | null): Promise<void> {
+    if (finalManifest) this.#setHead(finalManifest);
+    this.#meta.coldPending = false;
+    await this.#tearDownInstance('cold finalize');
     this.#meta.token = null;
     this.#meta.state = 'cold';
+    this.#meta.generationAt = null;
+    this.#meta.supervisorSeen = false;
+    this.#meta.supervisorLostAt = null;
+    this.#meta.livenessStrikes = 0;
     this.#closeAwakeStretch();
+    this.#setDeadline('liveness', null);
+    this.#setDeadline('cold', null);
+    this.#setDeadline('tier', null);
+    this.#setDeadline('waking', null);
     await this.#persist();
     await this.#syncFleetState();
     this.#emit({ type: 'state', state: 'cold' });
+    this.#dropSupervisorSockets('cold');
+
+    // A run that was handed to the supervisor that just went away, or one queued
+    // during the transition, must still happen (spec 5.1).
+    this.#degradeInFlightRuns();
+    if (this.#hasQueuedRuns()) {
+      this.#meta.wakeFailures = 0;
+      this.#meta.wakeRetryAt = Date.now() + (WAKE_RETRY_MS[0] as number);
+    }
+    await this.#persist();
+    await this.#armAlarm();
   }
 
   // ---------------------------------------------------------------------------

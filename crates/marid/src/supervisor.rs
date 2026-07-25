@@ -13,11 +13,31 @@
 //! per connection the supervisor tracks how far it has sent, and on reconnect it
 //! resets that mark to the control plane's last-acked offset (from `HelloAck`)
 //! and re-reads — so a resumed stream has no gap and no duplicate bytes.
+//!
+//! # Staying alive, and dying properly
+//!
+//! Two things keep this daemon usable on a substrate that evicts containers and
+//! reaps idle sockets:
+//!
+//! - A **supervisor-level keepalive** (a WebSocket ping every
+//!   [`Config::keepalive_ms`]) that exists whether or not a run does. Spec 5.4's
+//!   heartbeat holds the *machine* awake during a run; it says nothing about an
+//!   AWAKE computer sitting with no run, whose idle control socket was measured
+//!   dying at ~270 s with a 1006 and no close frame. A drop that follows silence
+//!   is logged as an idle timeout, not as a failure, and a socket that stops
+//!   answering entirely is declared dead rather than hung.
+//! - A **graceful shutdown on SIGTERM/SIGINT** that does exactly what
+//!   `PrepareForCold` does — stop each run cleanly, flush the journal segments,
+//!   write the final manifest, advance the head — because on a substrate where
+//!   eviction is routine and the disk is wiped on every stop, that signal is the
+//!   only warning the computer gets. With `containers_pid_namespace` on, an init
+//!   process that does not handle SIGTERM receives nothing at all, so the whole
+//!   eviction grace window would be spent doing nothing.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -31,9 +51,9 @@ use mari_proto::{
 };
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_tungstenite::connect_async;
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::adapters::AdapterSet;
 use crate::config::Config;
@@ -42,13 +62,13 @@ use crate::journal::FRAME_CHUNK;
 use crate::run::RunManager;
 use crate::state::DurableState;
 use crate::store_uri::open_store;
-use crate::ws::{Backoff, decode_payload, send_framed};
+use crate::ws::{self, Backoff, UrlPolicyError, decode_payload, send_framed};
 
 /// How often to send `RunHeartbeat` while a run is active (spec 5.4).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long `PrepareForCold` waits for runs to stop before writing the final
-/// manifest anyway.
-const COLD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fallback for classifying a drop as an idle timeout when both the idle
+/// timeout and the keepalive are disabled.
+const DEFAULT_IDLE_CLASS: Duration = Duration::from_secs(60);
 
 /// State shared between the connection loop and the background tasks.
 pub(crate) struct Shared {
@@ -97,16 +117,146 @@ impl Shared {
 }
 
 /// Why a session ended.
+#[derive(Debug)]
 enum SessionOutcome {
-    /// The connection dropped; reconnect after backoff.
-    Disconnected,
-    /// `PrepareForCold` completed; the daemon should exit.
-    ColdExit,
+    /// The connection ended; reconnect after backoff.
+    Disconnected(DisconnectReason),
+    /// The shutdown sequence ran to completion on this connection
+    /// (`PrepareForCold`, or a SIGTERM/SIGINT while connected). Exit 0.
+    Exit,
+}
+
+/// How a control-plane session ended. The distinction that matters
+/// operationally is [`DisconnectReason::IdleTimeout`] — an edge or NAT reaping a
+/// socket that had nothing to carry — versus everything else, which is a real
+/// failure worth a warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisconnectReason {
+    /// The peer sent a Close frame.
+    PeerClose,
+    /// The stream ended with no close frame (a 1006-style abnormal closure).
+    Eof,
+    /// A transport read error.
+    ReadError,
+    /// No inbound frame arrived within the idle window — not even a pong to our
+    /// keepalive ping. Either the peer reaped an idle socket, or the flow was
+    /// dropped without an RST and reads would have hung forever.
+    IdleTimeout,
+    /// The outbox channel closed: the supervisor is tearing down.
+    OutboxClosed,
+    /// A shutdown signal arrived while the connection was still being made.
+    ShuttingDown,
+}
+
+impl DisconnectReason {
+    /// Classify a drop that arrived after `silence` of no inbound traffic. A
+    /// close/EOF/error that lands on a socket which had been quiet for longer
+    /// than the idle window is the idle reaper, not a session failure — logging
+    /// it as a failure is what makes a real failure impossible to spot.
+    fn after_silence(self, silence: Duration, idle_window: Duration) -> Self {
+        match self {
+            DisconnectReason::PeerClose | DisconnectReason::Eof | DisconnectReason::ReadError
+                if silence >= idle_window =>
+            {
+                DisconnectReason::IdleTimeout
+            }
+            other => other,
+        }
+    }
+}
+
+/// Which signal asked the daemon to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownSignal {
+    Term,
+    Int,
+}
+
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ShutdownSignal::Term => "SIGTERM",
+            ShutdownSignal::Int => "SIGINT",
+        })
+    }
+}
+
+type ShutdownRx = watch::Receiver<Option<ShutdownSignal>>;
+
+/// Resolve when a shutdown signal has been published.
+///
+/// If the watch channel is closed this **never** resolves. That matters: `run`
+/// owns the sender for the process lifetime, but if it ever did close,
+/// `wait_for` would return `Err` immediately and a `select!` branch that treated
+/// that as a shutdown request would tear the daemon down on its own — or, worse,
+/// spin the connection loop as fast as the CPU allows.
+async fn wait_for_shutdown(shutdown: &mut ShutdownRx) -> ShutdownSignal {
+    loop {
+        // Copy the value out and drop the watch guard within this statement: a
+        // guard held across an await would make every caller's future non-Send.
+        let signal = match shutdown.wait_for(|v| v.is_some()).await {
+            Ok(v) => *v,
+            Err(_) => None,
+        };
+        match signal {
+            Some(sig) => return sig,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Install handlers for SIGTERM and SIGINT and publish the first one that
+/// arrives. Without this the process has no handler at all, and an init process
+/// in its own PID namespace (`containers_pid_namespace`) is not killed by a
+/// signal it does not handle — the eviction grace window would pass with the
+/// supervisor doing nothing and the disk wiped at the end of it.
+fn spawn_signal_watcher(tx: Arc<watch::Sender<Option<ShutdownSignal>>>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("cannot install a SIGTERM handler: {e}; graceful shutdown is UNAVAILABLE");
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("cannot install a SIGINT handler: {e}");
+                return;
+            }
+        };
+        let sig = tokio::select! {
+            _ = term.recv() => ShutdownSignal::Term,
+            _ = int.recv() => ShutdownSignal::Int,
+        };
+        info!(%sig, "shutdown signal received");
+        let _ = tx.send(Some(sig));
+    });
 }
 
 /// Run the supervisor to completion (a cold exit) or until a fatal error. This
 /// is the daemon entry used by `main` and driven directly by tests.
 pub async fn run(config: Config) -> Result<()> {
+    // TLS first: `wss://` needs both the rustls feature and a process crypto
+    // provider, and a missing provider is a panic deep inside the first dial.
+    ws::install_crypto_provider();
+    // Then the scheme policy, before the store is even opened: a control URL
+    // that would put this computer's wake token on the wire in cleartext is a
+    // configuration error, and failing here (exit non-zero, one clear line) is
+    // better than a supervisor that runs and quietly leaks. A URL we merely
+    // cannot classify yet — DNS is often not up in a fresh container — is a
+    // warning, and the connect loop decides.
+    match ws::classify_control_url(&config.control_url, config.allow_insecure_ws).await {
+        Ok(dial) => info!(url = %config.control_url, policy = ?dial.policy, "control URL accepted"),
+        Err(e) if e.is_fatal() => {
+            error!("{e}");
+            return Err(anyhow::Error::new(e));
+        }
+        Err(e) => warn!("{e}; will re-check on each connect attempt"),
+    }
+
     let store = open_store(&config.store)?;
     let computer = ComputerId::new(config.computer_id.clone());
     let epoch = Epoch::new(config.epoch);
@@ -164,34 +314,108 @@ pub async fn run(config: Config) -> Result<()> {
     spawn_heartbeat(shared.clone());
     spawn_snapshot_scheduler(shared.clone());
 
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(None);
+    // The sender stays alive here for the whole loop (the watcher task gets a
+    // clone), so the channel cannot close under the connection loop.
+    let shutdown_tx = Arc::new(shutdown_tx);
+    spawn_signal_watcher(shutdown_tx.clone());
+
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     loop {
-        match connect_and_serve(&shared, &mut outbox_rx, &mut backoff).await {
-            Ok(SessionOutcome::ColdExit) => {
-                info!("prepared for cold; exiting");
-                return Ok(());
-            }
-            Ok(SessionOutcome::Disconnected) => {
+        // A signal that arrives while we are between connections still has to be
+        // honored: the runs and the tree are here whether or not a socket is.
+        // Copy out of the watch guard before awaiting: holding it across an await
+        // would make this future non-Send (and pin the channel's lock).
+        let pending = *shutdown_rx.borrow();
+        if let Some(sig) = pending {
+            offline_shutdown(&shared, sig).await;
+            return Ok(());
+        }
+        let outcome =
+            connect_and_serve(&shared, &mut outbox_rx, &mut backoff, &mut shutdown_rx).await;
+        match outcome {
+            Ok(SessionOutcome::Exit) => return Ok(()),
+            Ok(SessionOutcome::Disconnected(reason)) => {
                 let delay = backoff.next_delay();
-                debug!(?delay, "disconnected; reconnecting after backoff");
-                tokio::time::sleep(delay).await;
+                match reason {
+                    DisconnectReason::IdleTimeout => info!(
+                        ?delay,
+                        idle_window = ?idle_window(&shared.config),
+                        "control channel went silent (idle timeout, not a failure); reconnecting"
+                    ),
+                    DisconnectReason::ShuttingDown => {
+                        debug!("connect aborted by a shutdown signal")
+                    }
+                    other => warn!(
+                        reason = ?other,
+                        ?delay,
+                        "control channel dropped; reconnecting after backoff"
+                    ),
+                }
+                if sleep_or_shutdown(delay, &mut shutdown_rx).await {
+                    continue; // the loop top runs the offline shutdown
+                }
             }
             Err(e) => {
+                // A fatal scheme-policy error means the control URL can never be
+                // dialed as configured. Retrying would log the same refusal
+                // forever; exit non-zero so the operator (or the substrate's
+                // restart log) sees it.
+                if let Some(pe) = e.downcast_ref::<UrlPolicyError>()
+                    && pe.is_fatal()
+                {
+                    error!("{pe}");
+                    return Err(e);
+                }
                 let delay = backoff.next_delay();
                 warn!("session error: {e:#}; reconnecting after {delay:?}");
-                tokio::time::sleep(delay).await;
+                if sleep_or_shutdown(delay, &mut shutdown_rx).await {
+                    continue;
+                }
             }
         }
     }
 }
 
-/// Connect, handshake, and serve until the connection drops or a cold exit.
+/// Sleep for `delay`, or return early if a shutdown signal arrives. Returns true
+/// when it was the signal.
+async fn sleep_or_shutdown(delay: Duration, shutdown: &mut ShutdownRx) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = wait_for_shutdown(shutdown) => true,
+    }
+}
+
+/// The window of inbound silence after which a drop is attributed to the idle
+/// reaper rather than to a failure.
+fn idle_window(config: &Config) -> Duration {
+    config
+        .idle_timeout()
+        .or_else(|| config.keepalive_interval().map(|k| k * 2))
+        .unwrap_or(DEFAULT_IDLE_CLASS)
+}
+
+/// Connect, handshake, and serve until the connection drops or the daemon exits.
 async fn connect_and_serve(
     shared: &Arc<Shared>,
     outbox_rx: &mut UnboundedReceiver<SupervisorMessage>,
     backoff: &mut Backoff,
+    shutdown: &mut ShutdownRx,
 ) -> Result<SessionOutcome> {
-    let (ws, _resp) = connect_async(shared.config.control_url.as_str()).await?;
+    // The scheme policy is enforced here, not at startup only: this is the call
+    // that actually opens the socket, and for a name-based host it is the DNS
+    // answer at *this* moment that decides whether plaintext is acceptable.
+    let connect = ws::connect_control(
+        shared.config.control_url.as_str(),
+        shared.config.allow_insecure_ws,
+        None,
+    );
+    let (ws, _resp) = tokio::select! {
+        r = connect => r?,
+        _ = wait_for_shutdown(shutdown) => {
+            return Ok(SessionOutcome::Disconnected(DisconnectReason::ShuttingDown));
+        }
+    };
     // NB: do NOT reset the backoff here. A successful TCP/WS connect is not a
     // successful session: the DO still validates proto_version, epoch, and the
     // one-time token in the handshake and closes the socket (1008) on a
@@ -219,18 +443,38 @@ async fn connect_and_serve(
     let mut frames = mari_proto::FrameReader::new();
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The supervisor-level keepalive: independent of runs, so an AWAKE computer
+    // with nothing running keeps its control channel. Its first tick is
+    // immediate, which also exercises the path right after the handshake.
+    let mut keepalive = shared.config.keepalive_interval().map(|d| {
+        let mut i = tokio::time::interval(d);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        i
+    });
+    let idle_window = idle_window(&shared.config);
+    let mut last_inbound = Instant::now();
 
     loop {
         tokio::select! {
             incoming = read.next() => {
+                // Any frame at all — including a pong to our keepalive — proves
+                // the peer is still there.
+                if matches!(incoming, Some(Ok(_))) {
+                    last_inbound = Instant::now();
+                }
                 match incoming {
                     Some(Ok(Message::Binary(payload))) => {
                         let mut msgs: Vec<ControlMessage> = Vec::new();
                         decode_payload(&mut frames, payload.as_ref(), &mut msgs)?;
                         for cm in msgs {
                             if matches!(cm, ControlMessage::PrepareForCold) {
-                                cold_shutdown(shared, &mut write, outbox_rx, &mut sent).await?;
-                                return Ok(SessionOutcome::ColdExit);
+                                info!("prepare_for_cold: beginning shutdown");
+                                bounded_connected_shutdown(
+                                    shared, &mut write, outbox_rx, &mut sent,
+                                )
+                                .await;
+                                info!("prepared for cold; exiting");
+                                return Ok(SessionOutcome::Exit);
                             }
                             // The handshake succeeded: the DO accepted our epoch/token
                             // and replied. Only now is the session truly established, so
@@ -243,25 +487,73 @@ async fn connect_and_serve(
                         flush_journals(shared, &mut write, &mut sent).await?;
                     }
                     Some(Ok(Message::Ping(p))) => { write_msg(&mut write, Message::Pong(p)).await?; }
-                    Some(Ok(Message::Close(_))) | None => return Ok(SessionOutcome::Disconnected),
+                    Some(Ok(Message::Close(_))) => {
+                        return Ok(SessionOutcome::Disconnected(
+                            DisconnectReason::PeerClose
+                                .after_silence(last_inbound.elapsed(), idle_window),
+                        ));
+                    }
+                    None => {
+                        return Ok(SessionOutcome::Disconnected(
+                            DisconnectReason::Eof
+                                .after_silence(last_inbound.elapsed(), idle_window),
+                        ));
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         debug!("read error: {e}");
-                        return Ok(SessionOutcome::Disconnected);
+                        return Ok(SessionOutcome::Disconnected(
+                            DisconnectReason::ReadError
+                                .after_silence(last_inbound.elapsed(), idle_window),
+                        ));
                     }
                 }
             }
             ev = outbox_rx.recv() => {
                 match ev {
                     Some(msg) => send_framed(&mut write, &msg).await?,
-                    None => return Ok(SessionOutcome::Disconnected),
+                    None => return Ok(SessionOutcome::Disconnected(DisconnectReason::OutboxClosed)),
                 }
             }
             _ = shared.journal_notify.notified() => {
                 flush_journals(shared, &mut write, &mut sent).await?;
             }
             _ = tick.tick() => {
+                // The idle check rides the always-present tick, not the keepalive
+                // ticker: a deployment that disables the keepalive (or a peer that
+                // is a black hole from the very first frame, so no pong can ever
+                // arrive) must still not leave this loop reading a dead socket
+                // forever.
+                if let Some(limit) = shared.config.idle_timeout()
+                    && last_inbound.elapsed() >= limit
+                {
+                    warn!(
+                        silence = ?last_inbound.elapsed(),
+                        ?limit,
+                        "control channel answered nothing within the idle window \
+                         (not even a pong); treating it as dead"
+                    );
+                    return Ok(SessionOutcome::Disconnected(DisconnectReason::IdleTimeout));
+                }
                 flush_journals(shared, &mut write, &mut sent).await?;
+            }
+            // Graceful shutdown with the socket still up: the control plane gets
+            // the final journal bytes, the completion events, and the final
+            // manifest before this process goes away.
+            sig = wait_for_shutdown(shutdown) => {
+                info!(%sig, "graceful shutdown: control connection is up");
+                bounded_connected_shutdown(shared, &mut write, outbox_rx, &mut sent).await;
+                info!(%sig, "graceful shutdown complete; exiting");
+                return Ok(SessionOutcome::Exit);
+            }
+            _ = async {
+                match keepalive.as_mut() {
+                    Some(i) => { i.tick().await; }
+                    // No keepalive configured: this branch never completes.
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                write_msg(&mut write, ws::keepalive_ping()).await?;
             }
         }
     }
@@ -366,15 +658,9 @@ where
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     for (run, journal) in shared.run_manager.all_journals() {
-        let mut off = *sent.entry(run.clone()).or_insert_with(|| {
-            shared
-                .acked
-                .lock()
-                .unwrap()
-                .get(&run)
-                .copied()
-                .unwrap_or(0)
-        });
+        let mut off = *sent
+            .entry(run.clone())
+            .or_insert_with(|| shared.acked.lock().unwrap().get(&run).copied().unwrap_or(0));
         // A resumed run's journal starts above 0 (spec 5.6): its earlier life
         // owns everything below `base_offset`, and this instance cannot serve
         // those bytes. Never try to stream below the base — an ack lower than
@@ -403,8 +689,39 @@ where
     Ok(())
 }
 
+/// [`cold_shutdown`] under the configured grace budget, with every outcome
+/// logged. The budget exists because the shutdown window is not ours: a
+/// substrate hands out a bounded eviction grace (SIGTERM plus ~15 minutes on
+/// Cloudflare Containers), and a run that refuses to die must not consume it.
+/// Whatever is durable at the deadline is what survives, which is why the run
+/// stop gets only a fraction of the budget and the manifest write gets the rest.
+async fn bounded_connected_shutdown<S>(
+    shared: &Arc<Shared>,
+    write: &mut S,
+    outbox_rx: &mut UnboundedReceiver<SupervisorMessage>,
+    sent: &mut HashMap<RunId, u64>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let grace = shared.config.shutdown_grace();
+    match tokio::time::timeout(grace, cold_shutdown(shared, write, outbox_rx, sent)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("shutdown: reporting to the control plane failed: {e:#}"),
+        Err(_) => warn!(
+            ?grace,
+            "shutdown: grace budget exhausted; exiting with whatever reached the store"
+        ),
+    }
+}
+
 /// The WARM->COLD sequence (spec 4.5): stop runs cleanly, drain their final
-/// journals/events to the control plane, write a final manifest, and return.
+/// journals/events to the control plane, flush journal segments to the store,
+/// write a final manifest, advance the head, and return.
+///
+/// This is the one shutdown path. `PrepareForCold` and a SIGTERM differ only in
+/// who asked: the durability duty is identical, and a second implementation of
+/// it would be a second thing to get wrong.
 async fn cold_shutdown<S>(
     shared: &Arc<Shared>,
     write: &mut S,
@@ -415,8 +732,7 @@ where
     S: futures_util::Sink<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
-    info!("prepare_for_cold: stopping runs");
-    shared.run_manager.stop_all(COLD_STOP_TIMEOUT).await;
+    stop_runs(shared).await;
 
     // Drain any pending control events (RunCompleted from the stopped runs, etc.)
     // and stream any last journal bytes so the control plane has the full record.
@@ -424,8 +740,108 @@ where
         send_framed(write, &msg).await?;
     }
     flush_journals(shared, write, sent).await?;
+    flush_journal_segments(shared).await;
 
     // Final manifest (spec 4.5).
+    match write_final_manifest(shared).await {
+        Some(manifest) => {
+            send_framed(
+                write,
+                &SupervisorMessage::SnapshotWritten {
+                    manifest: manifest.clone(),
+                    epoch: shared.epoch,
+                    reason: SnapshotReason::Final,
+                },
+            )
+            .await?;
+            send_framed(
+                write,
+                &SupervisorMessage::HeadAdvanceRequest {
+                    manifest,
+                    epoch: shared.epoch,
+                },
+            )
+            .await?;
+        }
+        None => warn!("shutdown: no final manifest to report"),
+    }
+    // Best-effort: let the peer receive the tail before we drop the socket.
+    use futures_util::SinkExt;
+    let _ = write.flush().await;
+    Ok(())
+}
+
+/// The same durability duty with no control connection to report it on: a signal
+/// that arrives while the supervisor is disconnected (or mid-reconnect) still has
+/// to leave the computer recoverable. The manifest and the journal segments go to
+/// the chunk store, and the manifest is appended to the store's head history
+/// (`state/{computer}/heads.cbor`) under our epoch.
+///
+/// What this path cannot do is make the control plane *adopt* that manifest:
+/// there is no socket to send `HeadAdvanceRequest` on, and the next wake restores
+/// from the head the Durable Object holds, which will be the last one it was
+/// told. So the work between the last reported snapshot and the signal is **in
+/// the chunk store and named in the head history, but not the DO's head** — a
+/// recoverable artifact rather than an automatic recovery. Adopting it would mean
+/// advancing the head to a manifest the restored disk does not match, which is a
+/// worse failure than the one it fixes; closing the gap properly is a
+/// contracts-level decision (who wins when the two disagree), not a supervisor
+/// one. The connected path is the normal case, and it reports everything.
+async fn offline_shutdown(shared: &Arc<Shared>, sig: ShutdownSignal) {
+    let grace = shared.config.shutdown_grace();
+    info!(%sig, ?grace, "graceful shutdown: no control connection");
+    let work = async {
+        stop_runs(shared).await;
+        flush_journal_segments(shared).await;
+        write_final_manifest(shared).await;
+    };
+    if tokio::time::timeout(grace, work).await.is_err() {
+        warn!(
+            ?grace,
+            "shutdown: grace budget exhausted; exiting with whatever reached the store"
+        );
+    }
+    info!(%sig, "graceful shutdown complete; exiting");
+}
+
+/// Stop every run cleanly within the shutdown's stop budget (spec 4.5: "the
+/// supervisor stops each agent session in a clean state").
+async fn stop_runs(shared: &Arc<Shared>) {
+    let budget = shared.config.shutdown_stop_budget();
+    let active = shared.run_manager.active_run_ids();
+    info!(runs = active.len(), ?budget, "shutdown: stopping runs");
+    shared.run_manager.stop_all(budget).await;
+    let left = shared.run_manager.active_run_ids();
+    if left.is_empty() {
+        info!("shutdown: all runs stopped");
+    } else {
+        warn!(runs = ?left, "shutdown: runs still active at the stop deadline");
+    }
+}
+
+/// Push every journal's remaining bytes into local + store segments. A run that
+/// exited did this in its completion task; one that had to be abandoned did not,
+/// and on a substrate that wipes the disk the store copy is the only copy.
+async fn flush_journal_segments(shared: &Arc<Shared>) {
+    let journals = shared.run_manager.all_journals();
+    for (run, journal) in &journals {
+        // Allow the trailing partial segment to be written even though the run
+        // never reached its natural end.
+        journal.finish();
+        if let Err(e) = journal.flush_ready_segments().await {
+            warn!(%run, "shutdown: journal segment flush failed: {e:#}");
+        }
+    }
+    let bytes: u64 = journals.iter().map(|(_, j)| j.uploaded_len()).sum();
+    info!(
+        journals = journals.len(),
+        uploaded_bytes = bytes,
+        "shutdown: journal segments flushed"
+    );
+}
+
+/// Write the final manifest and record it as the head under our epoch.
+async fn write_final_manifest(shared: &Arc<Shared>) -> Option<ManifestId> {
     let opts = SnapshotOptions {
         exclude: shared.excludes(),
         created_at: now_secs(),
@@ -439,32 +855,16 @@ where
                 .record_head(&res.manifest_id, shared.epoch)
                 .await
             {
-                warn!("recording final head failed: {e:#}");
+                warn!("shutdown: recording final head failed: {e:#}");
             }
-            send_framed(
-                write,
-                &SupervisorMessage::SnapshotWritten {
-                    manifest: res.manifest_id.clone(),
-                    epoch: shared.epoch,
-                    reason: SnapshotReason::Final,
-                },
-            )
-            .await?;
-            send_framed(
-                write,
-                &SupervisorMessage::HeadAdvanceRequest {
-                    manifest: res.manifest_id,
-                    epoch: shared.epoch,
-                },
-            )
-            .await?;
+            info!(manifest = %res.manifest_id, "shutdown: final manifest written");
+            Some(res.manifest_id)
         }
-        Err(e) => warn!("final snapshot failed: {e:#}"),
+        Err(e) => {
+            error!("shutdown: FINAL SNAPSHOT FAILED: {e:#}");
+            None
+        }
     }
-    // Best-effort: let the peer receive the tail before we drop the socket.
-    use futures_util::SinkExt;
-    let _ = write.flush().await;
-    Ok(())
 }
 
 async fn write_msg<S>(write: &mut S, msg: Message) -> Result<()>
@@ -496,10 +896,12 @@ fn spawn_snapshot(shared: Arc<Shared>, reason: SnapshotReason) {
                     epoch: shared.epoch,
                     reason,
                 });
-                let _ = shared.outbox_tx.send(SupervisorMessage::HeadAdvanceRequest {
-                    manifest: res.manifest_id,
-                    epoch: shared.epoch,
-                });
+                let _ = shared
+                    .outbox_tx
+                    .send(SupervisorMessage::HeadAdvanceRequest {
+                        manifest: res.manifest_id,
+                        epoch: shared.epoch,
+                    });
             }
             Err(e) => warn!("snapshot ({reason:?}) failed: {e:#}"),
         }
@@ -749,11 +1151,13 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod supervisor_tests {
-    //! Unit tests for the two behaviors that only exist in this module: the
+    //! Unit tests for the behaviors that only exist in this module: the
     //! authoritative revert (`revert_to_manifest` must not leave a run's added
-    //! files behind, yet must preserve `.mari`/credential state), and the
-    //! reconnect backoff (reset on a successful `HelloAck`, never on a bare TCP
-    //! connect — so a fenced-out supervisor cannot storm the edge).
+    //! files behind, yet must preserve `.mari`/credential state), the reconnect
+    //! backoff (reset on a successful `HelloAck`, never on a bare TCP connect —
+    //! so a fenced-out supervisor cannot storm the edge), and how a session's end
+    //! is classified (an idle socket is not a failure, and a failure is not an
+    //! idle socket).
 
     use super::*;
     use futures_util::SinkExt;
@@ -768,6 +1172,16 @@ mod supervisor_tests {
         root: &Path,
         store: ChunkStore,
         control_url: &str,
+    ) -> (Arc<Shared>, UnboundedReceiver<SupervisorMessage>) {
+        test_shared_with(root, store, control_url, |_| {})
+    }
+
+    /// [`test_shared`] with a chance to adjust the config (timings, mostly).
+    fn test_shared_with(
+        root: &Path,
+        store: ChunkStore,
+        control_url: &str,
+        tweak: impl FnOnce(&mut Config),
     ) -> (Arc<Shared>, UnboundedReceiver<SupervisorMessage>) {
         let (tx, rx) = unbounded_channel();
         let notify = Arc::new(Notify::new());
@@ -787,9 +1201,10 @@ mod supervisor_tests {
             Arc::new(crate::adapters::AdapterSet::default()),
             Arc::new(DurableState::new(store.clone(), computer.clone(), epoch)),
         ));
-        let config = Config {
+        let mut config = Config {
             computer_id: "comp-test".into(),
             control_url: control_url.into(),
+            allow_insecure_ws: false,
             token: "tok".into(),
             epoch: 1,
             root: root.to_path_buf(),
@@ -799,7 +1214,13 @@ mod supervisor_tests {
             restore_manifest: None,
             agents_dir: root.join("agents.d"),
             segment_bytes: 4 * 1024 * 1024,
+            // Off by default so a test that is not about the keepalive sees no
+            // pings; the timing tests turn them on explicitly.
+            keepalive_ms: 0,
+            idle_timeout_ms: 0,
+            shutdown_grace_ms: 5_000,
         };
+        tweak(&mut config);
         let shared = Arc::new(Shared {
             config,
             store,
@@ -1026,6 +1447,13 @@ mod supervisor_tests {
         format!("ws://{addr}")
     }
 
+    /// A `ShutdownRx` that never fires, for the tests that are not about signals.
+    /// The sender is dropped immediately on purpose: a closed channel must never
+    /// be mistaken for "shutdown requested" (see [`wait_for_shutdown`]).
+    fn no_shutdown() -> ShutdownRx {
+        watch::channel(None).1
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backoff_preserved_when_handshake_is_rejected() {
         // Server reads the Hello, then closes WITHOUT a HelloAck — the DO
@@ -1047,9 +1475,9 @@ mod supervisor_tests {
         let _ = backoff.next_delay();
         let _ = backoff.next_delay();
 
-        let outcome = connect_and_serve(&shared, &mut rx, &mut backoff).await;
+        let outcome = connect_and_serve(&shared, &mut rx, &mut backoff, &mut no_shutdown()).await;
         assert!(
-            matches!(outcome, Ok(SessionOutcome::Disconnected) | Err(_)),
+            matches!(outcome, Ok(SessionOutcome::Disconnected(_)) | Err(_)),
             "a rejected handshake must end the session"
         );
 
@@ -1082,7 +1510,7 @@ mod supervisor_tests {
         let _ = backoff.next_delay();
         let _ = backoff.next_delay(); // current now 200ms
 
-        let _ = connect_and_serve(&shared, &mut rx, &mut backoff).await;
+        let _ = connect_and_serve(&shared, &mut rx, &mut backoff, &mut no_shutdown()).await;
 
         // The session was established, so the backoff resets to its initial delay.
         assert_eq!(
@@ -1090,5 +1518,217 @@ mod supervisor_tests {
             Duration::from_millis(50),
             "a successful hello_ack must reset the backoff"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle control channel: a socket the peer stops answering is declared dead
+    // and reported as an IDLE TIMEOUT, while a socket that fails is reported as
+    // a failure. The distinction is the whole point — an edge reaping an idle
+    // WebSocket (measured: ~270 s, 1006, no close frame) is routine, and logging
+    // it as a failure is what makes a real failure invisible.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_answers_nothing_is_declared_dead_as_an_idle_timeout() {
+        // NB: the keepalive is on here, but the detection does not depend on it —
+        // see `a_black_hole_peer_is_declared_dead_even_with_no_keepalive`.
+        // The server completes the handshake and then stops reading entirely: no
+        // pong to our keepalive, no close frame, socket held open. This is the
+        // silent-death case — without detection, reads hang forever and the
+        // supervisor is offline with nothing to show for it.
+        let url = spawn_ws(|mut ws| async move {
+            let _ = ws.next().await; // the Hello frame
+            let _ = send_framed(&mut ws, &ControlMessage::HelloAck { acked: vec![] }).await;
+            // Hold the socket open and never read again.
+            std::future::pending::<()>().await;
+            drop(ws);
+        })
+        .await;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (shared, mut rx) = test_shared_with(root_dir.path(), store, &url, |c| {
+            c.keepalive_ms = 60;
+            c.idle_timeout_ms = 400;
+        });
+
+        let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_and_serve(&shared, &mut rx, &mut backoff, &mut no_shutdown()),
+        )
+        .await
+        .expect("the session must end on its own, not hang");
+
+        assert!(
+            matches!(
+                outcome,
+                Ok(SessionOutcome::Disconnected(DisconnectReason::IdleTimeout))
+            ),
+            "a peer that answers nothing must end the session as an idle timeout, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the socket must not be declared dead before the idle window elapses"
+        );
+    }
+
+    /// Idle death must not be a side effect of the keepalive being configured: a
+    /// peer that swallows the handshake and never says anything (no HelloAck, no
+    /// close) has to be given up on even with pings switched off, or the loop sits
+    /// on a dead socket forever with no error to report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_black_hole_peer_is_declared_dead_even_with_no_keepalive() {
+        let url = spawn_ws(|ws| async move {
+            // Never read, never write, never close: accept and go silent.
+            std::future::pending::<()>().await;
+            drop(ws);
+        })
+        .await;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (shared, mut rx) = test_shared_with(root_dir.path(), store, &url, |c| {
+            c.keepalive_ms = 0; // no pings at all
+            c.idle_timeout_ms = 300;
+        });
+
+        let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_and_serve(&shared, &mut rx, &mut backoff, &mut no_shutdown()),
+        )
+        .await
+        .expect("the session must end on its own even with no keepalive");
+        assert!(
+            matches!(
+                outcome,
+                Ok(SessionOutcome::Disconnected(DisconnectReason::IdleTimeout))
+            ),
+            "a black-hole peer must end the session as an idle timeout, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_after_a_live_session_is_a_failure_not_an_idle_timeout() {
+        // Handshake, then close straight away: the socket was never idle, so this
+        // must NOT be attributed to the idle reaper.
+        let url = spawn_ws(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = send_framed(&mut ws, &ControlMessage::HelloAck { acked: vec![] }).await;
+            let _ = ws.send(Message::Close(None)).await;
+        })
+        .await;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (shared, mut rx) = test_shared_with(root_dir.path(), store, &url, |c| {
+            c.keepalive_ms = 60;
+            c.idle_timeout_ms = 10_000;
+        });
+
+        let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_and_serve(&shared, &mut rx, &mut backoff, &mut no_shutdown()),
+        )
+        .await
+        .expect("the session must end");
+        assert!(
+            matches!(
+                outcome,
+                Ok(SessionOutcome::Disconnected(DisconnectReason::PeerClose))
+            ),
+            "a prompt close is a real failure, not an idle timeout, got {outcome:?}"
+        );
+    }
+
+    /// The classification rule itself, at the boundary: identical drops are
+    /// reported differently depending only on how long the socket had been quiet.
+    #[test]
+    fn a_drop_is_attributed_to_the_idle_reaper_only_after_the_idle_window() {
+        let window = Duration::from_secs(120);
+        for base in [
+            DisconnectReason::PeerClose,
+            DisconnectReason::Eof,
+            DisconnectReason::ReadError,
+        ] {
+            assert_eq!(
+                base.after_silence(Duration::from_secs(119), window),
+                base,
+                "a drop within the idle window is a real failure"
+            );
+            assert_eq!(
+                base.after_silence(window, window),
+                DisconnectReason::IdleTimeout,
+                "a drop after the idle window is the idle reaper"
+            );
+        }
+        // Reasons that are not transport drops are never reinterpreted.
+        assert_eq!(
+            DisconnectReason::OutboxClosed.after_silence(Duration::from_secs(600), window),
+            DisconnectReason::OutboxClosed
+        );
+        assert_eq!(
+            DisconnectReason::ShuttingDown.after_silence(Duration::from_secs(600), window),
+            DisconnectReason::ShuttingDown
+        );
+    }
+
+    /// The idle window used for classification is derived, so a deployment that
+    /// disables one knob still gets a sane rule instead of 0 (which would call
+    /// every drop an idle timeout).
+    #[test]
+    fn the_idle_window_falls_back_sanely() {
+        let root = std::path::PathBuf::from("/tmp/unused");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        let (a, _rx) = test_shared_with(&root, store.clone(), "ws://127.0.0.1:1", |c| {
+            c.idle_timeout_ms = 30_000;
+            c.keepalive_ms = 1_000;
+        });
+        assert_eq!(idle_window(&a.config), Duration::from_secs(30));
+
+        let (b, _rx) = test_shared_with(&root, store.clone(), "ws://127.0.0.1:1", |c| {
+            c.idle_timeout_ms = 0;
+            c.keepalive_ms = 45_000;
+        });
+        assert_eq!(
+            idle_window(&b.config),
+            Duration::from_secs(90),
+            "with no idle timeout, twice the keepalive is the window"
+        );
+
+        let (c, _rx) = test_shared_with(&root, store, "ws://127.0.0.1:1", |c| {
+            c.idle_timeout_ms = 0;
+            c.keepalive_ms = 0;
+        });
+        assert_eq!(idle_window(&c.config), DEFAULT_IDLE_CLASS);
+    }
+
+    /// The shutdown budget must always leave room to write the final manifest.
+    #[test]
+    fn the_shutdown_stop_budget_never_eats_the_whole_grace() {
+        let root = std::path::PathBuf::from("/tmp/unused");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_fs(store_dir.path()).unwrap();
+        for grace_ms in [1_000u64, 6_000, 60_000, 900_000] {
+            let (s, _rx) = test_shared_with(&root, store.clone(), "ws://127.0.0.1:1", |c| {
+                c.shutdown_grace_ms = grace_ms;
+            });
+            let stop = s.config.shutdown_stop_budget();
+            assert!(
+                stop < s.config.shutdown_grace(),
+                "stop budget {stop:?} must be strictly less than the grace {grace_ms}ms"
+            );
+            assert!(
+                stop >= Duration::from_millis(200),
+                "a run must always get a moment to stop cleanly ({stop:?})"
+            );
+        }
     }
 }

@@ -6,10 +6,13 @@
 
 import type {
   ComputerDetail,
+  ComputerCreated,
+  ConfigResponse,
   DiffResponse,
   DirListing,
   FleetResponse,
   LayoutResponse,
+  PreviewResponse,
   ReviewResponse,
   RunListResponse,
   SnapshotResponse,
@@ -94,6 +97,15 @@ function seg(id: string): string {
 /** Fleet home data (spec 8.2). */
 export function fetchFleet(signal?: AbortSignal): Promise<FleetResponse> {
   return getJson<FleetResponse>('/fleet', signal);
+}
+
+/**
+ * Create a computer (the first-run action). It is created COLD — an identity
+ * and a manifest head in the chunk store — so this is a fast write and NOT a
+ * wake: nothing is materialized on a substrate until something runs.
+ */
+export function createComputer(name?: string): Promise<ComputerCreated> {
+  return postJson<ComputerCreated>('/computers', name === undefined ? {} : { name });
 }
 
 /** One computer's detail, including live runs. */
@@ -251,4 +263,29 @@ export function snapshotComputer(id: string): Promise<SnapshotResponse> {
 /** The SSE endpoint carrying content-free attention/run/state events (6.2). */
 export function eventsUrl(): string {
   return `${API_BASE}/events`;
+}
+
+// ---- deployment configuration + the preview capability (spec 8.5) ----------
+//
+// These two exist because the browser-preview pane cannot be built from the
+// bundle. The zone, the scheme, the origin port and the per-user host label are
+// all facts about the DEPLOYMENT — the label is derived from the owner's account
+// id — and the wake proxy requires a capability scoped to one computer and one
+// port. The pane used to compose `https://{port}--{computer}--user.mari.sh` from
+// a build-time env var and the literal string `'user'`, which could never
+// resolve on a private instance and carried no authorization at all.
+
+/** What this deployment is: preview zone/scheme, dev-auth availability, limits.
+ *  Unauthenticated and content-free, so it can be read before sign-in. */
+export function fetchConfig(signal?: AbortSignal): Promise<ConfigResponse> {
+  return getJson<ConfigResponse>('/config', signal);
+}
+
+/** The preview URL for one port of one computer, plus its capability. */
+export function fetchPreview(
+  id: string,
+  port: number,
+  signal?: AbortSignal,
+): Promise<PreviewResponse> {
+  return getJson<PreviewResponse>(`/computers/${seg(id)}/preview?port=${port}`, signal);
 }

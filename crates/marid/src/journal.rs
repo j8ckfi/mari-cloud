@@ -219,7 +219,10 @@ impl Journal {
 
             let local_path = self.local_dir.join(format!("{seq:08}.seg"));
             tokio::fs::write(&local_path, &bytes).await.map_err(|e| {
-                anyhow::anyhow!("writing local journal segment {}: {e}", local_path.display())
+                anyhow::anyhow!(
+                    "writing local journal segment {}: {e}",
+                    local_path.display()
+                )
             })?;
 
             let key = Self::segment_key(&self.computer, &self.run, seq);

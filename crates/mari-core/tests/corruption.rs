@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mari_core::{restore, snapshot, ChunkStore, ChunkerConfig, RestoreOptions, SnapshotOptions};
+use mari_core::{ChunkStore, ChunkerConfig, RestoreOptions, SnapshotOptions, restore, snapshot};
 use mari_proto::ChunkId;
 
 fn on_disk_chunk_path(store_dir: &Path, id: &ChunkId) -> PathBuf {
@@ -50,13 +50,21 @@ async fn blake3_mismatch_detected_on_restore() {
     // Craft a *validly compressed but wrong* body: store different bytes under
     // their own id, then copy that object over the victim's key. It will
     // decompress cleanly but hash to the wrong id.
-    let wrong = store.put_chunk(b"these are not the bytes you are looking for").await.unwrap();
+    let wrong = store
+        .put_chunk(b"these are not the bytes you are looking for")
+        .await
+        .unwrap();
     let wrong_bytes = std::fs::read(on_disk_chunk_path(&store_dir, &wrong)).unwrap();
     std::fs::write(on_disk_chunk_path(&store_dir, &victim), &wrong_bytes).unwrap();
 
-    let err = restore(&store, &manifest, &tmp.path().join("dst"), &RestoreOptions::default())
-        .await
-        .expect_err("corruption must be detected");
+    let err = restore(
+        &store,
+        &manifest,
+        &tmp.path().join("dst"),
+        &RestoreOptions::default(),
+    )
+    .await
+    .expect_err("corruption must be detected");
 
     match &err {
         mari_core::Error::ChunkCorrupted { chunk, actual } => {
@@ -82,9 +90,14 @@ async fn undecompressable_body_detected_on_restore() {
     )
     .unwrap();
 
-    let err = restore(&store, &manifest, &tmp.path().join("dst"), &RestoreOptions::default())
-        .await
-        .expect_err("undecompressable chunk must be detected");
+    let err = restore(
+        &store,
+        &manifest,
+        &tmp.path().join("dst"),
+        &RestoreOptions::default(),
+    )
+    .await
+    .expect_err("undecompressable chunk must be detected");
     assert!(
         matches!(&err, mari_core::Error::ChunkDecompress { chunk } if chunk == &victim),
         "expected ChunkDecompress naming {victim}, got {err:?}"
@@ -103,10 +116,16 @@ async fn direct_get_chunk_verifies() {
     assert_eq!(store.get_chunk(&good).await.unwrap(), b"hello world");
 
     // Corrupt it and confirm the read refuses to hand back bytes.
-    let other = store.put_chunk(b"a different payload entirely").await.unwrap();
+    let other = store
+        .put_chunk(b"a different payload entirely")
+        .await
+        .unwrap();
     let other_bytes = std::fs::read(on_disk_chunk_path(&store_dir, &other)).unwrap();
     std::fs::write(on_disk_chunk_path(&store_dir, &good), &other_bytes).unwrap();
 
-    let err = store.get_chunk(&good).await.expect_err("must not return unverified bytes");
+    let err = store
+        .get_chunk(&good)
+        .await
+        .expect_err("must not return unverified bytes");
     assert_eq!(err.corrupt_chunk(), Some(&good));
 }

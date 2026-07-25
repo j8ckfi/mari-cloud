@@ -1,6 +1,12 @@
-# A Mari private instance: ONE command (spec 11.2).
+# A Mari private instance, for people who have the compose plugin:
 #
 #   docker compose -f deploy/docker-compose.yml up --build
+#
+# The DOCUMENTED one command (spec 11.2) is `./deploy/up.sh`, which does exactly
+# what this file describes using only `docker` subcommands that ship with the CLI
+# itself — because `docker compose` is a plugin that a working Docker daemon does
+# not imply (Colima, Rancher Desktop, Podman, Homebrew's `docker` formula). Keep
+# the two in step: same images, same volumes, same environment.
 #
 # What comes up:
 #   base-image     builds `mari/base:v0` (deploy/Dockerfile.marid — the marid

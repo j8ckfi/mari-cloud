@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use mari_proto::messages::PROTO_VERSION;
 use mari_proto::{
-    AttentionKind, ChunkRef, ComputerId, ComputerState, ControlMessage, DiffSummary, Epoch,
-    EntryKind, ExitStatus, HeatProfile, JournalOffset, MANIFEST_VERSION, Manifest, ManifestEntry,
+    AttentionKind, ChunkRef, ComputerId, ComputerState, ControlMessage, DiffSummary, EntryKind,
+    Epoch, ExitStatus, HeatProfile, JournalOffset, MANIFEST_VERSION, Manifest, ManifestEntry,
     ManifestId, RunId, RunOffset, RunRollback, SnapshotReason, SupervisorMessage,
 };
 use serde::Serialize;
@@ -51,7 +51,11 @@ where
     fs::write(dir.join(format!("{name}.cbor")), &cbor).expect("write cbor");
 
     let json = serde_json::to_string_pretty(value).expect("encode json");
-    fs::write(dir.join(format!("{name}.expected.json")), format!("{json}\n")).expect("write json");
+    fs::write(
+        dir.join(format!("{name}.expected.json")),
+        format!("{json}\n"),
+    )
+    .expect("write json");
 
     // Teeth: the files we just wrote must decode back to the exact value.
     let from_cbor: T = mari_proto::from_cbor(&cbor).expect("decode cbor");
@@ -325,7 +329,11 @@ fn generate_and_verify_fixtures() {
             reason: SnapshotReason::Command,
         },
     );
-    write_fixture(&dir, "ctl_prepare_for_cold", &ControlMessage::PrepareForCold);
+    write_fixture(
+        &dir,
+        "ctl_prepare_for_cold",
+        &ControlMessage::PrepareForCold,
+    );
     write_fixture(
         &dir,
         "ctl_head_advance_result",

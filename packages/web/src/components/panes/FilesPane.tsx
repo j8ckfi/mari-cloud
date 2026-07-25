@@ -156,7 +156,25 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
             )}
           </div>
         ))}
-        {dir.isError && <div className="empty-note">Could not read directory.</div>}
+        {dir.isError && (
+          <div className="empty-note" role="alert" data-testid="files-error">
+            <strong>Could not read this directory.</strong>
+            <p>
+              The listing comes from the computer’s manifest in the chunk store, not from the
+              computer itself — so this is the control plane failing to answer, and nothing on the
+              computer has changed. Check the instance is up, then reopen the pane.
+            </p>
+          </div>
+        )}
+        {/* An empty directory is a real, common state — a computer that has not
+            snapshotted anything yet reads as an empty root. Say so, rather than
+            rendering a blank pane the user has to guess about (every other pane
+            carries its own empty note). */}
+        {!dir.isError && dir.isFetched && entries.length === 0 && (
+          <div className="empty-note" data-testid="files-empty">
+            Nothing here yet.
+          </div>
+        )}
       </div>
     </div>
   );

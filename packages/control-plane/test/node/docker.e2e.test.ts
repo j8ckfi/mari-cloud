@@ -304,6 +304,54 @@ describe.runIf(GATE)('private instance on the real Docker substrate', () => {
       'the write run to land on the container disk',
     );
 
+    // ---- the sizes that used to be SILENTLY LOST -------------------------
+    //
+    // 96 KiB of bytes is 131072 base64 characters — one over Linux's
+    // `MAX_ARG_STRLEN` with its NUL. While the payload was one argv element the
+    // supervisor's spawn failed with `E2BIG`, the run ended `signal=6`, nothing
+    // reached the disk, and this route had already answered `202 {ok:true}`.
+    // Nothing in the suite noticed, because the only write it made was 10 bytes.
+    // These two go through the REAL supervisor onto the REAL disk.
+    for (const size of [96 * 1024, 200 * 1024]) {
+      const payload = new Uint8Array(size);
+      for (let i = 0; i < size; i++) payload[i] = (i * 31 + (i >> 8)) & 0xff;
+      const res = await fetch(`${instance.url}/api/computers/${id}/file?path=/notes/big${size}.bin`, {
+        method: 'PUT',
+        headers: { Cookie: cookie, 'content-type': 'application/octet-stream' },
+        body: payload,
+      });
+      expect(res.status).toBe(202);
+      const runIdBig = ((await res.json()) as { runId: string }).runId;
+      await waitUntil(
+        async () => {
+          try {
+            return bytesEqual(
+              await readFileInContainer(containerA, `/work/notes/big${size}.bin`),
+              payload,
+            );
+          } catch {
+            return false;
+          }
+        },
+        60_000,
+        `the ${size}-byte write to land byte-identically on the container disk`,
+      );
+      // ...and the run that did it SUCCEEDED: not signaled, not failed. A
+      // spawn that aborts leaves `signal` set, which is what made the loss
+      // silent — the API had already said "ok".
+      const rec = await api<{ state: string; signal: number | null; exitCode: number | null }>(
+        instance.url,
+        cookie,
+        `/api/computers/${id}/runs/${runIdBig}`,
+      );
+      expect(rec.body.signal, `signal for ${size}`).toBeNull();
+      expect(rec.body.exitCode, `exit for ${size}`).toBe(0);
+      // No staging file is left behind for the next snapshot to commit.
+      await expect(
+        readFileInContainer(containerA, `/work/notes/big${size}.bin.mari-${runIdBig}.part`),
+      ).rejects.toThrow();
+    }
+
     // ---- tier policy: AWAKE -> WARM is a REAL pause (spec 4.4) ------------
     await advanceTier(id, 'warm');
     expect(await containerStatus(containerA)).toBe('paused');

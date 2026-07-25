@@ -28,6 +28,7 @@ import { findDockerSocket } from '../substrates/docker.js';
 import type {
   ExecOptions,
   ExecResult,
+  InstanceStatus,
   MaterializeSpec,
   Mount,
   SubstrateHandle,
@@ -125,6 +126,23 @@ export class RuntimeSubstrate implements SubstrateProvider {
 
   async exposePort(handle: SubstrateHandle, port: number): Promise<string> {
     return (await this.#driver(handle.substrate)).exposePort(handle, port);
+  }
+
+  /**
+   * Route the liveness probe to the driver that owns the handle (provider.ts's
+   * optional declaration). A driver that does not declare it reports `unknown`,
+   * which is what the Durable Object's bounded probe path expects — it must never
+   * be told `gone` about a substrate nobody asked.
+   */
+  async instanceStatus(handle: SubstrateHandle): Promise<InstanceStatus> {
+    try {
+      const driver = await this.#driver(handle.substrate);
+      return driver.instanceStatus ? await driver.instanceStatus(handle) : 'unknown';
+    } catch {
+      // A driver that cannot even be constructed (an unreachable daemon socket)
+      // has not answered the question; it has not answered `gone` either.
+      return 'unknown';
+    }
   }
 
   /** Construct (once) the driver named `name`. */

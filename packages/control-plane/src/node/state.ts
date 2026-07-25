@@ -18,6 +18,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { NodeSqlStorage, openDatabase, type SqlValue } from './sql.js';
 
+/**
+ * Backoff for an alarm handler that THREW, mirroring workerd's own retry rather
+ * than dropping the deadline. Bounded: an alarm that fails this many times in a
+ * row is a bug, and retrying it forever would spin.
+ */
+const ALARM_RETRY_MS: readonly number[] = [1_000, 5_000, 15_000, 60_000];
+
 /** Options for `storage.list()`. */
 export interface ListOptions {
   prefix?: string;
@@ -35,6 +42,8 @@ export class NodeDurableObjectStorage {
   #db: DatabaseSync;
   #timer: NodeJS.Timeout | null = null;
   #firing = false;
+  /** Consecutive alarm handler failures; reset by a clean run. */
+  #alarmFailures = 0;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -167,17 +176,42 @@ export class NodeDurableObjectStorage {
   async #fire(): Promise<void> {
     if (this.#firing) return;
     this.#firing = true;
+    let rearmAt: number | null = null;
     try {
       // workerd deletes the alarm before running the handler, so a handler that
       // re-arms (AWAKE->WARM arming WARM->COLD) is not clobbered afterwards.
       this.#db.exec(`DELETE FROM _alarm WHERE id = 0`);
       this.#clearTimer();
       await this.onAlarm?.();
-    } catch {
-      // An alarm that throws must not take the process down. workerd retries;
-      // here the next transition re-arms.
+      this.#alarmFailures = 0;
+    } catch (err) {
+      // AN ALARM THAT THROWS MUST NOT TAKE THE PROCESS DOWN — but it must not
+      // vanish either, which is what the empty catch here used to do. The row is
+      // DELETEd before the handler runs, and a computer that failed to transition
+      // performs no next transition, so the deadline was consumed FOREVER with no
+      // log line: every tier deadline, wake retry and liveness check for that
+      // computer silently stopped existing. workerd retries a failed alarm with
+      // backoff; this is that behaviour, plus the log line that makes a
+      // workerd-vs-Node divergence findable.
+      this.#alarmFailures += 1;
+      const backoff =
+        ALARM_RETRY_MS[Math.min(this.#alarmFailures - 1, ALARM_RETRY_MS.length - 1)] as number;
+      const give = this.#alarmFailures > ALARM_RETRY_MS.length;
+      console.error(
+        `mari: durable object alarm threw (attempt ${this.#alarmFailures})` +
+          `${give ? ', giving up' : `, retrying in ${backoff} ms`}: ` +
+          `${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
+      );
+      if (!give) rearmAt = Date.now() + backoff;
     } finally {
       this.#firing = false;
+    }
+    // Re-armed OUTSIDE the try/finally so the handler's own re-arm (the healthy
+    // path) is never overwritten by the retry: only a throw sets `rearmAt`, and
+    // an alarm the handler already re-armed for an EARLIER time wins.
+    if (rearmAt !== null) {
+      const existing = await this.getAlarm();
+      if (existing === null || existing > rearmAt) await this.setAlarm(rearmAt);
     }
   }
 }

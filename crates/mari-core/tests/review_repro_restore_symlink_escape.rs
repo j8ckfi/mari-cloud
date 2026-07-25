@@ -33,13 +33,13 @@
 
 mod common;
 
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 use mari_core::{
-    restore, snapshot, ChunkStore, Error, ManifestEntry, RestoreOptions, RootDir, SnapshotOptions,
+    ChunkStore, Error, ManifestEntry, RestoreOptions, RootDir, SnapshotOptions, restore, snapshot,
 };
-use mari_proto::{ChunkRef, EntryKind, Manifest, MANIFEST_VERSION};
+use mari_proto::{ChunkRef, EntryKind, MANIFEST_VERSION, Manifest};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -585,7 +585,9 @@ async fn remove_path_refuses_the_root_and_reports_a_missing_node() {
     let mut rootfs = RootDir::open(&fx.root).unwrap();
 
     assert!(matches!(
-        rootfs.remove_path("/").expect_err("the root is not removable"),
+        rootfs
+            .remove_path("/")
+            .expect_err("the root is not removable"),
         Error::UnsafePath { .. }
     ));
     // A node that is not there is not an error — a prune walks a live tree.

@@ -60,6 +60,26 @@ export interface NodeConfig {
   urlsPinned: boolean;
 }
 
+/**
+ * Read a variable under BOTH spellings: the `MARI_`-prefixed one
+ * `deploy/README.md`'s configuration table documents, and the bare one this
+ * module used to read alone.
+ *
+ * The two halves of that document disagreed: compose maps `MARI_AUTH_SECRET`,
+ * `MARI_DEV_AUTH`, `MARI_DEV_SEED`, `MARI_PREVIEW_ZONE`, `MARI_WARM_IDLE_MS` and
+ * `MARI_COLD_IDLE_MS` through, while the "without compose" recipe (and this file)
+ * used the unprefixed names — so an operator who followed the table without
+ * compose got silently ignored settings, including the auth secret and the tier
+ * thresholds. Accepting both is the fix that cannot break either recipe; the
+ * documented prefixed name wins when both are set.
+ */
+function envAny(key: string): string | undefined {
+  const prefixed = process.env[`MARI_${key}`];
+  if (prefixed !== undefined && prefixed !== '') return prefixed;
+  const bare = process.env[key];
+  return bare === undefined || bare === '' ? undefined : bare;
+}
+
 function envStr(key: string, fallback: string): string {
   const v = process.env[key];
   return v === undefined || v === '' ? fallback : v;
@@ -72,6 +92,12 @@ function envOpt(key: string): string | undefined {
 
 function envInt(key: string, fallback: number): number {
   const v = Number(process.env[key]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+/** `envInt` under both spellings (`MARI_PORT` is what the README documents). */
+function envIntAny(key: string, fallback: number): number {
+  const v = Number(envAny(key));
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
@@ -118,7 +144,7 @@ function parsePorts(raw: string | undefined): number[] {
 
 /** Resolve configuration from the process environment. */
 export function readConfig(overrides: Partial<NodeConfig> = {}): NodeConfig {
-  const port = overrides.port ?? envInt('PORT', 8787);
+  const port = overrides.port ?? envIntAny('PORT', 8787);
   const dataDir = resolve(overrides.dataDir ?? envStr('MARI_DATA_DIR', join(process.cwd(), 'data')));
   const storeDir = resolve(overrides.storeDir ?? envStr('MARI_STORE_DIR', join(dataDir, 'store')));
   // `MARI_CONTROL_HOST` may carry its own port (a published/forwarded one that
@@ -138,7 +164,7 @@ export function readConfig(overrides: Partial<NodeConfig> = {}): NodeConfig {
     urlsPinned: Boolean(
       overrides.supervisorUrlBase ??
         envOpt('MARI_SUPERVISOR_URL') ??
-        envOpt('BASE_URL') ??
+        envAny('BASE_URL') ??
         (colon === -1 ? undefined : rawHost),
     ),
     port,
@@ -155,7 +181,7 @@ export function readConfig(overrides: Partial<NodeConfig> = {}): NodeConfig {
     substrates: overrides.substrates ?? envStr('MARI_SUBSTRATES', 'docker,sprites').split(','),
     publishPorts: overrides.publishPorts ?? parsePorts(envOpt('MARI_PUBLISH_PORTS')),
     webDir,
-    baseUrl: overrides.baseUrl ?? envStr('BASE_URL', `http://localhost:${port}`),
+    baseUrl: overrides.baseUrl ?? envAny('BASE_URL') ?? `http://localhost:${port}`,
   };
 }
 
@@ -220,14 +246,24 @@ export async function createNodeRuntime(config: NodeConfig): Promise<NodeRuntime
         });
 
   const env = {
-    PREVIEW_ZONE: envStr('PREVIEW_ZONE', 'mari.sh'),
-    DEV_AUTH: envStr('DEV_AUTH', '0'),
-    DEV_SEED: envStr('DEV_SEED', '0'),
-    AUTH_SECRET: envStr('AUTH_SECRET', 'mari-private-instance-change-me'),
+    // `localhost` by default, NOT the hosted zone: `*.localhost` resolves to
+    // loopback in Chrome and Firefox with no DNS and no /etc/hosts entry, so a
+    // private instance's preview pane works out of the box. A default of
+    // `mari.sh` pointed every private instance's preview at a host it could not
+    // reach — which is half of why that pane never worked locally.
+    PREVIEW_ZONE: envAny('PREVIEW_ZONE') ?? 'localhost',
+    DEV_AUTH: envAny('DEV_AUTH') ?? '0',
+    DEV_SEED: envAny('DEV_SEED') ?? '0',
+    AUTH_SECRET: envAny('AUTH_SECRET') ?? 'mari-private-instance-change-me',
     BASE_URL: config.baseUrl,
     SUBSTRATE_MODE: config.substrateMode,
-    WARM_IDLE_MS: envOpt('WARM_IDLE_MS'),
-    COLD_IDLE_MS: envOpt('COLD_IDLE_MS'),
+    WARM_IDLE_MS: envAny('WARM_IDLE_MS'),
+    COLD_IDLE_MS: envAny('COLD_IDLE_MS'),
+    // Liveness/recovery windows (computer-do.ts). Unset ⇒ the defaults there.
+    SUPERVISOR_GRACE_MS: envOpt('SUPERVISOR_GRACE_MS'),
+    LIVENESS_MS: envOpt('LIVENESS_MS'),
+    COLD_FINALIZE_MS: envOpt('COLD_FINALIZE_MS'),
+    WAKE_TIMEOUT_MS: envOpt('WAKE_TIMEOUT_MS'),
     BASE_IMAGE: config.baseImage,
     COMPUTER_ROOT: config.computerRoot,
     STORE_URI: `fs://${config.storeMountPath}`,

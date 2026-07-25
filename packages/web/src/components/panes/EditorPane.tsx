@@ -63,7 +63,9 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
       void qc.invalidateQueries({ queryKey: queryKeys.dir(computer, dirnameOf(spec.path)) });
       return true;
     } catch {
-      setStatus('Save failed');
+      // Say what state the file is in, not just that something went wrong: the
+      // document is still here, unsaved, and retrying is safe.
+      setStatus('Save failed — nothing was written. Try again.');
       return false;
     }
   };
@@ -83,7 +85,9 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
       openRunTerminal(computer, runId);
       void qc.invalidateQueries({ queryKey: queryKeys.runs(computer) });
     } catch {
-      setStatus('Run failed');
+      // The save above succeeded, so the brief is on the computer; only the run
+      // did not start. Saying so keeps the user from re-saving to "fix" it.
+      setStatus('Saved, but the run did not start. Press ⌥R to try again.');
     }
   };
 

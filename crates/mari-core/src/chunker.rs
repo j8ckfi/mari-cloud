@@ -87,12 +87,7 @@ pub fn cut(data: &[u8], cfg: &ChunkerConfig) -> Vec<Cut> {
     if data.is_empty() {
         return Vec::new();
     }
-    let chunker = FastCDC::new(
-        data,
-        cfg.min as usize,
-        cfg.avg as usize,
-        cfg.max as usize,
-    );
+    let chunker = FastCDC::new(data, cfg.min as usize, cfg.avg as usize, cfg.max as usize);
     chunker
         .map(|c| Cut {
             offset: c.offset,
@@ -118,7 +113,9 @@ mod tests {
             max: 1024,
         };
         cfg.validate().unwrap();
-        let data: Vec<u8> = (0..50_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..50_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let cuts = cut(&data, &cfg);
         assert!(cuts.len() > 1, "expected many chunks, got {}", cuts.len());
         // Contiguous, gap-free, covering the whole input.

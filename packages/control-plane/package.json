@@ -16,10 +16,12 @@
     "@better-auth/passkey": "1.6.25",
     "@hono/node-server": "^2.0.11",
     "@mari/shared": "workspace:*",
+    "@noble/hashes": "2.2.0",
     "better-auth": "^1.6.25",
     "cbor-x": "^1.6.4",
     "dockerode": "^5.0.1",
     "drizzle-orm": "^0.45.2",
+    "fzstd": "0.1.1",
     "hono": "^4.12.32",
     "ws": "^8.21.0",
     "zod": "^4.4.3"

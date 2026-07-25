@@ -219,11 +219,7 @@ impl FakeControlPlane {
 
     /// Poll `pred` against the observed state until it holds or `timeout`
     /// elapses. Returns whether it held.
-    pub async fn wait_until(
-        &self,
-        timeout: Duration,
-        pred: impl Fn(&FakeState) -> bool,
-    ) -> bool {
+    pub async fn wait_until(&self, timeout: Duration, pred: impl Fn(&FakeState) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if pred(&self.state.lock().unwrap()) {
@@ -251,11 +247,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<Mutex<FakeState>>, ctrl: 
     }
 }
 
-async fn serve_conn(
-    ws: WebSocketStream<TcpStream>,
-    state: Arc<Mutex<FakeState>>,
-    ctrl: Arc<Ctrl>,
-) {
+async fn serve_conn(ws: WebSocketStream<TcpStream>, state: Arc<Mutex<FakeState>>, ctrl: Arc<Ctrl>) {
     let conn_idx = {
         let mut s = state.lock().unwrap();
         s.connections += 1;
@@ -388,7 +380,11 @@ async fn handle_sup(
             run,
             pre_run_manifest,
         } => {
-            state.lock().unwrap().run_started.push((run, pre_run_manifest));
+            state
+                .lock()
+                .unwrap()
+                .run_started
+                .push((run, pre_run_manifest));
         }
         SupervisorMessage::RunCompleted {
             run,

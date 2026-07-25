@@ -266,15 +266,65 @@ The chunk store (R2 / S3-compatible; spec 3.3) uses these keys:
 
 | Key | Contents |
 |---|---|
-| `chunks/{id[0..2]}/{id}` | One chunk's bytes, content-addressed. The 2-hex-char prefix directory (`id[0..2]`) shards the keyspace. |
-| `manifests/{id}.cbor` | One `Manifest`, CBOR (§4). `id` is its blake3. |
-| `heat/{computer}.cbor` | The `HeatProfile` for a computer (§4). |
-| `journal/{computer}/{run}/{seq}.seg` | Journal segments written directly to the store by `marid` (decisions.md); `seq` is a zero-padded ordinal. Only the coalesced live tail and segment pointers flow through the DO. |
+| `chunks/{id[0..2]}/{id}` | One chunk's body: its bytes **zstd-compressed** (see below). The 2-hex-char prefix directory (`id[0..2]`) shards the keyspace. |
+| `manifests/{id}.cbor` | One `Manifest`, CBOR (§4), **uncompressed**. `id` is its blake3. |
+| `heat/{computer}.cbor` | The `HeatProfile` for a computer (§4), uncompressed. |
+| `journal/{computer}/{run}/{seq}.seg` | Journal segments written directly to the store by `marid` (decisions.md); `seq` is a zero-padded ordinal. Raw journal bytes, uncompressed. Only the coalesced live tail and segment pointers flow through the DO. |
 
 Chunks and manifests are immutable and content-addressed, so writes are
 idempotent and safe from a fenced-out writer (§6). Garbage collection is
 mark-and-sweep over the live set of all retained manifests (decisions.md); no
 object here is deleted except by that swept process after its safety window.
+
+### 9.1 A chunk body is compressed; a chunk id is not
+
+**The object at `chunks/{id[0..2]}/{id}` is a zstd frame, and `id` is the blake3
+of the frame's CONTENTS, never of the frame.** `mari-core` compresses every chunk
+body at zstd level 3 on write (`crates/mari-core/src/store.rs`) because a wake
+reads many chunks; compression is a storage detail that identity deliberately
+ignores, so the same bytes always land under the same key whatever the encoder
+did with them.
+
+This section used to omit that, and the omission cost a release: the control
+plane's reader concatenated stored bodies and sliced them to the plaintext length
+from the manifest, so `GET /api/computers/:id/file` served a truncated prefix of a
+compressed frame for every file a real supervisor had written. Directory listings
+and diffs were unaffected (they are functions of the manifest alone), which is
+exactly why nothing noticed. So, normatively:
+
+**A reader of a chunk MUST**
+
+1. **decompress** the stored body as a zstd frame, and
+2. **verify then use**: re-hash the decompressed bytes with blake3 and compare to
+   the `ChunkId` it asked for, *before* the bytes are used or served, and
+3. treat a `ChunkRef.len` from a manifest as the length of the **plaintext**
+   (never of the stored object), and
+4. **refuse** — with an error naming the chunk — on a malformed id, a missing
+   object, an undecodable frame, a hash mismatch, or a length disagreement.
+   Partially verified content must never be emitted; assemble, then serve.
+
+Both implementations do exactly this: `ChunkStore::get_chunk`
+(`Error::ChunkDecompress` / `Error::ChunkCorrupted`) and, on the TypeScript side,
+`packages/control-plane/src/manifest-store.ts` (`decodeChunkBody`, `getChunk`,
+`readFile`) using `fzstd` and a pure-JS blake3 so the same code runs on workerd
+and on Node. Its `ChunkReadError.code` is the wire code the file routes return
+with **HTTP 500** and a JSON body `{ error, path, chunk }`: `chunk_id_malformed`,
+`chunk_missing`, `chunk_undecodable`, `chunk_corrupt`, `chunk_length_mismatch`,
+`manifest_size_mismatch`. A store-integrity failure is not a 404: the path exists,
+the store's answer for it does not, and no bytes are served.
+
+A **writer** other than `mari-core` (the dev seed, and tests) must produce the
+same shape. A conformant zstd frame of *raw* blocks is acceptable and is what
+`encodeChunkBody` emits, there being no pure-JS zstd compressor that runs on
+workerd; it is a 1:1 ratio, not a different format, and `zstd(1)`, libzstd and
+`fzstd` all decode it. An **empty file has zero chunk refs** — no empty chunk
+body is ever stored.
+
+Cross-language proof lives in
+`packages/control-plane/test/fixtures/mari-core-store.json`: a store written by
+the Rust snapshotter (regenerate with `cargo test -p mari-core --test
+ts_store_fixture`), loaded into a real R2 binding and read back through the HTTP
+routes by `test/chunk-read.test.ts`.
 
 ## Appendix A — Dev seed route (control-plane)
 
@@ -330,11 +380,15 @@ it responds `404`. It is unauthenticated because it mints the session it returns
   run" would pass on residue. `ComputerDO.resetSeedState()` is gated on
   `DEV_SEED=1` and is a no-op in any deployed control plane.
 
-**v0 deviation:** the seed's content addresses (`manifest`/chunk ids) are
-SHA-256 hex, a stand-in for blake3 (§3) until `mari-core`'s blake3 chunker is
-compiled into the control plane. The ids are self-consistent within the seed,
-which is all the manifest file-browser (§8.4) requires — it fetches chunks by the
-id recorded in the manifest, and does not re-verify the digest algorithm.
+**Content addressing in the seed is real** (superseding the earlier note that it
+used SHA-256 as a stand-in): chunk ids are the blake3 of the plaintext, the
+manifest id is the blake3 of its CBOR (§3), and every chunk body is written as a
+zstd frame (§9.1). It has to be — the file-read path now verifies every chunk it
+serves, and a seed with its own digest algorithm would fail that check on the
+first read. The remaining deviation is only that TypeScript writes a manifest at
+all (decisions.md says `mari-core` is the writer); the seed does it because the
+web Playwright suite needs a deterministic COLD computer with no supervisor in
+the picture.
 
 ## Appendix B — v0 control-plane protocol notes
 
@@ -484,3 +538,117 @@ Each record is `event: <type>` + `data: <json>`:
   watching the fleet. Each ComputerDO publishes into `EventsDO(userId)`; an event
   with no listener is dropped, and the durable record of an attention remains the
   attention log in the computer's own DO.
+
+## Appendix D — Write encoding, run cwd, and the preview capability
+
+_Appended by the blocker-closing lane (append-only). This SUPERSEDES two details
+of Appendix C.2 and adds the preview surface's contract. Where this appendix and
+C.2 disagree, this one is current (and `packages/control-plane/test/runs-argv.test.ts`
+plus `test/writes.test.ts` are the executable form of it)._
+
+### D.1 A write run's argv (supersedes C.2's one-liner)
+
+C.2 described the write as
+`["/bin/sh","-c","set -e; mkdir -p '<dir>'; printf '%s' '<base64>' | base64 -d > '<path>'"]`.
+That form was **unspawnable** for a payload above 96 KiB of raw bytes: Linux caps
+one `execve` argument at `MAX_ARG_STRLEN` = 131072 bytes (NUL included), and 96 KiB
+base64-encodes to exactly 131072 characters. The failure was `E2BIG` at spawn,
+after the route had already answered `202 {ok:true}`.
+
+The current form, normatively:
+
+```
+argv[0] = "/bin/sh"
+argv[1] = "-c"
+argv[2] = "set -e; mkdir -p '<dir>'; T='<path>.mari-<run>.part'; trap 'rm -f \"$T\"' EXIT; \
+           printf '%s' \"$@\" | base64 -d > \"$T\"; mv -f \"$T\" '<path>'"
+argv[3] = "mari-write"        # $0 for `sh -c`
+argv[4..] = base64 payload, split into pieces of at most 32768 characters
+```
+
+- The payload is `argv[4]` onward and is re-joined by `printf '%s' "$@"` (POSIX
+  reuses the format for each operand, so the pieces concatenate with nothing
+  between them). **No argv element may exceed `MAX_ARGV_ELEMENT_BYTES` (32 KiB)**
+  and the whole block must stay under `MAX_ARGV_TOTAL_BYTES` (1.6 MB), which is
+  what keeps the largest accepted write inside Linux's `RLIMIT_STACK / 4` total.
+- An EMPTY file has no payload pieces; `printf '%s' "$@"` then emits nothing and
+  the decode produces a zero-byte file.
+- The decode targets `<path>.mari-<run>.part` and is renamed over the target, so a
+  failed decode leaves the previous content intact, and an `EXIT` trap removes the
+  staging file so a failed write leaves nothing behind for the next snapshot to
+  commit into the manifest. The temp name carries the RUN ID so two writes racing
+  on one path cannot clobber each other's staging file.
+- Paths and the script are POSIX single-quoted exactly as before (`'` → `'\''`).
+- **Limit: 1 MiB per write** (`MAX_WRITE_BYTES`), equal to `MAX_INLINE_FILE_BYTES`
+  on the read path. C.2's "256 KiB per write" is superseded. Over the limit is
+  still `413 {error:"too_large", limit}`.
+
+### D.2 `cwd` in `start_run` is always inside the computer
+
+`start_run.cwd` is a substrate path and is **never empty and never `/`** unless the
+computer's root really is `/`. The control plane resolves it (`resolveRunCwd`):
+
+| Request | `cwd` sent |
+|---|---|
+| absent / empty | the computer's filesystem root (`MARI_ROOT`) |
+| a path at or under the root (`/work/project`) | verbatim |
+| any other absolute path (`/project`) | joined onto the root (`/work/project`) |
+
+The third row is the one that matters: a manifest path (what the file browser, the
+editor and a diff all speak) is rooted at the computer's filesystem root, and a run
+that executed at the container's `/` wrote files no manifest recorded and deep
+sleep destroyed. marid's own empty-`cwd` fallback applies to a RESUMED run only, so
+an empty string on this field is not a valid way to say "the root".
+
+### D.3 Preview capability (spec 8.5 + spec 10)
+
+| Route | Result |
+|---|---|
+| `GET /api/config` | `{ previewZone, previewScheme, previewPort, devAuth, devSeed, maxWriteBytes, maxReadBytes }` — unauthenticated, content-free, no user data |
+| `GET /api/computers/:id/preview?port=` | `{ computer, port, host, url, stableUrl, expiresAt }` — session-authenticated and ownership-scoped |
+
+- `host` is `{port}--{computer}--{user}.{zone}`, where **`user` is
+  `SHA-256("mari-preview-user:" + userId)` truncated to 12 hex characters** — the
+  owner's account id never appears in a hostname.
+- `url` carries the capability once as `?mari_preview=<token>`; `stableUrl` is the
+  spec 8.5 address with no capability.
+- A token is `p1.<expiresAtMs>.<hex HMAC-SHA256(AUTH_SECRET, "p1:{computer}:{port}:{expiresAt}")>`,
+  valid for 12 h, and is accepted only for that computer and that port.
+- The wake proxy accepts a request iff the host's `user` label matches the
+  computer's owner AND (a valid capability arrives in the `mari_preview` cookie, or
+  in the query string, or a session that OWNS the computer is presented). A
+  capability in the query on a GET/HEAD is converted into a host-scoped
+  `HttpOnly; SameSite=Lax` cookie and 302-redirected to the same path without it.
+- Refusals: `404` + `x-mari-preview: no_such_preview` for an unknown computer or a
+  label that is not its owner's (identical answers, deliberately); `401` +
+  `x-mari-preview: preview_unauthorized` otherwise. **No refusal reaches the
+  Durable Object**, so it cannot wake a computer or spend substrate budget.
+- Mari's own cookies (`mari_*`, `better-auth*`) are stripped from the request
+  before it reaches the guest process.
+- Proxy failures are `502` + `x-mari-preview-error`:
+  `expose_port` (the port was never published — the driver's message says so),
+  `upstream_unreachable` (nothing is listening), `proxy_fetch` (a
+  `proxyFetch`-serving driver refused).
+
+### D.4 Other route-shape corrections
+
+- `POST /api/computers/:id/sleep` — body `{ deep?: boolean }` (or `?deep=1`) →
+  `{ computer, state, deep, settled }`. `deep` is spec 4.4's deep sleep (COLD);
+  `settled` is false while the supervisor's final-manifest handshake is still in
+  flight.
+- `DELETE /api/computers/:id/secrets/:name` → `{ ok, name }`, or
+  `404 {error:"secret_not_found"}`. `PUT` refuses a name that is not a valid
+  environment variable (`400 bad_name`) or starts with `MARI_`
+  (`400 reserved_name`), because vault names become variables in the SUPERVISOR's
+  process environment (spec 10.1) and `MARI_TOKEN`/`MARI_EPOCH` are the fencing
+  credentials.
+- `POST /api/computers/:id/attention/:eventId/dismiss` →
+  `400 {error:"bad_event_id"}` for a non-numeric id, `404
+  {error:"attention_not_found"}` for a miss, `200 {ok:true, eventId}` for a
+  dismissal (it used to answer `200 {ok:false}` for every failure).
+- `POST /api/computers/:id/runs/:runId/stop` also returns `status` (the control
+  plane's own `RunStatus`) and `cancelled`, so a run stopped before it ever reached
+  a supervisor is not reported to the user as a failure.
+- `GET /api/computers/:id/files` with **no manifest at all** answers
+  `200 { manifest: null, entries: [] }` for the root and `404` for any deeper path,
+  instead of `404 no_manifest` for everything.

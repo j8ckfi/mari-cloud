@@ -95,7 +95,9 @@ fn repo_root() -> PathBuf {
 fn build_marid_in_docker() {
     let repo = repo_root();
     let repo_mount = format!("{}:/repo:ro", repo.display());
-    println!("[e2e] building marid for linux/arm64 in {RUST_IMAGE} (incremental via named volumes)…");
+    println!(
+        "[e2e] building marid for linux/arm64 in {RUST_IMAGE} (incremental via named volumes)…"
+    );
     let status = std::process::Command::new("docker")
         .args([
             "run",
@@ -345,9 +347,7 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     // Drive the run: append known bytes to /work/log.txt, print a known blob to
     // the PTY, exit 0. `/bin/sh` avoids any PATH ambiguity in the container.
     let run = RunId::new(format!("run-{run_id}"));
-    let script = format!(
-        "printf '%s' '{pty_str}'; printf '%s' '{append_str}' >> /work/log.txt",
-    );
+    let script = format!("printf '%s' '{pty_str}'; printf '%s' '{append_str}' >> /work/log.txt",);
     cp.queue_to(
         conn_a,
         ControlMessage::StartRun {
@@ -382,7 +382,10 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     let journal_ok = cp
         .wait_until(Duration::from_secs(30), |st| st.journal(&run) == pty_blob)
         .await;
-    assert!(journal_ok, "journal frames must reassemble to the PTY output");
+    assert!(
+        journal_ok,
+        "journal frames must reassemble to the PTY output"
+    );
     cp.with_state(|st| assert!(st.errors.is_empty(), "journal integrity: {:?}", st.errors));
 
     // The structured diff names exactly `/log.txt` (i.e. /work/log.txt relative
@@ -399,7 +402,10 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     let d = diff(&pre, &post);
     let modified: Vec<&str> = d.modified.iter().map(|m| m.path.as_str()).collect();
     assert_eq!(modified, vec!["/log.txt"], "exactly /work/log.txt changed");
-    assert!(d.added.is_empty() && d.removed.is_empty(), "no adds/removes");
+    assert!(
+        d.added.is_empty() && d.removed.is_empty(),
+        "no adds/removes"
+    );
     assert!(
         d.modified[0].content_changed && !d.modified[0].mode_changed,
         "log.txt content changed, mode unchanged"
@@ -410,7 +416,9 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     cp.queue_to(conn_a, ControlMessage::PrepareForCold);
     let final_written = cp
         .wait_until(Duration::from_secs(30), |st| {
-            st.snapshots.iter().any(|(_, _, r)| *r == SnapshotReason::Final)
+            st.snapshots
+                .iter()
+                .any(|(_, _, r)| *r == SnapshotReason::Final)
         })
         .await;
     if !final_written {
@@ -537,7 +545,11 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
         token,
     });
     let hello_g = await_new_hello(&cp, prev_hellos, &name_g, Duration::from_secs(60)).await;
-    assert_eq!(hello_g.epoch, Epoch::new(1), "ghost is a stale epoch-1 waker");
+    assert_eq!(
+        hello_g.epoch,
+        Epoch::new(1),
+        "ghost is a stale epoch-1 waker"
+    );
     let conn_g = hello_g.conn;
 
     // Provoke a head advance from the stale supervisor.
@@ -561,7 +573,11 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     }
     // The head is unchanged (still H2): the fenced-out writer moved nothing.
     cp.with_state(|st| {
-        assert_eq!(st.head.as_ref(), Some(&h2), "fenced-out writer must not move the head");
+        assert_eq!(
+            st.head.as_ref(),
+            Some(&h2),
+            "fenced-out writer must not move the head"
+        );
         assert!(
             st.head_advances[advances_before..]
                 .iter()
@@ -583,5 +599,7 @@ async fn cold_wake_across_fresh_containers_is_byte_identical_and_continuous() {
     cleanup.run();
     cleanup_by_label(&label);
 
-    println!("[e2e] PASS — a computer is data: reconstructed byte-identically on a fresh container from the store alone.");
+    println!(
+        "[e2e] PASS — a computer is data: reconstructed byte-identically on a fresh container from the store alone."
+    );
 }

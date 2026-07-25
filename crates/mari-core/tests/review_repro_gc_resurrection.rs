@@ -18,8 +18,8 @@
 use std::path::{Path, PathBuf};
 
 use filetime::FileTime;
-use mari_core::{execute, plan_at, ChunkId, ChunkStore, GcAction, GcMode, RestoreOptions};
-use mari_proto::{ChunkRef, EntryKind, Manifest, ManifestEntry, ManifestId, MANIFEST_VERSION};
+use mari_core::{ChunkId, ChunkStore, GcAction, GcMode, RestoreOptions, execute, plan_at};
+use mari_proto::{ChunkRef, EntryKind, MANIFEST_VERSION, Manifest, ManifestEntry, ManifestId};
 
 const NOW: u64 = 1_000_000;
 

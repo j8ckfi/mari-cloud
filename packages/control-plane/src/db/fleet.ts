@@ -179,3 +179,43 @@ export async function listSecretNames(db: D1Database, computerId: string): Promi
     .all();
   return (res.results as { name: string }[]).map((r) => r.name);
 }
+
+/**
+ * Names AND values — the vault read that spec 10.1 exists for.
+ *
+ * The ONLY caller is the Durable Object's `materialize` configuration
+ * (`#maridEnv`): "the supervisor injects credentials at run start", and marid
+ * resolves a run's `env_names` out of its own process environment
+ * (crates/marid/src/run.rs), so the values have to reach the supervisor process
+ * and nowhere else. They never enter an HTTP response, an event, a journal or a
+ * `start_run` frame (contracts.md §5.2 keeps that message name-only).
+ *
+ * Before this existed the vault was write-only: a stored key was listed by name
+ * and never reached a run, so every agent that needs an API key was unusable.
+ */
+export async function listSecrets(
+  db: D1Database,
+  computerId: string,
+): Promise<{ name: string; value: string }[]> {
+  const res = await db
+    .prepare(`SELECT name, value FROM secrets WHERE computerId = ? ORDER BY name`)
+    .bind(computerId)
+    .all();
+  return (res.results as { name: string; value: string }[]).map((r) => ({
+    name: String(r.name),
+    value: String(r.value),
+  }));
+}
+
+/** Remove one vault entry. Returns false when there was nothing to remove. */
+export async function deleteSecret(
+  db: D1Database,
+  computerId: string,
+  name: string,
+): Promise<boolean> {
+  const res = await db
+    .prepare(`DELETE FROM secrets WHERE computerId = ? AND name = ?`)
+    .bind(computerId, name)
+    .run();
+  return (res.meta?.changes ?? 0) > 0;
+}

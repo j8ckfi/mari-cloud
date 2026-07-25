@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { coldCard, resetLayouts, seedRecord } from './helpers';
+import { coldCard, resetFleet, seedRecord } from './helpers';
 // @ts-expect-error — plain .mjs helper, transpiled in-process by Playwright.
 import { startFakeSupervisor } from './fake-supervisor.mjs';
 
@@ -49,7 +49,7 @@ test.describe('terminal round-trip', () => {
 
   test('typed input echoes back through the fake supervisor', async ({ page, request }) => {
     // Start from a workspace with no panes saved by an earlier spec (8.6).
-    await resetLayouts(request);
+    await resetFleet(request);
     await page.goto('/');
 
     // Identify the COLD computer and stand up a fake supervisor for it.

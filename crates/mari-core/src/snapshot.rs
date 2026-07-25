@@ -51,13 +51,13 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use mari_proto::{
-    ChunkId, ChunkRef, EntryKind, Manifest, ManifestEntry, ManifestId, MANIFEST_VERSION,
+    ChunkId, ChunkRef, EntryKind, MANIFEST_VERSION, Manifest, ManifestEntry, ManifestId,
 };
 use walkdir::WalkDir;
 
 use crate::chunker::{self, ChunkerConfig};
 use crate::error::{Error, Result};
-use crate::rootfs::{manifest_components, FileFacts, RootDir};
+use crate::rootfs::{FileFacts, RootDir, manifest_components};
 use crate::store::ChunkStore;
 
 /// Options controlling a snapshot.
@@ -215,8 +215,7 @@ pub async fn snapshot(
     let mut names_by_inode: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
 
     for entry in WalkDir::new(root).sort_by_file_name() {
-        let entry =
-            entry.map_err(|e| Error::io(root.display().to_string(), walkdir_io(e)))?;
+        let entry = entry.map_err(|e| Error::io(root.display().to_string(), walkdir_io(e)))?;
         let mpath = manifest_path(root, entry.path())?;
 
         // Prune anything beneath an excluded directory.
@@ -305,9 +304,7 @@ pub async fn snapshot(
             // the walk saw can be gone before its bytes are read. It is then not
             // in the tree, so it is not in the manifest — and that is not an
             // error about the snapshot.
-            Err(Error::Io { ref source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
+            Err(Error::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 dropped.insert(p.entry);
                 continue;
             }
@@ -318,7 +315,8 @@ pub async fn snapshot(
             let allowed = match verdicts.get(&facts.inode()) {
                 Some(&v) => v,
                 None => {
-                    let v = links_are_accounted_for(&mut rootfs, &pending, &names_by_inode, &facts)?;
+                    let v =
+                        links_are_accounted_for(&mut rootfs, &pending, &names_by_inode, &facts)?;
                     verdicts.insert(facts.inode(), v);
                     v
                 }

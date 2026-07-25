@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use common::{build_reference_tree, gen_bytes};
 use mari_core::{
-    delta_chunks, manifest_chunks, snapshot, ChunkStore, ChunkerConfig, SnapshotOptions,
+    ChunkStore, ChunkerConfig, SnapshotOptions, delta_chunks, manifest_chunks, snapshot,
 };
 
 fn test_chunker() -> ChunkerConfig {
@@ -26,7 +26,11 @@ fn test_chunker() -> ChunkerConfig {
 
 /// Snapshot a directory containing a single file with the given bytes and
 /// return the set of chunk ids that file produced.
-async fn chunkset_of_file(store: &ChunkStore, dir: &std::path::Path, bytes: &[u8]) -> BTreeSet<mari_core::ChunkId> {
+async fn chunkset_of_file(
+    store: &ChunkStore,
+    dir: &std::path::Path,
+    bytes: &[u8],
+) -> BTreeSet<mari_core::ChunkId> {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("f.bin"), bytes).unwrap();
     let opts = SnapshotOptions {
@@ -52,7 +56,11 @@ async fn one_byte_insert_reuses_at_least_90_percent() {
     let s1 = chunkset_of_file(&store, &tmp.path().join("v1"), &original).await;
     let s2 = chunkset_of_file(&store, &tmp.path().join("v2"), &mutated).await;
 
-    assert!(s1.len() > 100, "need many chunks to measure reuse, got {}", s1.len());
+    assert!(
+        s1.len() > 100,
+        "need many chunks to measure reuse, got {}",
+        s1.len()
+    );
     let shared = s1.intersection(&s2).count();
     let reuse = shared as f64 / s1.len() as f64;
     assert!(
@@ -94,7 +102,10 @@ async fn fork_shares_everything_then_delta_is_local() {
         created_at: 11,
     };
     let fork = snapshot(&store, &src, &fork_opts).await.unwrap();
-    assert_eq!(fork.uploaded_chunks, 0, "a fork of an identical tree uploads nothing");
+    assert_eq!(
+        fork.uploaded_chunks, 0,
+        "a fork of an identical tree uploads nothing"
+    );
     assert_eq!(fork.reused_chunks, fork.unique_chunks);
     assert_eq!(fork.unique_chunks, base.unique_chunks);
 
@@ -107,7 +118,11 @@ async fn fork_shares_everything_then_delta_is_local() {
 
     // Now change exactly one small file and re-snapshot against the base. Only
     // that file's new chunk(s) are uploaded; the delta is exactly those chunks.
-    std::fs::write(src.join("data").join("a.txt"), b"completely different contents").unwrap();
+    std::fs::write(
+        src.join("data").join("a.txt"),
+        b"completely different contents",
+    )
+    .unwrap();
     common::chmod(&src.join("data").join("a.txt"), 0o600);
 
     let changed = snapshot(&store, &src, &fork_opts).await.unwrap();

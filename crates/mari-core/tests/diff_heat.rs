@@ -4,7 +4,7 @@
 mod common;
 
 use mari_core::{
-    diff, load_heat, snapshot, store_heat, ChunkStore, ChunkerConfig, HeatRecorder, SnapshotOptions,
+    ChunkStore, ChunkerConfig, HeatRecorder, SnapshotOptions, diff, load_heat, snapshot, store_heat,
 };
 use mari_proto::{ComputerId, HeatProfile};
 
@@ -64,7 +64,10 @@ async fn diff_distinguishes_mode_only_from_content_from_add_remove() {
         .find(|m| m.path == "/chmod_me.txt")
         .expect("chmod_me should be modified");
     assert!(chmod_change.mode_changed);
-    assert!(!chmod_change.content_changed, "chmod must not read as content change");
+    assert!(
+        !chmod_change.content_changed,
+        "chmod must not read as content change"
+    );
 
     // edit_me: content changed.
     let edit_change = d
@@ -126,10 +129,7 @@ async fn heat_profile_persists_and_reloads() {
     assert_eq!(loaded, profile);
 
     // Stored at the contracts path heat/{computer}.cbor.
-    assert!(tmp
-        .path()
-        .join("store/heat/computer-alpha.cbor")
-        .exists());
+    assert!(tmp.path().join("store/heat/computer-alpha.cbor").exists());
 
     // A recorder can be seeded from a loaded profile and extend it.
     let mut r = HeatRecorder::from_profile(&loaded);

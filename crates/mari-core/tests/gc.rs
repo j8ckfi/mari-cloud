@@ -12,8 +12,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use filetime::FileTime;
-use mari_core::{execute, plan_at, ChunkStore, GcAction, GcMode};
-use mari_proto::{ChunkId, ChunkRef, EntryKind, Manifest, ManifestEntry, ManifestId, MANIFEST_VERSION};
+use mari_core::{ChunkStore, GcAction, GcMode, execute, plan_at};
+use mari_proto::{
+    ChunkId, ChunkRef, EntryKind, MANIFEST_VERSION, Manifest, ManifestEntry, ManifestId,
+};
 use proptest::prelude::*;
 
 const NOW: u64 = 1_000_000;
@@ -66,7 +68,10 @@ async fn window_and_reachability_are_respected() {
     let store_dir = tmp.path().join("store");
     let store = ChunkStore::open_fs(&store_dir).unwrap();
 
-    let live = store.put_chunk(b"referenced by a retained manifest").await.unwrap();
+    let live = store
+        .put_chunk(b"referenced by a retained manifest")
+        .await
+        .unwrap();
     let young = store.put_chunk(b"a young orphan chunk").await.unwrap();
     let old = store.put_chunk(b"an old orphan chunk").await.unwrap();
 
@@ -75,36 +80,79 @@ async fn window_and_reachability_are_respected() {
     set_age(&store_dir, &young, 10);
     set_age(&store_dir, &old, 10_000);
 
-    let retained = store_manifest(&store, &[live.clone()], &[0], None).await;
+    let retained = store_manifest(&store, std::slice::from_ref(&live), &[0], None).await;
 
     let window = 100;
-    let plan = plan_at(&store, std::slice::from_ref(&retained), window, NOW).await.unwrap();
+    let plan = plan_at(&store, std::slice::from_ref(&retained), window, NOW)
+        .await
+        .unwrap();
 
     assert_eq!(plan.live_count(), 1);
     assert!(plan.live.contains(&live));
-    assert!(!plan.dead.iter().any(|d| d.chunk == live), "live chunk must not be a dead candidate");
+    assert!(
+        !plan.dead.iter().any(|d| d.chunk == live),
+        "live chunk must not be a dead candidate"
+    );
 
     let young_d = plan.dead.iter().find(|d| d.chunk == young).unwrap();
-    assert!(young_d.protected, "young orphan must be protected by the window");
+    assert!(
+        young_d.protected,
+        "young orphan must be protected by the window"
+    );
     assert_eq!(young_d.age_secs, 10);
     let old_d = plan.dead.iter().find(|d| d.chunk == old).unwrap();
     assert!(!old_d.protected, "old orphan must be deletable");
     assert_eq!(old_d.age_secs, 10_000);
 
     // Dry-run changes nothing on disk.
-    let dry = execute(&store, &plan, std::slice::from_ref(&retained), GcMode::DryRun).await.unwrap();
+    let dry = execute(
+        &store,
+        &plan,
+        std::slice::from_ref(&retained),
+        GcMode::DryRun,
+    )
+    .await
+    .unwrap();
     assert!(dry.deleted.is_empty());
     assert!(store.has_chunk(&old).await.unwrap());
-    assert!(dry.audit.iter().any(|a| a.chunk == old && a.action == GcAction::WouldDelete));
-    assert!(dry.audit.iter().any(|a| a.chunk == young && a.action == GcAction::ProtectedByWindow));
+    assert!(
+        dry.audit
+            .iter()
+            .any(|a| a.chunk == old && a.action == GcAction::WouldDelete)
+    );
+    assert!(
+        dry.audit
+            .iter()
+            .any(|a| a.chunk == young && a.action == GcAction::ProtectedByWindow)
+    );
 
     // Delete: only the old orphan is swept.
-    let rep = execute(&store, &plan, std::slice::from_ref(&retained), GcMode::Delete).await.unwrap();
+    let rep = execute(
+        &store,
+        &plan,
+        std::slice::from_ref(&retained),
+        GcMode::Delete,
+    )
+    .await
+    .unwrap();
     assert_eq!(rep.deleted, vec![old.clone()]);
-    assert!(!store.has_chunk(&old).await.unwrap(), "old orphan should be gone");
-    assert!(store.has_chunk(&young).await.unwrap(), "young orphan must survive the window");
-    assert!(store.has_chunk(&live).await.unwrap(), "reachable chunk must never be deleted");
-    assert!(rep.audit.iter().any(|a| a.chunk == old && a.action == GcAction::Deleted));
+    assert!(
+        !store.has_chunk(&old).await.unwrap(),
+        "old orphan should be gone"
+    );
+    assert!(
+        store.has_chunk(&young).await.unwrap(),
+        "young orphan must survive the window"
+    );
+    assert!(
+        store.has_chunk(&live).await.unwrap(),
+        "reachable chunk must never be deleted"
+    );
+    assert!(
+        rep.audit
+            .iter()
+            .any(|a| a.chunk == old && a.action == GcAction::Deleted)
+    );
 }
 
 #[tokio::test]
@@ -117,8 +165,13 @@ async fn missing_parent_fails_the_plan_rather_than_deleting() {
     let bogus_parent = ManifestId::new("0".repeat(64));
     let child = store_manifest(&store, &[c], &[0], Some(bogus_parent)).await;
 
-    let err = plan_at(&store, &[child], 0, NOW).await.expect_err("must fail on missing parent");
-    assert!(matches!(err, mari_core::Error::ManifestNotFound(_)), "got {err:?}");
+    let err = plan_at(&store, &[child], 0, NOW)
+        .await
+        .expect_err("must fail on missing parent");
+    assert!(
+        matches!(err, mari_core::Error::ManifestNotFound(_)),
+        "got {err:?}"
+    );
 }
 
 const NC: usize = 6; // distinct chunks
@@ -156,10 +209,10 @@ proptest! {
 
             // Put every chunk (including pure orphans) and age it.
             let mut chunk_ids: Vec<ChunkId> = Vec::with_capacity(NC);
-            for i in 0..NC {
+            for (i, &age) in ages.iter().enumerate() {
                 let blob = format!("gc-prop-chunk-{i}").into_bytes();
                 let id = store.put_chunk(&blob).await.unwrap();
-                set_age(&store_dir, &id, ages[i]);
+                set_age(&store_dir, &id, age);
                 chunk_ids.push(id);
             }
 
@@ -185,8 +238,8 @@ proptest! {
                     if !seen.insert(x) {
                         break;
                     }
-                    for j in 0..NC {
-                        if membership[x][j] {
+                    for (j, &member) in membership[x].iter().enumerate() {
+                        if member {
                             live_idx.insert(j);
                         }
                     }

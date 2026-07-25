@@ -23,15 +23,24 @@
 //   journal state; sets the computer's DO head (no wake); the response also
 //   carries the Better Auth `Set-Cookie` session header.
 //
-// DEVIATION: content addressing here uses SHA-256 (Web Crypto) as a stand-in for
-// blake3. mari-core (the real blake3 chunker/manifest writer) is not yet wired
-// into the control plane; the ids are self-consistent within the seed, which is
-// all the file-browse path needs (it fetches chunks by the id in the manifest).
+// CONTENT ADDRESSING IS REAL HERE. Chunk ids are the blake3 of the plaintext and
+// manifest ids the blake3 of the CBOR (contracts.md §3), and every chunk body is
+// written as a zstd frame — exactly the storage contract `mari-core` writes and
+// `manifest-store.ts` verifies on read (contracts.md §9). The seed is not
+// allowed a private dialect: if it wrote SHA-256 ids or bare bytes (it used to
+// do both), the file-read path could not verify a single seeded chunk, and the
+// seed would be "working" only because nothing checked it.
+//
+// It remains a deviation that TypeScript writes a manifest at all (decisions.md:
+// mari-core is the writer). The seed does it because the web Playwright suite
+// needs a deterministic COLD computer with no supervisor in the picture; the
+// bytes it writes are indistinguishable from mari-core's, apart from the
+// compression ratio (see `encodeChunkBody`).
 
 import { encodeCbor, type Manifest, type ManifestEntry } from '@mari/shared';
 import type { Env } from './types';
 import { applySchema } from './db/apply';
-import { chunkKey, manifestKey } from './manifest-store';
+import { chunkIdOf, chunkKey, encodeChunkBody, manifestIdOf, manifestKey } from './manifest-store';
 import { insertComputer, deleteComputer, setSecret } from './db/fleet';
 import { makeAuth } from './auth';
 import { toArrayBuffer } from './bytes';
@@ -95,14 +104,6 @@ export const SEED_RUN_CHANGES = {
   removed: ['/src/util.ts'],
 } as const;
 
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
-  const arr = new Uint8Array(digest);
-  let hex = '';
-  for (const b of arr) hex += b.toString(16).padStart(2, '0');
-  return hex;
-}
-
 function dirsOf(paths: string[]): string[] {
   const dirs = new Set<string>();
   for (const p of paths) {
@@ -137,8 +138,15 @@ export async function writeSeedTree(
 
   for (const [path, contents] of Object.entries(tree)) {
     const bytes = enc.encode(contents);
-    const id = await sha256Hex(bytes);
-    await store.put(chunkKey(id), bytes);
+    // An empty file has ZERO chunk refs (mari-core's chunker emits no cuts for
+    // empty input); anything else would leave an unreferenced object behind and
+    // a ref the reader would have to special-case.
+    if (bytes.length === 0) {
+      entries.push({ path, kind: 'file', mode: 0o100644, size: 0, symlink_target: null, chunks: [] });
+      continue;
+    }
+    const id = chunkIdOf(bytes);
+    await store.put(chunkKey(id), toArrayBuffer(encodeChunkBody(bytes)));
     entries.push({
       path,
       kind: 'file',
@@ -158,8 +166,8 @@ export async function writeSeedTree(
     entries,
   };
   const cbor = encodeCbor(manifest);
-  const manifestId = await sha256Hex(cbor);
-  await store.put(manifestKey(manifestId), cbor);
+  const manifestId = manifestIdOf(cbor);
+  await store.put(manifestKey(manifestId), toArrayBuffer(cbor));
 
   return { manifest: manifestId, files: Object.keys(tree).sort() };
 }

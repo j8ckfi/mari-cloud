@@ -1,0 +1,169 @@
+name: e2e (gated)
+
+# The suites that need a real substrate. They materialize containers, build the
+# base image, and take minutes — so they are NOT in the default PR run.
+#
+# Two ways to ask for them:
+#   * add the `e2e` label to a pull request (remove and re-add it to re-run);
+#   * Actions → "e2e (gated)" → Run workflow.
+#
+# What is deliberately absent: anything that touches the hosted deployment.
+# `e2e/cloudflare.e2e.test.ts` needs a real `wrangler deploy`, a pushed container
+# image and account credentials; it is run by hand by whoever owns the account
+# (CONTRIBUTING.md, "The suites that are not in CI"), never by this workflow.
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+
+jobs:
+  docker:
+    name: real Docker substrate
+    # `synchronize` fires on every push to a labelled PR, so the label check has
+    # to gate the job itself, not just the event.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker is present
+        # ubuntu-latest ships a running daemon. Assert it rather than discover it
+        # halfway through a suite.
+        run: docker version
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-e2e-${{ runner.os }}-
+
+      - run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build the base image
+        # Every suite below materializes computers from it. Building it once here
+        # keeps each suite's own "build it if missing" path from doing it three
+        # times, and makes a broken Dockerfile fail as itself.
+        run: |
+          docker build -f deploy/Dockerfile.marid -t mari/base:v0 .
+          docker run --rm mari/base:v0 --help > /dev/null
+
+      - name: marid — thesis test (snapshot → destroy → wake into a fresh container)
+        run: MARI_E2E_DOCKER=1 cargo test -p marid --test e2e_docker -- --nocapture
+
+      - name: control plane — substrate death and recovery on real Docker
+        run: MARI_NODE_E2E=1 pnpm --filter @mari/control-plane test:node
+
+      - name: the spec 1.3 loop — start, disconnect, results
+        run: MARI_LOOP_E2E=1 pnpm --filter @mari/e2e test
+
+      - name: Leave no containers behind
+        if: always()
+        run: |
+          ids=$(docker ps -aq --filter label=mari.computer)
+          if [ -n "$ids" ]; then docker rm -f $ids; fi
+
+  # Playwright against the real control plane (wrangler dev, local mode) and the
+  # real Vite dev server. No Docker daemon is involved — containers are disabled
+  # for it (packages/web/playwright.config.ts).
+  #
+  # Gated, and NOT because it is slow: the suite shares one control plane across
+  # its spec files, and `editor-save.spec.ts` performs a spec 8.4 write that WAKES
+  # the seeded computer, after which every spec needing a COLD card waits out the
+  # tier policy — 30 s in one measured case and past the 45 s test timeout in a
+  # full run, while each file passes on its own. That is the suite's bug to fix
+  # (state its own precondition), and until it is fixed this must not be able to
+  # redden an unrelated pull request.
+  web:
+    name: playwright (web)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm --filter @mari/web exec playwright install --with-deps chromium
+
+      - name: Run
+        run: pnpm --filter @mari/web test:e2e
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: packages/web/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The one command that proves the documented first-run path still works, on a
+  # machine that has never run Mari. It builds both images and boots the private
+  # instance exactly as a new user would (deploy/README.md), then checks the
+  # origin answers and the API is behind the session guard.
+  private-instance:
+    name: deploy/up.sh on a clean machine
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: ./deploy/up.sh
+
+      - name: The origin serves the web app
+        run: |
+          curl -fsS http://localhost:8787/ | grep -qi '<div id="root"'
+
+      - name: The API is behind the session guard
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/api/fleet)
+          test "$code" = "401" || { echo "expected 401, got $code"; exit 1; }
+
+      - name: Teardown removes the container
+        run: |
+          ./deploy/down.sh --computers
+          test -z "$(docker ps -aq --filter name=^mari-control-plane$)"
+
+      - if: failure()
+        run: docker logs --tail 200 mari-control-plane || true

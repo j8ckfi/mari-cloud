@@ -49,15 +49,15 @@
 //! refused rather than materialized into a tree no later snapshot could walk,
 //! and a declared size no chunk backs is an error rather than an allocation.
 
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mari_core::{
-    restore, snapshot, ChunkStore, EntryKind, Error, Manifest, ManifestEntry, RestoreOptions,
-    RootDir, SnapshotOptions,
+    ChunkStore, EntryKind, Error, Manifest, ManifestEntry, RestoreOptions, RootDir,
+    SnapshotOptions, restore, snapshot,
 };
 use mari_proto::{ChunkRef, MANIFEST_VERSION};
 
@@ -310,7 +310,10 @@ fn a_fifo_at_the_leaf_or_at_a_parent_component_never_parks_a_restore() {
         let finished = rx
             .recv_timeout(Duration::from_secs(20))
             .unwrap_or_else(|_| panic!("restore blocked on a FIFO (at_parent={at_parent})"));
-        assert!(finished, "restore over a FIFO failed (at_parent={at_parent})");
+        assert!(
+            finished,
+            "restore over a FIFO failed (at_parent={at_parent})"
+        );
 
         let landed = if at_parent {
             fx.root.join("pipe/f")
@@ -331,7 +334,9 @@ async fn an_embedded_nul_in_a_manifest_path_writes_nothing() {
     let fx = Fixture::new();
 
     // A NUL that would truncate to a real, different target name.
-    let manifest = manifest_of(vec![file_entry(&fx.store, "/sentinel\0/../../x", b"x").await]);
+    let manifest = manifest_of(vec![
+        file_entry(&fx.store, "/sentinel\0/../../x", b"x").await,
+    ]);
     let err = restore(&fx.store, &manifest, &fx.root, &RestoreOptions::default())
         .await
         .expect_err("a `..` is rejected lexically whatever else is in the path");
@@ -728,7 +733,9 @@ async fn a_manifest_path_deeper_than_path_max_must_not_be_materialized() {
     let name = "dddddddddddddddddddd";
     let deep: String = (0..depth).map(|i| format!("/{name}{i}")).collect();
 
-    let manifest = manifest_of(vec![file_entry(&fx.store, &format!("{deep}/leaf"), b"x").await]);
+    let manifest = manifest_of(vec![
+        file_entry(&fx.store, &format!("{deep}/leaf"), b"x").await,
+    ]);
     let restored = restore(&fx.store, &manifest, &fx.root, &RestoreOptions::default()).await;
 
     let snapped = snapshot(
@@ -749,7 +756,10 @@ async fn a_manifest_path_deeper_than_path_max_must_not_be_materialized() {
     let _ = rootfs.remove_path(&format!("{deep}/leaf"));
     let mut comps: Vec<String> = (0..depth).map(|i| format!("{name}{i}")).collect();
     while !comps.is_empty() {
-        if rootfs.remove_path(&format!("/{}", comps.join("/"))).is_err() {
+        if rootfs
+            .remove_path(&format!("/{}", comps.join("/")))
+            .is_err()
+        {
             break;
         }
         comps.pop();
@@ -796,9 +806,10 @@ async fn a_hostile_declared_size_must_be_an_error_not_a_panic() {
 
     let store = fx.store.clone();
     let root = fx.root.clone();
-    let handle = tokio::spawn(async move {
-        restore(&store, &manifest, &root, &RestoreOptions::default()).await
-    });
+    let handle =
+        tokio::spawn(
+            async move { restore(&store, &manifest, &root, &RestoreOptions::default()).await },
+        );
     let joined = handle.await;
 
     assert!(

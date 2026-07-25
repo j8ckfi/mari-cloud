@@ -20,7 +20,15 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import { SELF, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
-import { ensureSchema, computerStub, FakeSupervisor, delay } from './helpers';
+import {
+  apiGet,
+  computerStub,
+  createComputer,
+  delay,
+  ensureSchema,
+  FakeSupervisor,
+  seedSession,
+} from './helpers';
 import { createCloudflareProvider } from '../src/substrates/cloudflare';
 import { FakeContainer, type FakeContainerOptions } from './substrates/fake-container';
 import type { ComputerDO } from '../src/computer-do';
@@ -166,8 +174,11 @@ describe('wake proxy over a container port (spec 8.5)', () => {
   beforeAll(ensureSchema);
 
   it('serves the preview request through the container instead of a URL', async () => {
-    const id = 'cfproxy';
-    const user = 'alice';
+    // The preview surface is authorized (test/proxy.test.ts owns those rules), so
+    // this needs a REAL owned computer and a session: the substrate assertions
+    // below are unchanged, only the way the request gets past the gate is.
+    const cookie = (await seedSession()).cookie;
+    const id = await createComputer(cookie, 'cfproxy');
     const seen: { url: string; epoch: string | null }[] = [];
     const stub = computerStub(id);
     await installDriver(stub, {
@@ -177,14 +188,20 @@ describe('wake proxy over a container port (spec 8.5)', () => {
       },
     });
 
-    const res = await SELF.fetch(`http://8080--${id}--${user}.mari.sh/app/index.html?q=1`);
+    const info = await apiGet<{ host: string }>(`/api/computers/${id}/preview?port=8080`, cookie);
+    expect(info.status).toBe(200);
+    const host = info.body.host;
+
+    const res = await SELF.fetch(`http://${host}/app/index.html?q=1`, {
+      headers: { Cookie: cookie },
+    });
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('from-port-8080:/app/index.html');
 
     // The request reached the container with its path, query and the DO's epoch
     // stamp intact — and the internal routing headers stripped.
     expect(seen.length).toBe(1);
-    expect(seen[0]!.url).toBe(`http://8080--${id}--${user}.mari.sh/app/index.html?q=1`);
+    expect(seen[0]!.url).toBe(`http://${host}/app/index.html?q=1`);
     expect(seen[0]!.epoch).toBe('1');
 
     const fake = await runInDurableObject(stub, (instance: ComputerDO) => {

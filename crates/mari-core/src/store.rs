@@ -47,9 +47,12 @@ impl ChunkStore {
     pub fn open_fs(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         std::fs::create_dir_all(root).map_err(|e| Error::io(root.display().to_string(), e))?;
-        let root_str = root
-            .to_str()
-            .ok_or_else(|| Error::io(root.display().to_string(), std::io::Error::other("non-utf8 store root")))?;
+        let root_str = root.to_str().ok_or_else(|| {
+            Error::io(
+                root.display().to_string(),
+                std::io::Error::other("non-utf8 store root"),
+            )
+        })?;
         let builder = opendal::services::Fs::default().root(root_str);
         let op = Operator::new(builder)?.finish();
         Ok(Self::new(op))
@@ -177,8 +180,8 @@ impl ChunkStore {
     /// to the same key, so a re-write is harmless. Returns the id.
     pub async fn put_chunk(&self, bytes: &[u8]) -> Result<ChunkId> {
         let id = Self::chunk_id(bytes);
-        let compressed = zstd::encode_all(bytes, ZSTD_LEVEL)
-            .map_err(|e| Error::io(Self::chunk_key(&id), e))?;
+        let compressed =
+            zstd::encode_all(bytes, ZSTD_LEVEL).map_err(|e| Error::io(Self::chunk_key(&id), e))?;
         self.op.write(&Self::chunk_key(&id), compressed).await?;
         Ok(id)
     }
@@ -226,10 +229,10 @@ impl ChunkStore {
             }
             // The key is chunks/{prefix}/{id}; the id is the final segment.
             let path = entry.path();
-            if let Some(name) = path.rsplit('/').next() {
-                if !name.is_empty() {
-                    ids.push(ChunkId::new(name.to_string()));
-                }
+            if let Some(name) = path.rsplit('/').next()
+                && !name.is_empty()
+            {
+                ids.push(ChunkId::new(name.to_string()));
             }
         }
         Ok(ids)
@@ -283,7 +286,13 @@ impl ChunkStore {
     // ---- heat ----------------------------------------------------------
 
     /// Persist a computer's heat profile at `heat/{computer}.cbor`.
+    ///
+    /// The id is validated for the same reason a chunk id is: it is interpolated
+    /// into a store key, and an id containing a separator or `..` would address a
+    /// different prefix entirely. `check_computer_id` existed for this and was
+    /// never called; both heat entry points now call it.
     pub async fn put_heat(&self, computer: &str, profile: &HeatProfile) -> Result<()> {
+        Self::check_computer_id(computer)?;
         let cbor = mari_proto::to_cbor(profile)?;
         self.op.write(&Self::heat_key(computer), cbor).await?;
         Ok(())
@@ -291,6 +300,7 @@ impl ChunkStore {
 
     /// Load a computer's heat profile, or `None` if it has none yet.
     pub async fn get_heat(&self, computer: &str) -> Result<Option<HeatProfile>> {
+        Self::check_computer_id(computer)?;
         match self.op.read(&Self::heat_key(computer)).await {
             Ok(buf) => Ok(Some(mari_proto::from_cbor(&buf.to_vec())?)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),

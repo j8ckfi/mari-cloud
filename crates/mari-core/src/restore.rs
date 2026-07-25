@@ -52,7 +52,7 @@ use std::path::Path;
 use mari_proto::{EntryKind, Manifest, ManifestEntry};
 
 use crate::error::{Error, Result};
-use crate::rootfs::{manifest_components_under, RootDir};
+use crate::rootfs::{RootDir, manifest_components_under};
 use crate::store::ChunkStore;
 
 /// The most a restore will reserve for a file *before* it has read the
@@ -140,17 +140,17 @@ pub async fn restore(
         .collect();
 
     for p in &opts.priority {
-        if let Some(&i) = index_of.get(p.as_str()) {
-            if done.insert(i) {
-                write_file(
-                    store,
-                    &manifest.entries[i],
-                    &mut rootfs,
-                    &targets[i],
-                    &mut stats,
-                )
-                .await?;
-            }
+        if let Some(&i) = index_of.get(p.as_str())
+            && done.insert(i)
+        {
+            write_file(
+                store,
+                &manifest.entries[i],
+                &mut rootfs,
+                &targets[i],
+                &mut stats,
+            )
+            .await?;
         }
     }
     for (i, e) in manifest.entries.iter().enumerate() {

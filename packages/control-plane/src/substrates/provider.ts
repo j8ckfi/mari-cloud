@@ -104,6 +104,20 @@ export interface ExecOptions {
   readonly input?: Uint8Array | string;
 }
 
+/**
+ * What a substrate says about the resources behind one handle.
+ *
+ * - `alive`: the instance this handle names still exists on the substrate. It may
+ *   be AWAKE or WARM (a `docker pause`d container is `alive`) — this answers
+ *   "do the resources exist", not "is a process running".
+ * - `gone`: the substrate is certain the instance no longer exists. Everything on
+ *   its disk is lost; only the chunk store still holds the computer (spec §4.1).
+ * - `unknown`: the substrate could not be asked (API unreachable, a call that did
+ *   not answer in time). NOT a synonym for `gone`: a caller must bound how long
+ *   it will tolerate `unknown` rather than treat it as either verdict.
+ */
+export type InstanceStatus = 'alive' | 'gone' | 'unknown';
+
 /** The result of {@link SubstrateProvider.exec}. */
 export interface ExecResult {
   /** Process exit code. A terminating signal is normalized to `128 + signal`. */
@@ -209,6 +223,30 @@ export interface SubstrateProvider {
    * never fail a run.
    */
   holdAwake?(handle: SubstrateHandle): Promise<void>;
+
+  /**
+   * Report whether the resources behind `handle` still exist (spec §4.7's "a
+   * substrate returns a stale disk" has a harsher sibling: the substrate returns
+   * NO disk, because the instance is gone).
+   *
+   * WHY THIS IS NOT A SEVENTH SPEC §3.5 FUNCTION. The six functions are how Mari
+   * CHANGES a substrate's state; this is a READ of the state Mari already asked
+   * for, and the control plane can already take it through §3.5's {@link exec}:
+   * the cheapest possible command either runs inside the instance or it does not.
+   * What `exec` cannot do is tell "this instance is gone" apart from "I could not
+   * reach the substrate API", and that distinction decides whether a computer is
+   * recovered (fresh instance, new epoch, restore from the head) or left alone.
+   * So this is an OPTIONAL declaration in the same family as {@link holdAwake},
+   * {@link proxyFetch} and {@link supportsWarm}: a driver that already tracks the
+   * answer (Docker: `inspect`; Cloudflare: `running` plus the platform's own
+   * "no container instance") says so, and a driver that omits it is probed
+   * through `exec` and reports {@link InstanceStatus} `unknown` on refusal, which
+   * the caller must bound. No caller may REQUIRE this method.
+   *
+   * A driver MUST NOT start, stop or otherwise change the instance here, and MUST
+   * NOT throw: an unanswerable probe is `unknown`.
+   */
+  instanceStatus?(handle: SubstrateHandle): Promise<InstanceStatus>;
 
   /**
    * Serve a request to `port` inside the computer, for a substrate whose exposed

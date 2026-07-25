@@ -1,6 +1,8 @@
-import { useEffect } from 'react';
+import { useCallback, useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useUiStore } from '../store/ui';
-import { useFleet } from '../api/queries';
+import { queryKeys, useFleet } from '../api/queries';
+import { createComputer } from '../api/client';
 import { useEventsStore } from '../store/events';
 import { allAttention, attentionFor, badgeCount } from '../events/reducer';
 import { FleetHome } from './FleetHome';
@@ -56,11 +58,45 @@ export function Shell({
   const addPane = useUiStore((s) => s.addPane);
   const notice = useUiStore((s) => s.notice);
 
+  const setNotice = useUiStore((s) => s.setNotice);
+
+  const queryClient = useQueryClient();
   const fleet = useFleet();
   const events = useEventsStore((s) => s.model);
   const computers = fleet.data?.computers ?? [];
   const idsKey = computers.map((c) => c.id).join(',');
   const namesKey = computers.map((c) => `${c.id}:${c.hostname}`).join('|');
+
+  /**
+   * The first-run action, and the only way to get a computer from the interface.
+   * A computer is created COLD, so there is nothing to wait for: refresh the
+   * fleet and open the new workspace immediately (spec 8.3). A failure says what
+   * failed in words, in the same place every other command reports itself.
+   */
+  const newComputer = useCallback(async (): Promise<void> => {
+    try {
+      const created = await createComputer();
+      await queryClient.invalidateQueries({ queryKey: queryKeys.fleet });
+      setNotice(`Created ${created.name} · deep sleep`);
+      openComputer(created.id);
+    } catch {
+      setNotice('Could not create a computer — the control plane did not accept the request.');
+    }
+  }, [openComputer, queryClient, setNotice]);
+
+  // Spec 8.1: every pointer action is a command too, so the first computer can
+  // be created from Cmd+K with no mouse.
+  useEffect(() => {
+    return registry.registerAll([
+      {
+        id: 'computer.new',
+        title: 'New computer',
+        group: 'Computer',
+        keywords: ['create', 'add', 'first', 'fleet', 'machine'],
+        run: newComputer,
+      },
+    ]);
+  }, [newComputer, registry]);
 
   // Map fleet order onto workspace slots (Super/Alt+1..9).
   useEffect(() => {
@@ -170,7 +206,17 @@ export function Shell({
 
       <div className="main">
         {view === 'fleet' || active === null ? (
-          <FleetHome computers={computers} onOpen={openComputer} onAttention={activateAttention} />
+          <FleetHome
+            computers={computers}
+            onOpen={openComputer}
+            onAttention={activateAttention}
+            onNew={() => void newComputer()}
+            // `isError` alone would flip the whole view on one failed background
+            // refetch; the fleet is only "unreachable" once there is nothing good
+            // left to render with it.
+            unreachable={fleet.isError && computers.length === 0}
+            onRetry={() => void fleet.refetch()}
+          />
         ) : (
           <Workspace computer={active} user={USER} />
         )}

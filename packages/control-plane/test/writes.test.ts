@@ -25,6 +25,12 @@ import {
 } from './helpers';
 import { fromBase64 } from '../src/bytes';
 import { SEED_TREE } from '../src/seed';
+import {
+  MAX_ARGV_ELEMENT_BYTES,
+  MAX_ARGV_TOTAL_BYTES,
+  MAX_WRITE_BYTES,
+  writeArgvBytes,
+} from '../src/runs';
 
 interface WriteBody {
   ok: boolean;
@@ -36,11 +42,28 @@ interface WriteBody {
   error?: string;
 }
 
-/** Pull the base64 payload out of the write run's shell script. */
-function payloadOf(script: string): Uint8Array {
-  const m = /printf '%s' '([A-Za-z0-9+/=]*)'/.exec(script);
-  if (!m) throw new Error(`no base64 payload in script: ${script}`);
-  return fromBase64(m[1]!);
+/**
+ * Reassemble the write payload from the run's argv.
+ *
+ * The payload lives in the POSITIONAL PARAMETERS (`argv[4]` onward), never inside
+ * the script, because Linux caps ONE argv string at `MAX_ARG_STRLEN` = 128 KiB
+ * and exceeding it fails the spawn itself — `E2BIG` at `execve`, after the API
+ * has already answered `202 {ok:true}`. Asserting the SHAPE on every write is
+ * what pins that: a payload back in `argv[2]` fails these checks immediately.
+ */
+function payloadOf(argv: string[]): Uint8Array {
+  expect(argv[0]).toBe('/bin/sh');
+  expect(argv[1]).toBe('-c');
+  expect(argv[3]).toBe('mari-write'); // $0 for `sh -c`
+  expect(argv[2]).toContain(`printf '%s' "$@"`);
+  for (const [i, a] of argv.entries()) {
+    expect(
+      a.length,
+      `argv[${i}] is ${a.length} bytes; the kernel refuses a single argument at 128 KiB`,
+    ).toBeLessThanOrEqual(MAX_ARGV_ELEMENT_BYTES);
+  }
+  expect(writeArgvBytes(argv)).toBeLessThan(MAX_ARGV_TOTAL_BYTES);
+  return fromBase64(argv.slice(4).join(''));
 }
 
 /**
@@ -126,8 +149,16 @@ describe('file write path (spec 8.4 wake-on-write)', () => {
     expect(start.c.argv[1]).toBe('-c');
     const script = start.c.argv[2] as string;
     expect(script).toContain("mkdir -p '/notes'");
-    expect(script).toContain("> '/notes/new.bin'");
-    expect(eqBytes(payloadOf(script), payload)).toBe(true);
+    // The decode lands on a sibling staging file and is RENAMED over the target,
+    // so a failed or partial decode cannot truncate the file that is already
+    // there (`> target` truncates before base64 produces a byte), and the staging
+    // file is trapped away on any exit so it never reaches a snapshot.
+    expect(script).toMatch(/T='\/notes\/new\.bin\.mari-[0-9a-f]+\.part';/);
+    expect(script).toContain(`trap 'rm -f "$T"' EXIT`);
+    expect(script).toContain(`mv -f "$T" '/notes/new.bin'`);
+    // The payload is NOT in the script — that is what made a >64 KiB write abort.
+    expect(script).not.toContain(start.c.argv[4] as string);
+    expect(eqBytes(payloadOf(start.c.argv as string[]), payload)).toBe(true);
 
     await delay(60);
     expect(sup.recv.countTag('start_run')).toBe(1);
@@ -169,10 +200,61 @@ describe('file write path (spec 8.4 wake-on-write)', () => {
     expect(body.queued).toBe(false);
 
     const start = await sup.recv.waitForTag('start_run');
-    expect(new TextDecoder().decode(payloadOf(start.c.argv[2] as string))).toBe(
+    expect(new TextDecoder().decode(payloadOf(start.c.argv as string[]))).toBe(
       'written while awake',
     );
     expect(start.c.argv[2]).toContain("mkdir -p '/a/b'");
+    sup.close();
+  });
+
+  /**
+   * THE BLOCKER THIS SUITE MISSED.
+   *
+   * 96 KiB of raw bytes base64-encode to exactly 131072 characters, one byte over
+   * Linux's `MAX_ARG_STRLEN` once the NUL is counted. With the whole payload in a
+   * single argv element the supervisor's spawn failed with `E2BIG` — and the
+   * measured outcome was worse than an error: the run ended `signal=6`, the file
+   * never reached the disk, and this route had already answered `202 {ok:true}`
+   * with the byte count. Editor Save and the files pane's Upload both reported
+   * success and threw the user's work away.
+   *
+   * Every size on the reported curve is checked, and each one is checked for the
+   * property that matters: the bytes the supervisor is told to write are exactly
+   * the bytes that were PUT, carried in elements no single one of which can
+   * exceed the kernel's ceiling.
+   */
+  it('splits a payload no single argv element could carry (96 KiB … 1 MiB)', async () => {
+    const id = await createComputer(cookie, 'bigwrite');
+    const stub = computerStub(id);
+    const w = await stub.wake(id);
+    const sup = await FakeSupervisor.connect(id);
+    await sup.handshake(id, w.epoch, w.token);
+
+    for (const size of [64 * 1024, 96 * 1024, 200 * 1024, MAX_WRITE_BYTES]) {
+      // Non-repeating content, so a payload reassembled in the wrong ORDER (or
+      // with a piece dropped) cannot compare equal.
+      const payload = new Uint8Array(size);
+      for (let i = 0; i < size; i++) payload[i] = (i * 31 + (i >> 8)) & 0xff;
+
+      const res = await SELF.fetch(`${HOST}/api/computers/${id}/file?path=/big/w${size}.bin`, {
+        method: 'PUT',
+        headers: { Cookie: cookie },
+        body: payload,
+      });
+      expect(res.status, `PUT ${size}`).toBe(202);
+      const body = (await res.json()) as WriteBody;
+      expect(body.bytes).toBe(size);
+
+      const start = await sup.recv.waitForTag('start_run');
+      expect(start.c.run).toBe(body.runId);
+      const argv = start.c.argv as string[];
+      // 96 KiB and up MUST arrive in more than one piece; that is the fix.
+      const pieces = argv.length - 4;
+      expect(pieces, `pieces for ${size}`).toBeGreaterThanOrEqual(
+        Math.ceil(Math.ceil(size / 3) * 4 / MAX_ARGV_ELEMENT_BYTES),
+      );
+      expect(eqBytes(payloadOf(argv), payload), `payload ${size}`).toBe(true);
+    }
     sup.close();
   });
 
@@ -232,9 +314,10 @@ describe('file write path (spec 8.4 wake-on-write)', () => {
     const big = await SELF.fetch(`${HOST}/api/computers/${id}/file?path=/big.bin`, {
       method: 'PUT',
       headers: { Cookie: cookie },
-      body: new Uint8Array(256 * 1024 + 1),
+      body: new Uint8Array(MAX_WRITE_BYTES + 1),
     });
     expect(big.status).toBe(413);
+    expect(((await big.json()) as WriteBody & { limit: number }).limit).toBe(MAX_WRITE_BYTES);
 
     // None of the rejections queued a run.
     const runs = await apiGet<{ runs: unknown[] }>(`/api/computers/${id}/runs`, cookie);
@@ -261,7 +344,7 @@ describe('file write path (spec 8.4 wake-on-write)', () => {
     expect(body.path).toBe('/uploads/photo.bin');
 
     const start = await sup.recv.waitForTag('start_run');
-    expect(eqBytes(payloadOf(start.c.argv[2] as string), new Uint8Array([1, 2, 3, 250]))).toBe(true);
+    expect(eqBytes(payloadOf(start.c.argv as string[]), new Uint8Array([1, 2, 3, 250]))).toBe(true);
     sup.close();
   });
 

@@ -1,12 +1,12 @@
 import { test, expect } from '@playwright/test';
-import { coldCard, resetLayouts } from './helpers';
+import { coldCard, resetFleet } from './helpers';
 
 // Spec 8.1: the command palette (Cmd+K) exposes every command and executes them
 // by keyboard. Here: open a workspace, open the palette, run "New terminal
 // pane", and assert a terminal pane appears.
 test.describe('command palette', () => {
   test('opens on Cmd+K and executes a command by keyboard', async ({ page, request }) => {
-    await resetLayouts(request);
+    await resetFleet(request);
     await page.goto('/');
     await coldCard(page).click();
     await expect(page.getByTestId('workspace')).toBeVisible();
@@ -28,7 +28,11 @@ test.describe('command palette', () => {
     await expect(page.locator('[data-testid="pane"][data-kind="terminal"]')).toBeVisible();
   });
 
-  test('closes on Escape', async ({ page }) => {
+  test('closes on Escape', async ({ page, request }) => {
+    // A COLD computer is this test's precondition, not something it may inherit:
+    // an earlier spec's editor save or run legitimately wakes one (see
+    // `resetFleet`).
+    await resetFleet(request);
     await page.goto('/');
     await coldCard(page).click();
     await page.keyboard.press('Meta+k');

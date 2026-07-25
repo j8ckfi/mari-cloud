@@ -150,9 +150,19 @@ kbd {
 }
 .fleet h1 {
   font-size: 15px;
-  margin: 0 0 12px;
+  margin: 0;
   color: var(--fg-dim);
   font-weight: 600;
+}
+.fleet-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.fleet-head .compact {
+  padding: 4px 9px;
+  font-size: 11px;
 }
 .fleet-grid {
   display: grid;
@@ -691,6 +701,32 @@ kbd {
 .empty-note {
   padding: 24px;
   color: var(--fg-faint);
+}
+/* An empty state that explains itself needs a paragraph and an action, not just
+   a line of grey text. Constrained to a readable measure and left-aligned with
+   the grid above it. */
+.empty-note strong {
+  color: var(--fg-dim);
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.empty-note p {
+  margin: 0 0 12px;
+  max-width: 62ch;
+  line-height: 1.55;
+}
+.empty-note code {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.empty-note button {
+  margin-bottom: 12px;
+}
+.empty-note[role='alert'] strong {
+  color: var(--attn);
 }
 
 /* ---- Attention badges (spec 6.2) ---- */

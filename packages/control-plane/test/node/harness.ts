@@ -74,18 +74,45 @@ export interface TestInstanceOptions extends BootOptions {
   devSeed?: boolean;
   warmIdleMs?: number;
   coldIdleMs?: number;
+  /** Grace after the supervisor's socket closes before the substrate is asked
+   *  whether the instance is alive (computer-do.ts). */
+  supervisorGraceMs?: number;
+  /** Health-check cadence while work is in flight. */
+  livenessMs?: number;
+  /** How long AWAKE/WARM -> COLD waits for the final snapshot. */
+  coldFinalizeMs?: number;
+  /** Budget for one substrate call on the wake path / WAKING watchdog window. */
+  wakeTimeoutMs?: number;
 }
 
 /** Boot a private instance on an ephemeral port. */
 export async function startInstance(options: TestInstanceOptions = {}): Promise<NodeInstance> {
-  const { devAuth = true, devSeed = true, warmIdleMs, coldIdleMs, ...bootOptions } = options;
+  const {
+    devAuth = true,
+    devSeed = true,
+    warmIdleMs,
+    coldIdleMs,
+    supervisorGraceMs,
+    livenessMs,
+    coldFinalizeMs,
+    wakeTimeoutMs,
+    ...bootOptions
+  } = options;
   process.env.DEV_AUTH = devAuth ? '1' : '0';
   process.env.DEV_SEED = devSeed ? '1' : '0';
   process.env.AUTH_SECRET = 'node-suite-secret-not-for-prod';
-  if (warmIdleMs !== undefined) process.env.WARM_IDLE_MS = String(warmIdleMs);
-  else delete process.env.WARM_IDLE_MS;
-  if (coldIdleMs !== undefined) process.env.COLD_IDLE_MS = String(coldIdleMs);
-  else delete process.env.COLD_IDLE_MS;
+  const numeric: [string, number | undefined][] = [
+    ['WARM_IDLE_MS', warmIdleMs],
+    ['COLD_IDLE_MS', coldIdleMs],
+    ['SUPERVISOR_GRACE_MS', supervisorGraceMs],
+    ['LIVENESS_MS', livenessMs],
+    ['COLD_FINALIZE_MS', coldFinalizeMs],
+    ['WAKE_TIMEOUT_MS', wakeTimeoutMs],
+  ];
+  for (const [key, value] of numeric) {
+    if (value !== undefined) process.env[key] = String(value);
+    else delete process.env[key];
+  }
   delete process.env.BASE_URL;
   delete process.env.MARI_SUPERVISOR_URL;
   return boot({

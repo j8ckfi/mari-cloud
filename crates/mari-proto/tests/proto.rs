@@ -132,10 +132,7 @@ fn adjacent_tagging_shape_is_stable() {
         mari_proto::from_cbor(&bytes).unwrap()
     };
     let map = value.as_map().expect("envelope is a map");
-    let keys: Vec<&str> = map
-        .iter()
-        .filter_map(|(k, _)| k.as_text())
-        .collect();
+    let keys: Vec<&str> = map.iter().filter_map(|(k, _)| k.as_text()).collect();
     assert_eq!(keys, vec!["t", "c"], "keys are t then c, in order");
     let tag = map[0].1.as_text().unwrap();
     assert_eq!(tag, "run_heartbeat");

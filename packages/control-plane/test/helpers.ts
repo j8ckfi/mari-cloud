@@ -15,7 +15,13 @@ import {
   type ManifestEntry,
 } from '@mari/shared';
 import { applySchema } from '../src/db/apply';
-import { chunkKey, manifestKey } from '../src/manifest-store';
+import {
+  chunkIdOf,
+  chunkKey,
+  encodeChunkBody,
+  manifestIdOf,
+  manifestKey,
+} from '../src/manifest-store';
 import { toArrayBuffer } from '../src/bytes';
 import type { ComputerDO } from '../src/computer-do';
 
@@ -68,18 +74,16 @@ export async function r2ObjectCount(): Promise<number> {
   return count;
 }
 
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
-  let hex = '';
-  for (const b of new Uint8Array(digest)) hex += b.toString(16).padStart(2, '0');
-  return hex;
-}
-
 /**
  * Write a real manifest + its chunks into the R2 store from a `path -> contents`
- * tree, and return the manifest id. Same content-addressing stand-in as the dev
- * seed (SHA-256 for blake3, contracts.md Appendix A) — the diff and file-read
- * paths only require ids to be self-consistent with the chunks they name.
+ * tree, and return the manifest id.
+ *
+ * The bytes obey the real storage contract (contracts.md §3/§9): chunk ids are
+ * the blake3 of the plaintext, the manifest id is the blake3 of its CBOR, and
+ * every chunk body is a zstd frame — so anything read back through
+ * `manifest-store.ts` goes through the same decompress-and-verify path a
+ * `mari-core`-written computer does. (Cross-language proof that the two really
+ * agree lives in `chunk-read.test.ts`, which reads a store `mari-core` wrote.)
  */
 export async function writeManifestTree(tree: Record<string, string>): Promise<string> {
   const enc = new TextEncoder();
@@ -98,8 +102,13 @@ export async function writeManifestTree(tree: Record<string, string>): Promise<s
   }
   for (const [path, contents] of Object.entries(tree)) {
     const bytes = enc.encode(contents);
-    const id = await sha256Hex(bytes);
-    await env.STORE.put(chunkKey(id), bytes);
+    if (bytes.length === 0) {
+      // An empty file has zero chunk refs, exactly as mari-core records it.
+      entries.push({ path, kind: 'file', mode: 0o100644, size: 0, symlink_target: null, chunks: [] });
+      continue;
+    }
+    const id = chunkIdOf(bytes);
+    await env.STORE.put(chunkKey(id), toArrayBuffer(encodeChunkBody(bytes)));
     entries.push({
       path,
       kind: 'file',
@@ -112,8 +121,8 @@ export async function writeManifestTree(tree: Record<string, string>): Promise<s
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const manifest: Manifest = { version: 1, parent: null, created_at: 1_700_000_000, entries };
   const cbor = encodeCbor(manifest);
-  const id = await sha256Hex(cbor);
-  await env.STORE.put(manifestKey(id), cbor);
+  const id = manifestIdOf(cbor);
+  await env.STORE.put(manifestKey(id), toArrayBuffer(cbor));
   return id;
 }
 

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { CONTROL_PLANE, coldCard, resetLayouts, seedRecord } from './helpers';
+import { CONTROL_PLANE, coldCard, resetFleet, seedRecord } from './helpers';
 // @ts-expect-error — plain .mjs helper, transpiled in-process by Playwright.
 import { startFakeSupervisor } from './fake-supervisor.mjs';
 
@@ -28,7 +28,7 @@ test.describe('starting a run', () => {
 
   test('palette → Run command starts a run that appears in the runs list', async ({ page, request }) => {
     // Pane layouts persist (spec 8.6); start from a known-empty workspace.
-    await resetLayouts(request);
+    await resetFleet(request);
     const requests: string[] = [];
     page.on('request', (r) => {
       if (r.url().includes('/api/')) requests.push(`${r.method()} ${new URL(r.url()).pathname}`);
@@ -84,7 +84,7 @@ test.describe('starting a run', () => {
   });
 
   test('a completed run offers Keep and Revert over its difference (spec 5.3)', async ({ page, request }) => {
-    await resetLayouts(request);
+    await resetFleet(request);
     await page.goto('/');
     const card = coldCard(page);
     await expect(card).toBeVisible();

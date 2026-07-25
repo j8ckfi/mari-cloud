@@ -37,18 +37,18 @@ pub mod snapshot;
 pub mod store;
 
 pub use chunker::{ChunkerConfig, Cut};
-pub use diff::{diff, ManifestDiff, ModifiedEntry};
+pub use diff::{ManifestDiff, ModifiedEntry, diff};
 pub use error::{Error, Result};
 pub use gc::{
-    collect_live_set, execute, plan, plan_at, DeadChunk, GcAction, GcAuditEntry, GcMode, GcPlan,
-    GcReport,
+    DeadChunk, GcAction, GcAuditEntry, GcMode, GcPlan, GcReport, collect_live_set, execute, plan,
+    plan_at,
 };
-pub use heat::{load_heat, store_heat, HeatRecorder};
-pub use restore::{restore, RestoreOptions, RestoreStats};
-pub use rootfs::{manifest_components, RootDir, RootWalk, WalkEntry};
+pub use heat::{HeatRecorder, load_heat, store_heat};
+pub use restore::{RestoreOptions, RestoreStats, restore};
+pub use rootfs::{RootDir, RootWalk, WalkEntry, manifest_components};
 pub use snapshot::{
-    default_credential_excludes, delta_chunks, manifest_chunks, snapshot, SnapshotOptions,
-    SnapshotResult,
+    SnapshotOptions, SnapshotResult, default_credential_excludes, delta_chunks, manifest_chunks,
+    snapshot,
 };
 pub use store::ChunkStore;
 

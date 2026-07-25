@@ -19,6 +19,7 @@ import type {
   MaterializeSpec,
   ExecOptions,
   ExecResult,
+  InstanceStatus,
 } from './substrates/provider';
 
 export type {
@@ -27,9 +28,14 @@ export type {
   MaterializeSpec,
   ExecOptions,
   ExecResult,
+  InstanceStatus,
 } from './substrates/provider';
 
-/** One recorded driver call, for test observability. */
+/** One recorded driver call, for test observability. Exactly the spec §3.5
+ *  functions: these are the calls that CHANGE a substrate's state. A liveness
+ *  probe is a read and is recorded separately (`FakeSubstrate.probes`), so a
+ *  suite asserting a lifecycle (`['materialize','sleep','destroy']`) is not
+ *  disturbed by the control plane checking whether an instance still exists. */
 export interface SubstrateCall {
   op: 'materialize' | 'destroy' | 'sleep' | 'wake' | 'exec' | 'exposePort';
   at: number;
@@ -47,7 +53,56 @@ export class FakeSubstrate implements SubstrateProvider {
    *  hands `marid` (contracts.md §5.1 / crates/marid/src/config.rs) and not just
    *  that a call happened. */
   readonly specs: MaterializeSpec[] = [];
+  /** Every liveness probe, in order: `[handleId, verdict]`. Kept out of
+   *  {@link calls} because a probe changes nothing (see {@link SubstrateCall}). */
+  readonly probes: { id: string; status: InstanceStatus }[] = [];
+  /**
+   * Handles whose instance no longer exists — destroyed, or EVICTED out from
+   * under the control plane ({@link evict}, the thing `docker rm -f` does to a
+   * real computer). Such a handle answers `gone` and every state-changing call on
+   * it fails the way a real substrate's would.
+   *
+   * Absence is `alive`, deliberately: a handle this fake has never seen (the
+   * control plane restarted and read one out of durable storage) names a resource
+   * a real substrate would still have.
+   */
+  readonly evictedHandles = new Set<string>();
+  /** Every handle id this fake has issued, in order. */
+  readonly issued: string[] = [];
+  /** Force every probe's verdict, whatever the handle bookkeeping says. */
+  statusOverride: InstanceStatus | null = null;
+  /** Make {@link instanceStatus} reject, so the DO's "cannot be asked" path (a
+   *  driver that misbehaves despite the contract) is exercised. */
+  statusThrows = false;
   #seq = 0;
+
+  /**
+   * Kill the instance behind `id` out from under the control plane. Nothing is
+   * told: exactly like a container the daemon removed, which is the defect this
+   * whole recovery path exists for.
+   */
+  evict(id: string): void {
+    this.evictedHandles.add(id);
+  }
+
+  /** Evict every instance this fake has handed out; returns how many. */
+  evictAll(): number {
+    for (const id of this.issued) this.evictedHandles.add(id);
+    return this.issued.length;
+  }
+
+  /** True while the fake still holds an instance for `id`. */
+  isLive(id: string): boolean {
+    return !this.evictedHandles.has(id);
+  }
+
+  async instanceStatus(handle: SubstrateHandle): Promise<InstanceStatus> {
+    if (this.statusThrows) throw new Error('fake: liveness unavailable');
+    const status: InstanceStatus =
+      this.statusOverride ?? (this.evictedHandles.has(handle.id) ? 'gone' : 'alive');
+    this.probes.push({ id: handle.id, status });
+    return status;
+  }
 
   /** Count of wake-ish operations, for "did browsing wake it?" assertions. */
   get wakeCount(): number {
@@ -62,19 +117,37 @@ export class FakeSubstrate implements SubstrateProvider {
   async materialize(spec: MaterializeSpec): Promise<SubstrateHandle> {
     this.calls.push({ op: 'materialize', at: Date.now(), detail: spec.computer });
     this.specs.push(spec);
-    return { substrate: 'fake', computer: spec.computer, id: `fake-${++this.#seq}` };
+    const id = `fake-${++this.#seq}`;
+    this.evictedHandles.delete(id);
+    this.issued.push(id);
+    return { substrate: 'fake', computer: spec.computer, id };
   }
 
   async destroy(handle: SubstrateHandle): Promise<void> {
     this.calls.push({ op: 'destroy', at: Date.now(), detail: handle.id });
+    this.evictedHandles.add(handle.id);
   }
 
   async sleep(handle: SubstrateHandle): Promise<void> {
     this.calls.push({ op: 'sleep', at: Date.now(), detail: handle.id });
+    // WARM keeps the resources (spec §2), so a live handle stays live — but a
+    // resource that is GONE cannot be slept, and a real daemon says so (Docker
+    // answers 404 for `pause` on a container that was removed). The tier alarm
+    // firing against an already-evicted instance is one of the wedges this
+    // matters for.
+    if (this.evictedHandles.has(handle.id)) {
+      throw new Error(`fake substrate: no such instance ${handle.id}`);
+    }
   }
 
   async wake(handle: SubstrateHandle): Promise<void> {
     this.calls.push({ op: 'wake', at: Date.now(), detail: handle.id });
+    // Resuming a resource that no longer exists is what a real substrate refuses
+    // (Docker: 404 on an evicted container), and the DO must see that refusal
+    // rather than a WARM computer that silently comes back empty.
+    if (this.evictedHandles.has(handle.id)) {
+      throw new Error(`fake substrate: no such instance ${handle.id}`);
+    }
   }
 
   async exec(
@@ -83,6 +156,9 @@ export class FakeSubstrate implements SubstrateProvider {
     _opts?: ExecOptions,
   ): Promise<ExecResult> {
     this.calls.push({ op: 'exec', at: Date.now(), detail: argv });
+    if (this.evictedHandles.has(handle.id)) {
+      throw new Error(`fake substrate: no such instance ${handle.id}`);
+    }
     return { exitCode: 0, stdout: '', stderr: '' };
   }
 

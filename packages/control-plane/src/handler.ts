@@ -4,8 +4,15 @@
 
 import { createApp } from './app';
 import { parsePreviewHost } from './host';
-import { makeAuth, assertProductionSafety } from './auth';
-import { getOwnedComputer } from './db/fleet';
+import { makeAuth, assertProductionSafety, resolveAuthConfig } from './auth';
+import { getComputer, getOwnedComputer } from './db/fleet';
+import {
+  PREVIEW_COOKIE,
+  PREVIEW_TOKEN_PARAM,
+  previewUserLabel,
+  readCookie,
+  verifyPreviewToken,
+} from './preview';
 import type { Env } from './types';
 
 const app = createApp();
@@ -70,16 +77,104 @@ async function tryWsRoute(request: Request, env: Env): Promise<Response | null> 
   return stub.fetch(forwarded);
 }
 
+/** A refusal on the preview surface. Deliberately terse and identical in shape
+ *  for "no such computer" and "not yours": the preview host of a computer that
+ *  exists must not be distinguishable from one that does not. Nothing here
+ *  touches the Durable Object, so a refused request costs no substrate call and
+ *  cannot wake anything (spec 10.3's denial-of-wallet concern). */
+function previewRefused(status: 401 | 404, reason: string): Response {
+  return new Response(`${reason}\n`, {
+    status,
+    headers: { 'content-type': 'text/plain; charset=utf-8', 'x-mari-preview': reason },
+  });
+}
+
 async function tryWakeProxy(request: Request, env: Env): Promise<Response | null> {
   const zone = env.PREVIEW_ZONE ?? 'mari.sh';
   // The request URL host is authoritative behind Cloudflare and in tests; fall
   // back to the Host header if a URL host is somehow absent.
-  const host = new URL(request.url).host || request.headers.get('host');
+  const url = new URL(request.url);
+  const host = url.host || request.headers.get('host');
   const target = parsePreviewHost(host, zone);
   if (!target) return null;
 
+  // ---- AUTHORIZE FIRST (SEC-03) --------------------------------------------
+  //
+  // This route reaches a computer's published ports and, on a computer that is
+  // not AWAKE, MATERIALIZES substrate resources. Both consequences are per-user,
+  // so the decision is made here, before the DO is addressed at all.
+  const row = await getComputer(env.DB, target.computer);
+  if (!row) return previewRefused(404, 'no_such_preview');
+  // The user field is part of the address, so it is part of the check: a label
+  // that is not this computer's owner's is not this computer's preview host.
+  if ((await previewUserLabel(row.userId)) !== target.user) {
+    return previewRefused(404, 'no_such_preview');
+  }
+
+  const secret = resolveAuthConfig(env).secret;
+  const queryToken = url.searchParams.get(PREVIEW_TOKEN_PARAM);
+  const cookieToken = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE);
+
+  let authorized = await verifyPreviewToken(secret, cookieToken, target.computer, target.port);
+  let mintCookie: string | null = null;
+
+  if (!authorized && queryToken !== null) {
+    if (await verifyPreviewToken(secret, queryToken, target.computer, target.port)) {
+      authorized = true;
+      mintCookie = queryToken;
+    }
+  }
+
+  if (!authorized) {
+    // An owning SESSION also authorizes — an operator with curl, and any
+    // deployment whose session cookie is scoped to the whole zone.
+    const session = await makeAuth(env).api.getSession({ headers: request.headers });
+    if (session?.user && (await getOwnedComputer(env.DB, target.computer, session.user.id))) {
+      authorized = true;
+    }
+  }
+
+  if (!authorized) return previewRefused(401, 'preview_unauthorized');
+
+  // A capability that arrived in the query string becomes a cookie for this
+  // preview host and is redirected out of the URL, so the iframe's subsequent
+  // asset requests carry it and the token stops appearing in the address bar,
+  // the referrer, or a screenshot. Only for a safe method — a POST must not be
+  // turned into a redirect that drops its body.
+  if (mintCookie !== null && (request.method === 'GET' || request.method === 'HEAD')) {
+    const clean = new URL(request.url);
+    clean.searchParams.delete(PREVIEW_TOKEN_PARAM);
+    const secure = clean.protocol === 'https:' ? '; Secure' : '';
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: clean.pathname + (clean.search === '' ? '' : clean.search),
+        'set-cookie':
+          `${PREVIEW_COOKIE}=${encodeURIComponent(mintCookie)}; Path=/; HttpOnly; ` +
+          `SameSite=Lax${secure}`,
+        'cache-control': 'no-store',
+      },
+    });
+  }
+
   const stub = env.COMPUTER.get(env.COMPUTER.idFromName(target.computer));
   const headers = new Headers(request.headers);
+  // Mari's own credentials stop here. The thing on the other side is whatever the
+  // user is running on their computer; it has no business receiving the session
+  // cookie or the preview capability that got the request this far.
+  // `better-auth` is matched anywhere in the NAME, not just at the start: a
+  // production session cookie is `__Secure-better-auth.session_token`, and a
+  // prefix-only filter would forward it.
+  const guestCookies = (request.headers.get('cookie') ?? '')
+    .split(';')
+    .map((c) => c.trim())
+    .filter((c) => {
+      if (c === '') return false;
+      const name = c.slice(0, c.indexOf('=') === -1 ? c.length : c.indexOf('=')).toLowerCase();
+      return !name.startsWith('mari_') && !name.includes('better-auth');
+    });
+  if (guestCookies.length === 0) headers.delete('cookie');
+  else headers.set('cookie', guestCookies.join('; '));
   headers.set('x-mari-proxy-port', String(target.port));
   headers.set('x-mari-computer', target.computer);
   const forwarded = new Request(request.url, {

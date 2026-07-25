@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { coldCard, installSpinnerWatchdog, resetLayouts, spinnerSeen } from './helpers';
+import { coldCard, installSpinnerWatchdog, resetFleet, spinnerSeen } from './helpers';
 
 // Spec 8.4: "A write to such a computer starts a wake." Spec 8.3: "A spinner in
 // front of the interface is not permitted."
@@ -12,7 +12,7 @@ import { coldCard, installSpinnerWatchdog, resetLayouts, spinnerSeen } from './h
 // never fired.
 test.describe('editor save wakes without blocking', () => {
   test('Save issues PUT /file and shows the state transition, no spinner', async ({ page, request }) => {
-    await resetLayouts(request);
+    await resetFleet(request);
     await installSpinnerWatchdog(page);
 
     const writes: string[] = [];

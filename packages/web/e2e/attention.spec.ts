@@ -3,7 +3,7 @@ import {
   CONTROL_PLANE,
   coldCard,
   installSpinnerWatchdog,
-  resetLayouts,
+  resetFleet,
   seedRecord,
   spinnerSeen,
 } from './helpers';
@@ -34,7 +34,7 @@ test.describe('attention (spec 6.2)', () => {
   });
 
   test('a waiting run badges the fleet and opens its terminal pane', async ({ page, request }) => {
-    await resetLayouts(request);
+    await resetFleet(request);
     await installSpinnerWatchdog(page);
     await page.goto('/');
 

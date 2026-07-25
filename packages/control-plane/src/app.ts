@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv, Env } from './types';
-import { makeAuth, assertProductionSafety, isProductionEnv } from './auth';
+import { makeAuth, assertProductionSafety, isProductionEnv, resolveAuthConfig } from './auth';
 import { runSeed } from './seed';
 import { toArrayBuffer, toBase64 } from './bytes';
 import {
@@ -19,6 +19,7 @@ import {
   PathNotFound,
   NotAFile,
   FileTooLarge,
+  ChunkReadError,
 } from './manifest-store';
 import { changedCount, diffManifestIds, type ManifestDiff } from './diff';
 import { costMeter } from './pricing';
@@ -35,11 +36,19 @@ import {
   listComputers,
   renameComputer,
   deleteComputer,
+  deleteSecret,
   insertLineage,
   listSecretNames,
   setSecret,
   type ComputerRow,
 } from './db/fleet';
+import { MAX_INLINE_FILE_BYTES } from './manifest-store';
+import {
+  PREVIEW_TOKEN_TTL_MS,
+  mintPreviewToken,
+  previewUrlFor,
+  previewUserLabel,
+} from './preview';
 
 function newComputerId(): string {
   return crypto.randomUUID().replace(/-/g, '');
@@ -140,6 +149,10 @@ function toRunSummary(r: RunRecord) {
     diff: r.diff,
     review: r.disposition,
     // Control-plane detail beyond the web's minimum (harmless extra fields).
+    // `status` is the control plane's own lifecycle, which carries one thing the
+    // five client states cannot: `interrupted` — a run whose computer's substrate
+    // died under it (spec 5.6), as opposed to one that failed on its own terms.
+    status: r.status,
     kind: r.kind,
     agent: r.agent,
     queuedAt: r.queuedAt,
@@ -284,10 +297,50 @@ export function createApp(env?: Env): Hono<AppEnv> {
     return res;
   });
 
+  // ---- runtime configuration the CLIENT cannot know at build time ----
+  //
+  // Unauthenticated on purpose, and content-free: it carries no user data, only
+  // what this deployment is. Two things depended on it and had no way to learn
+  // them, so both were hardcoded in the web bundle and wrong everywhere else:
+  //
+  //  - the preview zone/scheme (spec 8.5): `VITE_PREVIEW_ZONE` was build-time
+  //    only, the scheme was a literal `https`, and the user field was the literal
+  //    string `'user'` — so the browser-preview pane could never work on a
+  //    private instance, whatever the operator configured.
+  //  - whether email+password sign-in exists at all (`DEV_AUTH`), which is the
+  //    private instance's documented sign-in and was unreachable from the app
+  //    because the sign-in screen could not know it was enabled.
+  app.get('/api/config', (c) => {
+    const zone = c.env.PREVIEW_ZONE ?? 'mari.sh';
+    const base = c.env.BASE_URL;
+    let scheme = 'http';
+    let port = '';
+    try {
+      const url = new URL(base ?? 'http://localhost');
+      scheme = url.protocol === 'https:' ? 'https' : 'http';
+      port = url.port;
+    } catch {
+      /* keep the defaults */
+    }
+    return c.json({
+      previewZone: zone,
+      previewScheme: scheme,
+      previewPort: port,
+      devAuth: c.env.DEV_AUTH === '1',
+      devSeed: c.env.DEV_SEED === '1',
+      // The write/read ceiling the files and editor panes must respect, so the UI
+      // can refuse a too-large file with a real number instead of discovering it
+      // as a 413 (they are equal by construction — see runs.ts).
+      maxWriteBytes: MAX_WRITE_BYTES,
+      maxReadBytes: MAX_INLINE_FILE_BYTES,
+    });
+  });
+
   // ---- session guard for the rest of /api/* (spec 10, decisions.md Auth) ----
   app.use('/api/*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
     if (path.startsWith('/api/auth') || path.startsWith('/api/dev')) return next();
+    if (path === '/api/config') return next();
     const session = await makeAuth(c.env).api.getSession({ headers: c.req.raw.headers });
     if (!session?.user) return c.json({ error: 'unauthorized' }, 401);
     c.set('user', { id: session.user.id, email: session.user.email });
@@ -348,8 +401,15 @@ export function createApp(env?: Env): Hono<AppEnv> {
     const body = (await c.req.json().catch(() => ({}))) as { name?: string };
     const name = (body.name ?? 'computer').toString().slice(0, 200);
     const id = newComputerId();
-    const row = await insertComputer(c.env.DB, { id, name, userId: c.get('user').id });
-    await stubFor(c.env, id).initFromManifest(id, null);
+    // A NEW computer starts at the fleet's base-image manifest (spec §2 "the
+    // fleet stores each base image once"), not at nothing. With a null head its
+    // file browser and editor answered `404 no_manifest` until something
+    // snapshotted it, so a first-run user's very first computer looked broken.
+    // The head is a manifest ID only — spec 9.1's "a fork transfers no bulk
+    // data" applies here for the same reason: shared chunks, no copy.
+    const head = c.env.BASE_MANIFEST ?? null;
+    const row = await insertComputer(c.env.DB, { id, name, userId: c.get('user').id, head });
+    await stubFor(c.env, id).initFromManifest(id, head);
     return c.json({ id: row.id, name: row.name, state: row.state, head: row.head }, 201);
   });
 
@@ -375,19 +435,86 @@ export function createApp(env?: Env): Hono<AppEnv> {
   });
 
   // ---- wake ----
+  //
+  // HONEST IN EVERY OUTCOME, which is the whole point of this route existing at
+  // all. Three things it must never do: claim success it cannot deliver ("already
+  // awake" for a computer whose container was removed — the wedge this closes),
+  // hang the client while a substrate makes up its mind (every substrate call on
+  // the wake path is bounded inside the DO), or report a dead end when the DO is
+  // in fact still working on it.
   app.post('/api/computers/:id/wake', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
     const res = await stubFor(c.env, row.id).wake(row.id);
-    if (!res.ok) {
-      // A wake can fail for reasons the control plane does not control (no
-      // capacity, image pull, daemon down). The DO has already rolled itself out
-      // of WAKING; report the failure and the state it actually landed in, so
-      // the interface shows a computer the user can act on rather than a spinner
-      // that never resolves (spec 8.3).
-      return c.json({ error: res.error ?? 'wake_failed', state: res.state, epoch: res.epoch }, 503);
+    if (res.ok) return c.json({ state: res.state, epoch: res.epoch });
+    if (res.retrying) {
+      // The substrate refused BUT the DO has armed a bounded retry, so the wake is
+      // still in progress and the queued work will be taken as soon as the
+      // substrate accepts it. This is the Cloudflare case in particular: a
+      // `destroy()` followed by a `start()` on the same Durable Object is refused
+      // for MINUTES (measured >563 s), and Mari's own tier policy makes
+      // AWAKE→COLD→AWAKE exactly that sequence. 202 + the retry time is the truth;
+      // "awake" would be a lie and 503 would be a dead end.
+      return c.json(
+        {
+          error: 'wake_retrying',
+          state: res.state,
+          epoch: res.epoch,
+          retrying: true,
+          retryAt: res.retryAt,
+        },
+        202,
+      );
     }
-    return c.json({ state: res.state, epoch: res.epoch });
+    // A wake can fail for reasons the control plane does not control (no
+    // capacity, image pull, daemon down). The DO has already rolled itself out
+    // of WAKING; report the failure and the state it actually landed in, so
+    // the interface shows a computer the user can act on rather than a spinner
+    // that never resolves (spec 8.3).
+    return c.json(
+      { error: res.error ?? 'wake_failed', state: res.state, epoch: res.epoch, retrying: false },
+      503,
+    );
+  });
+
+  // ---- sleep on demand (spec 4.4; "deep sleep" is the user-visible COLD) ----
+  //
+  // The tier policy gets there on its own after an idle timeout, but a user who
+  // has finished with a computer had no way to stop it costing anything: the only
+  // route was to wait. `{deep:true}` goes all the way to COLD, where a computer
+  // costs only its delta in object storage; the default AWAKE->WARM stops compute
+  // billing while keeping the substrate disk for a fast wake (spec §2).
+  app.post('/api/computers/:id/sleep', async (c) => {
+    const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { deep?: unknown };
+    const deep = body.deep === true || new URL(c.req.url).searchParams.get('deep') === '1';
+    const stub = stubFor(c.env, row.id);
+    const state = deep ? await stub.deepSleepNow() : await stub.sleepNow();
+    // Honest about what actually happened: `requested` says whether the state the
+    // caller asked for has been reached yet. AWAKE/WARM -> COLD asks the
+    // supervisor for a final manifest first (spec 4.5) and completes when that
+    // arrives (or when its deadline expires), so the answer can legitimately
+    // still be `awake`.
+    return c.json({
+      computer: row.id,
+      state,
+      deep,
+      settled: deep ? state === 'cold' : state !== 'awake',
+    });
+  });
+
+  // ---- incidents: what Mari had to do that nobody asked for ----
+  //
+  // Content-free (spec 6.3), computer-level, and NOT the attention log: an
+  // attention event belongs to a run (spec 6.2), and "your computer's substrate
+  // instance was gone, so it is COLD at its last snapshot" belongs to no run. An
+  // operator — and a test — must be able to see that a transition completed
+  // WITHOUT the thing it asked for, instead of reading it as a clean success.
+  app.get('/api/computers/:id/incidents', async (c) => {
+    const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    return c.json({ incidents: await stubFor(c.env, row.id).listIncidents() });
   });
 
   // ---- fork (spec 9.1: head copy + lineage, zero bulk data) ----
@@ -447,9 +574,18 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.post('/api/computers/:id/attention/:eventId/dismiss', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
-    const eventId = Number(c.req.param('eventId'));
+    // A client checks `res.ok`, so an answer of `200 {ok:false}` reads as success.
+    // Two failures are distinguished and both are real status codes: an event id
+    // that is not a number is the caller's mistake (400), an id that names no
+    // undismissed event is a miss (404). Only an actual dismissal is a 200.
+    const raw = c.req.param('eventId');
+    const eventId = Number(raw);
+    if (!Number.isSafeInteger(eventId) || eventId <= 0) {
+      return c.json({ ok: false, error: 'bad_event_id', eventId: raw }, 400);
+    }
     const ok = await stubFor(c.env, row.id).dismissAttention(eventId);
-    return c.json({ ok });
+    if (!ok) return c.json({ ok: false, error: 'attention_not_found', eventId }, 404);
+    return c.json({ ok: true, eventId });
   });
 
   // ---- credential vault names (spec 10.1) ----
@@ -464,8 +600,72 @@ export function createApp(env?: Env): Hono<AppEnv> {
     if (!row) return c.json({ error: 'not_found' }, 404);
     const body = (await c.req.json().catch(() => ({}))) as { value?: string };
     if (typeof body.value !== 'string') return c.json({ error: 'value_required' }, 400);
-    await setSecret(c.env.DB, row.id, c.req.param('name'), body.value);
-    return c.json({ ok: true, name: c.req.param('name') });
+    const name = c.req.param('name');
+    // The name becomes an environment variable in the supervisor's process
+    // (spec 10.1, see ComputerDO#maridEnv), so it must BE one — and it must not be
+    // able to shadow marid's own configuration, which carries the fencing token.
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) {
+      return c.json({ error: 'bad_name', name }, 400);
+    }
+    if (name.startsWith('MARI_')) return c.json({ error: 'reserved_name', name }, 400);
+    await setSecret(c.env.DB, row.id, name, body.value);
+    // The value is never echoed back, not even the one just written.
+    return c.json({ ok: true, name });
+  });
+
+  app.delete('/api/computers/:id/secrets/:name', async (c) => {
+    const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    const name = c.req.param('name');
+    const removed = await deleteSecret(c.env.DB, row.id, name);
+    if (!removed) return c.json({ ok: false, error: 'secret_not_found', name }, 404);
+    return c.json({ ok: true, name });
+  });
+
+  // ---- preview capability (spec 8.5 + spec 10) ----
+  //
+  // The stable URL of one port of one computer, plus the scoped capability the
+  // wake proxy requires (preview.ts). The CLIENT cannot build this URL: the zone,
+  // the scheme, the origin port and the user label are all deployment facts, and
+  // the label is a hash of the owner's id. Minting is ownership-scoped, so the
+  // capability can only ever be issued for a computer the caller owns.
+  app.get('/api/computers/:id/preview', async (c) => {
+    const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    const portRaw = new URL(c.req.url).searchParams.get('port') ?? '';
+    const port = Number(portRaw);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ error: 'bad_port', port: portRaw }, 400);
+    }
+    const zone = c.env.PREVIEW_ZONE ?? 'mari.sh';
+    const user = await previewUserLabel(row.userId);
+    const expiresAt = Date.now() + PREVIEW_TOKEN_TTL_MS;
+    const token = await mintPreviewToken(
+      resolveAuthConfig(c.env).secret,
+      row.id,
+      port,
+      expiresAt,
+    );
+    const { host, url } = previewUrlFor({
+      zone,
+      baseUrl: c.env.BASE_URL,
+      port,
+      computer: row.id,
+      user,
+      token,
+    });
+    // `url` carries the capability once (the proxy turns it into a host-scoped
+    // cookie and redirects it out of the address bar); `stableUrl` is the
+    // spec 8.5 address to bookmark or share with a session that owns it.
+    const stable = previewUrlFor({ zone, baseUrl: c.env.BASE_URL, port, computer: row.id, user });
+    return c.json({
+      computer: row.id,
+      port,
+      host,
+      url,
+      stableUrl: stable.url,
+      expiresAt,
+    });
   });
 
   // ---- live event stream (spec 6.2) ----
@@ -573,9 +773,17 @@ export function createApp(env?: Env): Hono<AppEnv> {
     const runId = c.req.param('runId');
     const res = await stubFor(c.env, row.id).stopRun(runId);
     if (!res.ok) return c.json({ error: 'run_not_found' }, 404);
+    const status = res.status ?? 'stopping';
     return c.json({
       runId,
-      state: clientRunState(res.status ?? 'stopping', null),
+      state: clientRunState(status, null),
+      // The client's five states have no `cancelled`, so a run stopped BEFORE it
+      // ever reached a supervisor projects onto `failed` — which reads as "your
+      // command broke" when the truth is "you cancelled it before it started".
+      // The control plane's own status is reported alongside so the interface can
+      // say what happened; `cancelled` is the flag it renders on.
+      status,
+      cancelled: status === 'cancelled',
       sent: res.sent,
     });
   });
@@ -636,6 +844,19 @@ export function createApp(env?: Env): Hono<AppEnv> {
     return c.json(payload);
   });
 
+  /**
+   * A chunk the store could not turn into trustworthy bytes (manifest-store.ts:
+   * missing object, undecodable zstd frame, blake3 mismatch, length disagreement).
+   *
+   * This is a STORE-INTEGRITY failure, not a bad request, so it is a 500 that
+   * names the failing chunk and carries no body bytes at all. Refusing is the
+   * point: `mari-core` verifies every chunk it reads (verify-then-use), and
+   * handing a user silently corrupt file content — into an editor that will save
+   * it back — is strictly worse than an error they can see.
+   */
+  const chunkReadResponse = (c: Context<AppEnv>, err: ChunkReadError, path: string): Response =>
+    c.json({ error: err.code, path, chunk: err.chunk === '' ? undefined : err.chunk }, 500);
+
   // ---- files from the manifest head (spec 8.4: must not wake) ----
   const filesHandler = async (c: Context<AppEnv>): Promise<Response> => {
     const id = c.req.param('id');
@@ -645,7 +866,6 @@ export function createApp(env?: Env): Hono<AppEnv> {
 
     // Head from the DO snapshot (no wake); fall back to the D1 mirror.
     const head = (await stubFor(c.env, id).describe(id)).head ?? row.head;
-    if (!head) return c.json({ error: 'no_manifest' }, 404);
 
     // Two equivalent path spellings are accepted: the URL suffix
     // (`/files/src`, used by the control-plane's own tests) and a `?path=`
@@ -666,6 +886,18 @@ export function createApp(env?: Env): Hono<AppEnv> {
       }
     }
     const path = normalizePath(rel);
+
+    // A computer with no manifest at all — created before a base image existed,
+    // or one whose first snapshot has not happened yet — has an EMPTY filesystem,
+    // not a broken one. Answering 404 for its root made a brand-new computer look
+    // like a bug in the file browser (spec 8.3: the view renders from
+    // control-plane data). A path INSIDE that empty tree is still a miss.
+    if (!head) {
+      if (path === '/') {
+        return c.json({ computer: id, manifest: null, path: '/', entries: [] });
+      }
+      return c.json({ error: 'not_found', path, manifest: null }, 404);
+    }
 
     try {
       const manifest = await loadManifest(c.env.STORE, head);
@@ -695,6 +927,7 @@ export function createApp(env?: Env): Hono<AppEnv> {
       if (err instanceof PathNotFound) return c.json({ error: 'not_found', path }, 404);
       if (err instanceof NotAFile) return c.json({ error: 'not_a_file', path }, 400);
       if (err instanceof FileTooLarge) return c.json({ error: 'too_large', path }, 413);
+      if (err instanceof ChunkReadError) return chunkReadResponse(c, err, path);
       throw err;
     }
   };
@@ -739,6 +972,7 @@ export function createApp(env?: Env): Hono<AppEnv> {
       if (err instanceof PathNotFound) return c.json({ error: 'not_found', path }, 404);
       if (err instanceof NotAFile) return c.json({ error: 'not_a_file', path }, 400);
       if (err instanceof FileTooLarge) return c.json({ error: 'too_large', path }, 413);
+      if (err instanceof ChunkReadError) return chunkReadResponse(c, err, path);
       throw err;
     }
   });

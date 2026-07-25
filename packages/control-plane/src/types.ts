@@ -81,6 +81,25 @@ export interface Env {
   /** WARM -> COLD idle threshold, ms (default 30 min). */
   COLD_IDLE_MS?: string;
 
+  // ---- liveness and recovery (computer-do.ts) ------------------------------
+  // A substrate evicts an instance and tells nobody; these four numbers are how
+  // long Mari waits before it stops believing its own record of AWAKE.
+
+  /** Grace after the supervisor's socket closes before the substrate is asked
+   *  whether the instance is alive, ms (default 15 s). A network blip is not a
+   *  dead container. */
+  SUPERVISOR_GRACE_MS?: string;
+  /** Health-check cadence for an AWAKE computer with work in flight, ms
+   *  (default 30 s). A supervisor that spoke inside the window is its own proof,
+   *  so a healthy computer costs no substrate call. */
+  LIVENESS_MS?: string;
+  /** How long AWAKE/WARM -> COLD waits for the supervisor's final snapshot
+   *  before finalizing from the last known head, ms (default 20 s). */
+  COLD_FINALIZE_MS?: string;
+  /** Budget for ONE substrate call on the wake path, and the WAKING watchdog
+   *  window, ms (default 120 s). A driver that hangs must not hang the client. */
+  WAKE_TIMEOUT_MS?: string;
+
   // ---- materialize configuration (spec 3.5 `materialize`, spec 11.2) -------
   // The Durable Object hands `marid` its whole configuration when it
   // materializes a computer (crates/marid/src/config.rs). Everything below is

@@ -4,7 +4,7 @@
 mod common;
 
 use common::{build_reference_tree, read_tree};
-use mari_core::{restore, snapshot, ChunkStore, ChunkerConfig, RestoreOptions, SnapshotOptions};
+use mari_core::{ChunkStore, ChunkerConfig, RestoreOptions, SnapshotOptions, restore, snapshot};
 use mari_proto::EntryKind;
 
 /// Small chunker so the multi-MB file is split into many chunks.
@@ -122,7 +122,7 @@ async fn restore_honors_priority_order() {
 
 #[tokio::test]
 async fn restore_rejects_path_traversal() {
-    use mari_proto::{Manifest, ManifestEntry, MANIFEST_VERSION};
+    use mari_proto::{MANIFEST_VERSION, Manifest, ManifestEntry};
 
     let tmp = tempfile::tempdir().unwrap();
     let store = ChunkStore::open_fs(tmp.path().join("store")).unwrap();

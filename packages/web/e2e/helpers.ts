@@ -115,3 +115,37 @@ export async function resetLayouts(request: APIRequestContext): Promise<void> {
     if (!put.ok()) throw new Error(`layout reset failed for ${c.id}: ${put.status()}`);
   }
 }
+
+/**
+ * Return the whole fleet to the state `global.setup.ts` produced: both seeded
+ * computers COLD at the seeded manifest, no runs, no attention events, no
+ * journal, and no saved pane layouts.
+ *
+ * `resetLayouts` alone is not enough, and the gap was ORDER-DEPENDENT, which is
+ * the worst kind. Several specs legitimately WAKE a computer — an editor save on
+ * a COLD computer starts a wake (spec 8.4), a run starts one (spec 8.3) — and
+ * nothing brings it back: `wrangler dev` inherits no short tier thresholds, and
+ * when a fake supervisor's socket closes with work in flight the recovery path
+ * correctly re-wakes the computer (`mari: recovering computer=… epoch=3
+ * reason=supervisor_lost state=awake pendingWork=true`). So from the first spec
+ * that saves or runs, `coldCard()` matches NOTHING for the rest of the file
+ * order, and four tests that pass in isolation fail in the suite. The product is
+ * behaving correctly in every one of those steps; the suite was inheriting state.
+ *
+ * `POST /api/dev/seed` is idempotent and is the reset: it upserts the seed user
+ * (so the saved `storageState` cookie stays valid), recreates both computers
+ * COLD in D1, and calls `resetSeedState` + `initFromManifest` on each Durable
+ * Object — which is what puts `state` back to `cold` (see
+ * `packages/control-plane/src/seed.ts`).
+ *
+ * Like `resetLayouts` it runs on the `request` fixture, not the page, so a spec
+ * that asserts "browsing a COLD computer wakes nothing" (`installNoWakeSpy`) is
+ * unaffected: none of this is page traffic.
+ */
+export async function resetFleet(request: APIRequestContext): Promise<void> {
+  const seeded = await request.post('/api/dev/seed', { data: {} });
+  if (!seeded.ok()) {
+    throw new Error(`fleet reset (dev seed) failed: ${seeded.status()} ${await seeded.text()}`);
+  }
+  await resetLayouts(request);
+}

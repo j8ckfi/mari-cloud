@@ -15,6 +15,7 @@ import { useEventsStore } from './store/events';
 import { activeEditor, activeFiles } from './store/pane-actions';
 import { allAttention, attentionFor } from './events/reducer';
 import { snapshotComputer, stopRun } from './api/client';
+import { openShellTerminal } from './runs/shell';
 
 /** The one shared registry for the running app. */
 export const registry = new CommandRegistry();
@@ -54,7 +55,12 @@ export function coreCommands(): Command[] {
       title: 'New terminal pane',
       group: 'Pane',
       keywords: ['shell', 'console'],
-      run: () => s().addPane({ kind: 'terminal', run: 'shell' }),
+      // A terminal pane is a view of a RUN (spec 7.1), so this starts one. It
+      // used to open a pane bound to the literal run id 'shell', which never
+      // existed: the pane was permanently blank.
+      run: async () => {
+        await openShellTerminal();
+      },
     },
     {
       id: 'pane.new.files',

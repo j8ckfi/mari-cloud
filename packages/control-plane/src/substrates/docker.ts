@@ -18,7 +18,14 @@
 
 import { existsSync } from 'node:fs';
 import type DockerT from 'dockerode';
-import type { MaterializeSpec, SubstrateHandle, SubstrateProvider, ExecOptions, ExecResult } from './provider.js';
+import type {
+  MaterializeSpec,
+  SubstrateHandle,
+  SubstrateProvider,
+  ExecOptions,
+  ExecResult,
+  InstanceStatus,
+} from './provider.js';
 
 /** The registry name of this driver. */
 export const DOCKER_SUBSTRATE = 'docker';
@@ -239,6 +246,30 @@ export class DockerProvider implements SubstrateProvider {
     const binding = bindings.find((b) => b.HostIp === '127.0.0.1') ?? bindings[0]!;
     const host = binding.HostIp && binding.HostIp !== '0.0.0.0' ? binding.HostIp : '127.0.0.1';
     return `http://${host}:${binding.HostPort}`;
+  }
+
+  /**
+   * Does this container still exist? (provider.ts's optional liveness
+   * declaration.)
+   *
+   * `inspect` is the same call {@link exposePort} already makes, and it is the
+   * only honest answer available: `docker rm -f` (an eviction, by hand or by the
+   * daemon) leaves nothing behind, and the daemon then answers 404. A container
+   * that exists in ANY state — running, paused (WARM), exited — is `alive`: the
+   * question is whether the resources are still there, not whether a process is.
+   *
+   * Anything that is not a 404 is `unknown` rather than `gone`: a daemon that is
+   * restarting, a socket that vanished, or a timeout must not be read as "the
+   * user's computer was destroyed".
+   */
+  async instanceStatus(handle: SubstrateHandle): Promise<InstanceStatus> {
+    isDockerHandle(handle);
+    try {
+      const info = await this.docker.getContainer(handle.id).inspect();
+      return info?.Id ? 'alive' : 'unknown';
+    } catch (err) {
+      return statusCode(err) === 404 ? 'gone' : 'unknown';
+    }
   }
 
   /** Pull `image` if the daemon does not already have it (task: "pull image if absent"). */
