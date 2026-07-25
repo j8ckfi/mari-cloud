@@ -5,6 +5,11 @@ dist/
 .env
 .dev.vars
 *.local
+# Never commit a secrets file. The first deploy of a Worker that declares a
+# required secret must pass it with --secrets-file (see deploy/DEPLOY.md §2).
+.prod-secrets
+*.secrets
+secrets.json
 test-results/
 playwright-report/
 .DS_Store
