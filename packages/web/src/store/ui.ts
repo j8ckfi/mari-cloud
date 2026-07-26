@@ -44,8 +44,6 @@ interface UiState {
   /** Per-computer pane layout. */
   layouts: Record<string, Layout>;
   paletteOpen: boolean;
-  /** The "Run command" prompt (spec 8.1: every command is keyboard-reachable). */
-  runLauncherOpen: boolean;
   /**
    * One line of plain text reporting the outcome of a command the user ran
    * from the palette (a snapshot, a stop). It is text, not a spinner: spec 8.3
@@ -82,7 +80,6 @@ interface UiState {
   // ---- palette ----
   setPaletteOpen(open: boolean): void;
   togglePalette(): void;
-  setRunLauncherOpen(open: boolean): void;
   setNotice(text: string): void;
 }
 
@@ -92,7 +89,6 @@ export const useUiStore = create<UiState>((set, get) => ({
   activeComputer: null,
   layouts: {},
   paletteOpen: false,
-  runLauncherOpen: false,
   notice: '',
 
   setWorkspaces: (ids) => set({ workspaces: ids }),
@@ -206,7 +202,6 @@ export const useUiStore = create<UiState>((set, get) => ({
 
   setPaletteOpen: (open) => set({ paletteOpen: open }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
-  setRunLauncherOpen: (open) => set({ runLauncherOpen: open }),
   setNotice: (text) => set({ notice: text }),
 }));
 

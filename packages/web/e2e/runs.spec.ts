@@ -3,9 +3,11 @@ import { CONTROL_PLANE, coldCard, resetFleet, seedRecord } from './helpers';
 // @ts-expect-error — plain .mjs helper, transpiled in-process by Playwright.
 import { startFakeSupervisor } from './fake-supervisor.mjs';
 
-// Spec 5 + 8.1: a run starts from the command palette with no pointer, reaches
-// the control plane, is handed to the SUPERVISOR (the fake one here, speaking
-// the real framed-CBOR protocol), and shows up in the workspace's run list.
+// Spec 5 + 7.1 + 8.1: a run starts from the command palette with no pointer —
+// as a TERMINAL, because a terminal pane is a view of a run and there is no
+// separate "run command" prompt — reaches the control plane, is handed to the
+// SUPERVISOR (the fake one here, speaking the real framed-CBOR protocol), and
+// shows up in the workspace's run list.
 //
 // The teeth: the run id asserted in the UI is the one the SUPERVISOR was told
 // to start. A UI that optimistically drew a row without the request landing, or
@@ -26,7 +28,7 @@ test.describe('starting a run', () => {
     supervisor = null;
   });
 
-  test('palette → Run command starts a run that appears in the runs list', async ({ page, request }) => {
+  test('palette → New terminal starts a shell run that appears in the runs list', async ({ page, request }) => {
     // Pane layouts persist (spec 8.6); start from a known-empty workspace.
     await resetFleet(request);
     const requests: string[] = [];
@@ -50,18 +52,14 @@ test.describe('starting a run', () => {
     await card.click();
     await expect(page.getByTestId('workspace')).toBeVisible();
 
-    // Keyboard only: Cmd+K → "Run command" → type the command → Enter.
+    // Keyboard only: Cmd+K → "New terminal pane" → Enter. The shell run starts
+    // right away; the command itself would be typed into the shell.
     await page.keyboard.press('Meta+k');
     await expect(page.getByTestId('palette')).toBeVisible();
-    await page.getByTestId('palette-input').fill('run command');
+    await page.getByTestId('palette-input').fill('terminal');
     await expect(
-      page.locator('[data-testid="palette-item"][data-command-id="run.start"]'),
+      page.locator('[data-testid="palette-item"][data-command-id="pane.new.terminal"]'),
     ).toBeVisible();
-    await page.keyboard.press('Enter');
-
-    const input = page.getByTestId('run-launcher-input');
-    await expect(input).toBeFocused();
-    await input.fill('echo mari-run');
     await page.keyboard.press('Enter');
 
     // The control plane received the start and forwarded it to the supervisor.
@@ -76,11 +74,12 @@ test.describe('starting a run', () => {
       page.locator(`[data-testid="terminal-pane"][data-run="${runId}"]`),
     ).toBeVisible({ timeout: 15_000 });
 
-    // …and the runs list shows it, with the argv that was sent.
+    // …and the runs list shows it, with the interactive-shell argv that was
+    // sent (spec 7.1: the terminal IS this run's view).
     await page.getByTestId('add-runs-pane').click();
     const row = page.locator(`[data-testid="run-row"][data-run-id="${runId}"]`);
     await expect(row).toBeVisible({ timeout: 15_000 });
-    await expect(row.getByTestId('run-argv')).toHaveText('echo mari-run');
+    await expect(row.getByTestId('run-argv')).toHaveText('/bin/sh -i');
   });
 
   test('a completed run offers Keep and Revert over its difference (spec 5.3)', async ({ page, request }) => {
@@ -103,9 +102,9 @@ test.describe('starting a run', () => {
     supervisor = sup;
 
     await card.click();
-    await page.getByTestId('workspace-run-command').click();
-    await page.getByTestId('run-launcher-input').fill('touch /tmp/made-by-mari');
-    await page.keyboard.press('Enter');
+    // Any run will do for reviewing a diff; a terminal's shell run is the one
+    // the interface starts.
+    await page.getByTestId('add-terminal-pane').click();
 
     const runId = await sup.waitForRun(15_000);
     // The supervisor reports a completion with a real diff summary (§5.1).

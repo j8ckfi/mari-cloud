@@ -1,11 +1,11 @@
 // Turning what the user typed into an `argv` (contracts §5.2 `start_run` takes
 // `argv: string[]`, never a shell string — the supervisor execs it directly).
 //
-// The palette's "Run command" takes one line of text. A run is the user's
-// business (spec 6.3), so this does the least interpretation that still lets a
-// user type `git commit -m "wip thing"`: POSIX-ish quoting, nothing else. No
-// globbing, no variable expansion, no operators — a user who wants a shell says
-// so (`sh -lc '…'`).
+// A brief's `#!` line is one line of text. A run is the user's business (spec
+// 6.3), so this does the least interpretation that still lets a shebang say
+// `some-runner --flag "an arg"`: POSIX-ish quoting, nothing else. No globbing,
+// no variable expansion, no operators — a runner that wants a shell says so
+// (`sh -lc '…'`).
 
 /** The default runner for a brief document (spec 8.5: "a brief … starts as a run"). */
 export const BRIEF_RUNNER = 'mari-brief';

@@ -4,6 +4,7 @@ import { stopRun } from '../../api/client';
 import { queryKeys, useRuns } from '../../api/queries';
 import { useEventsStore } from '../../store/events';
 import { useUiStore } from '../../store/ui';
+import { openShellTerminal } from '../../runs/shell';
 import { mergeRuns, type RunRow } from '../../runs/merge';
 import { hasReviewableResult, isActive, runStateLabel } from '../../runs/state';
 
@@ -22,7 +23,6 @@ export function RunsPane({ computer }: { computer: string }) {
   const model = useEventsStore((s) => s.model);
   const openRunTerminal = useUiStore((s) => s.openRunTerminal);
   const openRunDiff = useUiStore((s) => s.openRunDiff);
-  const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
   const qc = useQueryClient();
 
   const rows = useMemo(
@@ -45,15 +45,16 @@ export function RunsPane({ computer }: { computer: string }) {
           {rows.length} run{rows.length === 1 ? '' : 's'}
         </span>
         <span className="spacer" style={{ flex: 1 }} />
-        <button type="button" onClick={() => setRunLauncherOpen(true)} data-testid="runs-new">
-          Run command
+        {/* A new run is a terminal (spec 7.1): open a shell, type the command. */}
+        <button type="button" onClick={() => void openShellTerminal()} data-testid="runs-new">
+          New terminal
         </button>
       </div>
 
       <div className="runs-list" data-testid="runs-list">
         {rows.length === 0 && (
           <div className="empty-note" data-testid="runs-empty">
-            No runs yet. Press <kbd>⌥R</kbd> to start one.
+            No runs yet. Open a terminal (<kbd>⌥R</kbd>) and run something.
           </div>
         )}
         {rows.map((row) => (

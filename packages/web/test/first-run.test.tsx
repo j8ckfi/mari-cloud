@@ -112,7 +112,6 @@ beforeEach(() => {
     activeComputer: null,
     layouts: {},
     paletteOpen: false,
-    runLauncherOpen: false,
     notice: '',
   });
 });

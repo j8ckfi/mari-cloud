@@ -784,29 +784,7 @@ kbd {
   color: var(--attn);
 }
 
-/* ---- Terminal bar ---- */
-.term-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 6px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
-  flex: 0 0 auto;
-  /* In a narrow pane the bar must shed the label, not wrap into two rows. */
-  flex-wrap: nowrap;
-  overflow: hidden;
-}
-.term-bar > .hint {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 0 1 auto;
-}
-.term-bar button {
-  white-space: nowrap;
-  flex: 0 0 auto;
-}
+/* ---- Terminal ---- */
 .term-wrap {
   position: relative;
   flex: 1 1 auto;

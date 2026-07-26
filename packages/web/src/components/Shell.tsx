@@ -8,7 +8,6 @@ import { allAttention, attentionFor, badgeCount } from '../events/reducer';
 import { FleetHome } from './FleetHome';
 import { Workspace } from './Workspace';
 import { CommandPalette } from './CommandPalette';
-import { RunLauncher } from './RunLauncher';
 import { AccountMenu } from './AccountMenu';
 import type { CommandRegistry } from '../palette/registry';
 import type { Account } from '../auth/machine';
@@ -19,8 +18,8 @@ const USER = (import.meta.env.VITE_USER as string | undefined) ?? 'user';
 
 /**
  * The app shell: a top bar with the fleet button and one tab per workspace
- * (Super/Alt+1..9), the main view (fleet home or the active workspace), the
- * command palette overlay, and the run launcher. Workspaces are populated from
+ * (Super/Alt+1..9), the main view (fleet home or the active workspace), and the
+ * command palette overlay. Workspaces are populated from
  * the fleet, and each computer is registered as a palette command so the
  * palette exposes EVERY command (spec 8.1).
  *
@@ -52,8 +51,6 @@ export function Shell({
   const setWorkspaces = useUiStore((s) => s.setWorkspaces);
   const paletteOpen = useUiStore((s) => s.paletteOpen);
   const setPaletteOpen = useUiStore((s) => s.setPaletteOpen);
-  const runLauncherOpen = useUiStore((s) => s.runLauncherOpen);
-  const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
   const openRunTerminal = useUiStore((s) => s.openRunTerminal);
   const addPane = useUiStore((s) => s.addPane);
   const notice = useUiStore((s) => s.notice);
@@ -223,12 +220,6 @@ export function Shell({
       </div>
 
       <CommandPalette registry={registry} open={paletteOpen} onClose={() => setPaletteOpen(false)} />
-      <RunLauncher
-        computer={active}
-        computerName={active !== null ? nameOf(active) : null}
-        open={runLauncherOpen}
-        onClose={() => setRunLauncherOpen(false)}
-      />
     </div>
   );
 }

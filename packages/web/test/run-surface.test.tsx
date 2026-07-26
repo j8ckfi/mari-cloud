@@ -5,8 +5,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { DiffView } from '../src/components/DiffView';
 import { DiffPane } from '../src/components/panes/DiffPane';
 import { RunsPane } from '../src/components/panes/RunsPane';
-import { RunLauncher } from '../src/components/RunLauncher';
 import { ComputerCard } from '../src/components/ComputerCard';
+import { SHELL_ARGV } from '../src/runs/shell';
 import { useUiStore } from '../src/store/ui';
 import { useEventsStore } from '../src/store/events';
 import { paneIds, findPane } from '../src/wm/tree';
@@ -307,77 +307,46 @@ describe('ComputerCard attention badge (spec 6.2)', () => {
   });
 });
 
-describe('RunLauncher (spec 5.1, spec 8.1)', () => {
+describe('starting a run IS opening a terminal (spec 7.1 — no prompt in between)', () => {
   beforeEach(() => {
     useUiStore.setState({ activeComputer: 'c1', layouts: {}, workspaces: ['c1'], view: 'workspace' });
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  it('starts the typed command as argv and opens its terminal', async () => {
+  it('the runs bar’s New terminal starts an interactive shell run and opens its pane', async () => {
     const bodies: string[] = [];
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (_input: unknown, init?: RequestInit) => {
-        bodies.push(init?.body as string);
-        return new Response(JSON.stringify({ runId: 'run-9', state: 'pending' }), {
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (init?.method === 'POST' && url.endsWith('/runs')) {
+          bodies.push(init.body as string);
+          return new Response(JSON.stringify({ runId: 'sh-1', state: 'pending' }), {
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ computer: 'c1', runs: [] }), {
           headers: { 'content-type': 'application/json' },
         });
       }),
     );
     const user = userEvent.setup();
-    const onClose = vi.fn();
-    wrap(<RunLauncher computer="c1" open onClose={onClose} />);
+    wrap(<RunsPane computer="c1" />);
 
-    await user.type(screen.getByTestId('run-launcher-input'), 'git commit -m "wip thing"');
-    await user.keyboard('{Enter}');
+    await user.click(screen.getByTestId('runs-new'));
 
+    // The run that starts is a SHELL — the command is typed into the terminal,
+    // not into a dialog about the terminal.
     await waitFor(() => expect(bodies.length).toBe(1));
-    expect(JSON.parse(bodies[0]!)).toEqual({ argv: ['git', 'commit', '-m', 'wip thing'] });
-    expect(onClose).toHaveBeenCalled();
+    expect(JSON.parse(bodies[0]!)).toEqual({ argv: [...SHELL_ARGV] });
 
     await waitFor(() => {
       const layout = useUiStore.getState().layoutFor('c1');
       expect(findPane(layout.root, layout.focused as string)!.pane).toEqual({
         kind: 'terminal',
-        run: 'run-9',
+        run: 'sh-1',
       });
     });
-  });
-
-  it('refuses an empty command instead of posting one', async () => {
-    const fetchFn = vi.fn();
-    vi.stubGlobal('fetch', fetchFn);
-    const user = userEvent.setup();
-    wrap(<RunLauncher computer="c1" open onClose={() => {}} />);
-    await user.keyboard('{Enter}');
-    expect(fetchFn).not.toHaveBeenCalled();
-    expect(screen.getByTestId('run-launcher-hint').textContent).toBe('Type a command.');
-  });
-
-  it('re-opens with the command intact and reports a failed start', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => new Response(JSON.stringify({ error: 'nope' }), { status: 500 })),
-    );
-    const user = userEvent.setup();
-    // The real wiring: the store owns `open`, exactly as the Shell renders it.
-    function Harness() {
-      const open = useUiStore((s) => s.runLauncherOpen);
-      const setOpen = useUiStore((s) => s.setRunLauncherOpen);
-      return <RunLauncher computer="c1" open={open} onClose={() => setOpen(false)} />;
-    }
-    useUiStore.getState().setRunLauncherOpen(true);
-    wrap(<Harness />);
-
-    await user.type(screen.getByTestId('run-launcher-input'), 'npm test');
-    await user.keyboard('{Enter}');
-
-    // The failure is reported, not swallowed, and the dialog is back with the
-    // command still typed so the user can retry.
-    await waitFor(() =>
-      expect(screen.getByTestId('run-launcher-hint').textContent).toBe('Could not start the run.'),
-    );
-    expect((screen.getByTestId('run-launcher-input') as HTMLInputElement).value).toBe('npm test');
   });
 });
 

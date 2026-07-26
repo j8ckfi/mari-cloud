@@ -3,6 +3,7 @@ import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { makeQueryClient, queryKeys } from '../api/queries';
 import { registry, registerCoreCommands } from '../commands';
 import { installHotkeys } from '../hotkeys';
+import { openShellTerminal } from '../runs/shell';
 import { useUiStore } from '../store/ui';
 import { connectEvents, useEventsStore } from '../store/events';
 import { betterAuthApi } from '../auth/better-auth';
@@ -77,7 +78,7 @@ function AuthedApp({
       onSplitDown: () => s().splitFocused('column', { kind: 'files', path: '/' }),
       onClosePane: () => s().closeFocused(),
       onFleet: () => s().goFleet(),
-      onRunCommand: () => s().setRunLauncherOpen(true),
+      onNewTerminal: () => void openShellTerminal(),
     });
 
     // Live server events (spec 6.2). The stream is content-free; folding it in
