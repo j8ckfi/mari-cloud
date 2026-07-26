@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  autoPlace,
   singlePane,
   splitPane,
   closePane,
@@ -132,6 +133,71 @@ describe('resizeSplit', () => {
     const l = splitPane(singlePane(term('A'), 'A'), 'A', 'row', term('B'), 'B', 's1');
     expect((resizeSplit(l, 's1', 5).root as SplitNode).ratio).toBe(0.95);
     expect((resizeSplit(l, 's1', -1).root as SplitNode).ratio).toBe(0.05);
+  });
+});
+
+describe('autoPlace', () => {
+  const ASPECT = 16 / 9;
+
+  it('seeds an empty layout with a single pane', () => {
+    const l = autoPlace(emptyLayout(), term('A'), ASPECT, 'A');
+    expect(l.root).toEqual({ type: 'pane', id: 'A', pane: term('A') });
+    expect(l.focused).toBe('A');
+  });
+
+  it('splits a single full-screen pane side by side on a wide viewport', () => {
+    const l0 = singlePane(term('A'), 'A');
+    const l1 = autoPlace(l0, term('B'), ASPECT, 'B', 's1');
+    const root = l1.root as SplitNode;
+    expect(root.axis).toBe('row');
+    expect(l1.focused).toBe('B');
+    const rects = computeRects(l1.root);
+    expect(rects.get('A')).toEqual({ x: 0, y: 0, w: 0.5, h: 1 });
+    expect(rects.get('B')).toEqual({ x: 0.5, y: 0, w: 0.5, h: 1 });
+  });
+
+  it('splits a single full-screen pane top/bottom on a tall viewport', () => {
+    const l1 = autoPlace(singlePane(term('A'), 'A'), term('B'), 0.5, 'B', 's1');
+    expect((l1.root as SplitNode).axis).toBe('column');
+  });
+
+  it('tiles toward a 2x2 grid instead of nesting narrow columns', () => {
+    // Third pane: two half-width columns exist; each is taller than wide at
+    // 16:9 halves? half column is (0.5*16/9=0.89) wide vs 1 tall -> column
+    // split. Largest pane is the first found (both equal): 'A'.
+    let l = singlePane(term('A'), 'A');
+    l = autoPlace(l, term('B'), ASPECT, 'B', 's1'); // A | B
+    l = autoPlace(l, term('C'), ASPECT, 'C', 's2'); // A over C, B right
+    l = autoPlace(l, term('D'), ASPECT, 'D', 's3'); // B over D
+    const rects = computeRects(l.root);
+    expect(rects.get('A')).toEqual({ x: 0, y: 0, w: 0.5, h: 0.5 });
+    expect(rects.get('C')).toEqual({ x: 0, y: 0.5, w: 0.5, h: 0.5 });
+    expect(rects.get('B')).toEqual({ x: 0.5, y: 0, w: 0.5, h: 0.5 });
+    expect(rects.get('D')).toEqual({ x: 0.5, y: 0.5, w: 0.5, h: 0.5 });
+    // Every pane keeps a sane share of the screen — no 12.5% strips.
+    for (const r of rects.values()) {
+      expect(r.w * r.h).toBeCloseTo(0.25, 10);
+    }
+  });
+
+  it('splits the LARGEST pane, not the focused one', () => {
+    // A | B, then shrink B to 20% and focus it. The next pane must land in A.
+    let l = splitPane(singlePane(term('A'), 'A'), 'A', 'row', term('B'), 'B', 's1');
+    l = resizeSplit(l, 's1', 0.8); // A gets 80%
+    l = focusPane(l, 'B');
+    const next = autoPlace(l, term('C'), ASPECT, 'C', 's2');
+    const rects = computeRects(next.root);
+    // C carved out of A's 80%, not out of the focused 20% strip.
+    expect(rects.get('B')).toEqual({ x: 0.8, y: 0, w: expect.closeTo(0.2, 10), h: 1 });
+    expect(rects.get('C')!.w * rects.get('C')!.h).toBeCloseTo(0.4, 10);
+    expect(next.focused).toBe('C');
+  });
+
+  it('does not mutate the input layout', () => {
+    const l0 = singlePane(term('A'), 'A');
+    const before = JSON.stringify(l0);
+    autoPlace(l0, term('B'), ASPECT, 'B', 's1');
+    expect(JSON.stringify(l0)).toBe(before);
   });
 });
 

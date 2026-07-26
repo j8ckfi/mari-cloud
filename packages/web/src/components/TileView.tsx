@@ -76,7 +76,13 @@ function Split({
       <div style={{ flex: `0 0 ${pct}`, minWidth: 0, minHeight: 0, display: 'flex' }}>
         <TileView node={node.a} computer={computer} user={user} focusedId={focusedId} />
       </div>
-      <div className="tile-gutter" onMouseDown={onGutterDown} data-testid="tile-gutter" />
+      <div
+        className="tile-gutter"
+        onMouseDown={onGutterDown}
+        onDoubleClick={() => resizeSplit(node.id, 0.5)}
+        title="Drag to resize · double-click to reset"
+        data-testid="tile-gutter"
+      />
       <div style={{ flex: '1 1 0', minWidth: 0, minHeight: 0, display: 'flex' }}>
         <TileView node={node.b} computer={computer} user={user} focusedId={focusedId} />
       </div>

@@ -6,9 +6,26 @@
 
 import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
 import { onUnauthorized } from '../api/client';
-import type { AuthApi } from './api';
-import { authReducer, gateView, initialAuthState, type AuthState, type GateView } from './machine';
+import type { AuthApi, AuthResult } from './api';
+import {
+  authReducer,
+  gateView,
+  initialAuthState,
+  TIMED_OUT,
+  type Account,
+  type AuthState,
+  type Ceremony,
+  type GateView,
+} from './machine';
 import { probeCapabilities, toAuthError, type Capabilities } from './webauthn';
+
+/**
+ * How long a modal ceremony may sit unanswered before the gate gives up on it.
+ * Platform passkey prompts can stall without ever rejecting (observed on
+ * Chrome + some credential managers); without a deadline the buttons stay
+ * disabled forever and only a page reload recovers.
+ */
+const CEREMONY_TIMEOUT_MS = 60_000;
 
 export interface AuthGateController {
   state: AuthState;
@@ -17,6 +34,8 @@ export interface AuthGateController {
   createAccount(email: string): Promise<void>;
   /** Sign in with an existing passkey (modal prompt). */
   signIn(): Promise<void>;
+  /** Abandon the in-flight ceremony and give the buttons back. */
+  cancelCeremony(): void;
   signOut(): Promise<void>;
 }
 
@@ -27,6 +46,8 @@ export interface UseAuthGateOptions {
   subscribeUnauthorized?: (fn: () => void) => () => void;
   /** Called on every signed-in → signed-out transition (cache teardown). */
   onSessionEnd?: () => void;
+  /** Injectable for tests; defaults to {@link CEREMONY_TIMEOUT_MS}. */
+  ceremonyTimeoutMs?: number;
 }
 
 export function useAuthGate(api: AuthApi, opts: UseAuthGateOptions = {}): AuthGateController {
@@ -97,40 +118,68 @@ export function useAuthGate(api: AuthApi, opts: UseAuthGateOptions = {}): AuthGa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedOut, conditional]);
 
-  const createAccount = useCallback(
-    async (email: string): Promise<void> => {
+  // Each ceremony gets a generation number. A ceremony that was cancelled or
+  // timed out is STALE: when its promise finally settles, its failure must not
+  // clobber whatever the user is doing by then (typically a fresh ceremony).
+  // A late SUCCESS still applies — the server minted a session either way, and
+  // showing the sign-in screen over a live session would just be a lie until
+  // the next reload.
+  const ceremonyGen = useRef(0);
+  const timeoutMs = opts.ceremonyTimeoutMs ?? CEREMONY_TIMEOUT_MS;
+
+  const runCeremony = useCallback(
+    async (
+      kind: Exclude<Ceremony, 'none'>,
+      exec: () => Promise<AuthResult<Account>>,
+      fallback: string,
+    ): Promise<void> => {
       if (live.current.status === 'signing-in') return;
       const supported = live.current.supported;
       // The reducer turns a ceremony start in an incapable browser into the
       // unsupported error state; there is nothing to call.
-      dispatch({ t: 'ceremony_start', kind: 'register' });
+      dispatch({ t: 'ceremony_start', kind });
       if (!supported) return;
-      const res = await api.createAccountWithPasskey(email);
+      const gen = ++ceremonyGen.current;
+      const timer = window.setTimeout(() => {
+        if (ceremonyGen.current !== gen) return;
+        ceremonyGen.current += 1; // mark the ceremony stale
+        dispatch({ t: 'ceremony_failed', error: TIMED_OUT });
+      }, timeoutMs);
+      const res = await exec();
+      window.clearTimeout(timer);
       if (res.ok) {
         dispatch({ t: 'signed_in', account: res.value });
         return;
       }
-      const error = toAuthError(res.error, 'Could not create the account.');
+      if (ceremonyGen.current !== gen) return; // stale: cancelled or timed out
+      const error = toAuthError(res.error, fallback);
       if (error.code === 'cancelled') dispatch({ t: 'ceremony_cancelled' });
       else dispatch({ t: 'ceremony_failed', error });
     },
-    [api],
+    [timeoutMs],
   );
 
-  const signIn = useCallback(async (): Promise<void> => {
-    if (live.current.status === 'signing-in') return;
-    const supported = live.current.supported;
-    dispatch({ t: 'ceremony_start', kind: 'authenticate' });
-    if (!supported) return;
-    const res = await api.signInWithPasskey();
-    if (res.ok) {
-      dispatch({ t: 'signed_in', account: res.value });
-      return;
-    }
-    const error = toAuthError(res.error, 'Could not sign in with that passkey.');
-    if (error.code === 'cancelled') dispatch({ t: 'ceremony_cancelled' });
-    else dispatch({ t: 'ceremony_failed', error });
-  }, [api]);
+  const createAccount = useCallback(
+    (email: string): Promise<void> =>
+      runCeremony(
+        'register',
+        () => api.createAccountWithPasskey(email),
+        'Could not create the account.',
+      ),
+    [api, runCeremony],
+  );
+
+  const signIn = useCallback(
+    (): Promise<void> =>
+      runCeremony('authenticate', () => api.signInWithPasskey(), 'Could not sign in with that passkey.'),
+    [api, runCeremony],
+  );
+
+  const cancelCeremony = useCallback((): void => {
+    if (live.current.status !== 'signing-in') return;
+    ceremonyGen.current += 1; // the in-flight ceremony is now stale
+    dispatch({ t: 'ceremony_cancelled' });
+  }, []);
 
   const signOut = useCallback(async (): Promise<void> => {
     // Local state first: the interface must not wait on the network to stop
@@ -140,7 +189,7 @@ export function useAuthGate(api: AuthApi, opts: UseAuthGateOptions = {}): AuthGa
   }, [api]);
 
   return useMemo(
-    () => ({ state, view: gateView(state), createAccount, signIn, signOut }),
-    [state, createAccount, signIn, signOut],
+    () => ({ state, view: gateView(state), createAccount, signIn, cancelCeremony, signOut }),
+    [state, createAccount, signIn, cancelCeremony, signOut],
   );
 }

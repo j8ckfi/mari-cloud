@@ -6,6 +6,7 @@
 
 import { create } from 'zustand';
 import {
+  autoPlace,
   emptyLayout,
   singlePane,
   splitPane,
@@ -20,9 +21,15 @@ import {
   type PaneNode,
   type SplitAxis,
 } from '../wm/tree';
-import { isDiffFor, isTerminalFor, type PaneSpec } from '../wm/pane';
+import { isDiffFor, isTerminalFor, samePane, type PaneSpec } from '../wm/pane';
 
 export type View = 'fleet' | 'workspace';
+
+/** Width/height ratio of the workspace viewport, for balanced auto-placement. */
+function workspaceAspect(): number {
+  if (typeof window === 'undefined' || window.innerHeight <= 0) return 16 / 9;
+  return window.innerWidth / window.innerHeight;
+}
 
 /** The default layout for a freshly opened computer: a COLD-safe file browser. */
 export function defaultLayout(): Layout {
@@ -116,11 +123,16 @@ export const useUiStore = create<UiState>((set, get) => ({
     const id = get().activeComputer;
     if (id === null) return;
     const layout = get().layoutFor(id);
-    const next =
-      layout.root === null
-        ? singlePane(pane)
-        : splitPane(layout, layout.focused as string, 'row', pane);
-    get().setLayout(id, next);
+    // A pane that already shows exactly this is focused, not duplicated —
+    // double-clicking a file must not open the same editor twice.
+    const existing = findPaneBy(layout.root, (p) => samePane(p, pane));
+    if (existing !== null) {
+      get().setLayout(id, focusPaneOp(layout, existing.id));
+      return;
+    }
+    // Balanced placement: split the largest pane, not the focused one, so
+    // adding panes tiles the workspace instead of nesting narrow columns.
+    get().setLayout(id, autoPlace(layout, pane, workspaceAspect()));
   },
 
   splitFocused: (axis, pane) => {
@@ -177,11 +189,7 @@ export const useUiStore = create<UiState>((set, get) => ({
       return;
     }
     const pane: PaneSpec = { kind: 'terminal', run };
-    const next =
-      layout.root === null || layout.focused === null
-        ? singlePane(pane)
-        : splitPane(layout, layout.focused, 'row', pane);
-    get().setLayout(computer, next);
+    get().setLayout(computer, autoPlace(layout, pane, workspaceAspect()));
   },
 
   openRunDiff: (computer, run) => {
@@ -193,11 +201,7 @@ export const useUiStore = create<UiState>((set, get) => ({
       return;
     }
     const pane: PaneSpec = { kind: 'diff', run };
-    const next =
-      layout.root === null || layout.focused === null
-        ? singlePane(pane)
-        : splitPane(layout, layout.focused, 'row', pane);
-    get().setLayout(computer, next);
+    get().setLayout(computer, autoPlace(layout, pane, workspaceAspect()));
   },
 
   setPaletteOpen: (open) => set({ paletteOpen: open }),

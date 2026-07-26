@@ -8,7 +8,7 @@ import { EchoPredictor } from '../../terminal/predictor';
 import { stopRun } from '../../api/client';
 import { useEventsStore } from '../../store/events';
 import { liveRun } from '../../events/reducer';
-import { runStateLabel } from '../../runs/state';
+import { runStateLabel, shortRunId } from '../../runs/state';
 import { useUiStore } from '../../store/ui';
 import type { GridSnapshot } from '@mari/shared';
 import type { TerminalPaneSpec } from '../../wm/pane';
@@ -45,6 +45,10 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   const [renderer, setRenderer] = useState<'webgl' | 'dom'>('dom');
   const [predict, setPredict] = useState<{ text: string; pending: number }>({ text: '', pending: 0 });
+  // Whether the attach socket has delivered ANYTHING for this run yet. Until it
+  // has, the pane is a black rectangle — which reads as broken. A line of text
+  // (not a spinner, spec 8.3) says what the pane is waiting for.
+  const [sawData, setSawData] = useState(false);
   const live = useEventsStore((s) => liveRun(s.model, computer, spec.run));
   const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
   const openRunDiff = useUiStore((s) => s.openRunDiff);
@@ -52,6 +56,7 @@ export function TerminalPane({
   useEffect(() => {
     const el = host.current;
     if (!el) return;
+    setSawData(false);
 
     const term = new Terminal({
       convertEol: false,
@@ -94,14 +99,19 @@ export function TerminalPane({
       cols: term.cols,
       rows: term.rows,
       handlers: {
-        onGrid: (m) => writeGrid(term, m.grid),
+        onGrid: (m) => {
+          setSawData(true);
+          writeGrid(term, m.grid);
+        },
         onFrame: (m) => {
+          setSawData(true);
           term.write(m.bytes);
           predictor.reconcile(m.bytes);
           refreshPredict();
         },
         onStatus: (m) => {
-          if (!m.alive) term.write(`\r\n\x1b[2m[run ${spec.run} exited${m.exitCode != null ? ` (${m.exitCode})` : ''}]\x1b[0m\r\n`);
+          setSawData(true);
+          if (!m.alive) term.write(`\r\n\x1b[2m[run ${shortRunId(spec.run)} exited${m.exitCode != null ? ` (${m.exitCode})` : ''}]\x1b[0m\r\n`);
         },
       },
     });
@@ -150,8 +160,8 @@ export function TerminalPane({
       {/* A run's controls live with its view (spec 7.1: the pane is a view of
           the run, so stopping is an action ON the run, not on this pane). */}
       <div className="term-bar">
-        <span className="hint" data-testid="term-run">
-          {spec.run}
+        <span className="hint" data-testid="term-run" title={spec.run}>
+          run {shortRunId(spec.run)}
         </span>
         {live !== null && (
           <span className={`run-state ${live.state}`} data-testid="term-run-state">
@@ -180,6 +190,13 @@ export function TerminalPane({
       </div>
       <div className="term-wrap">
         <div className="term-host" ref={host} />
+        {!sawData && (
+          <div className="term-connecting" data-testid="term-connecting">
+            <span className="hint">
+              Connecting to the run — output appears as soon as the computer answers.
+            </span>
+          </div>
+        )}
         {predict.pending > 0 && (
           <div className="term-predict" data-testid="term-predict">
             <span className="hint">predicting </span>

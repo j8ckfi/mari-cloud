@@ -18,10 +18,13 @@ import { useUiStore } from '../store/ui';
  */
 export function RunLauncher({
   computer,
+  computerName,
   open,
   onClose,
 }: {
   computer: string | null;
+  /** Human name (hostname) of the computer; the raw id is not for people. */
+  computerName?: string | null;
   open: boolean;
   onClose: () => void;
 }) {
@@ -102,8 +105,8 @@ export function RunLauncher({
               <span className="attn-text">{error}</span>
             ) : (
               <>
-                Runs on <b>{computer ?? 'no computer'}</b>. The supervisor owns the run — you can
-                close this tab.
+                Starts on <b>{computerName ?? computer ?? 'no computer'}</b> and keeps running on
+                its own — closing this tab won’t stop it.
               </>
             )}
           </div>

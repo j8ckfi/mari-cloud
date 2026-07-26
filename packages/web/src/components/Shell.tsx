@@ -225,6 +225,7 @@ export function Shell({
       <CommandPalette registry={registry} open={paletteOpen} onClose={() => setPaletteOpen(false)} />
       <RunLauncher
         computer={active}
+        computerName={active !== null ? nameOf(active) : null}
         open={runLauncherOpen}
         onClose={() => setRunLauncherOpen(false)}
       />

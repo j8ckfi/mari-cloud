@@ -47,6 +47,7 @@ export function AuthGate({
             state={gate.state}
             onCreate={(email) => void gate.createAccount(email)}
             onSignIn={() => void gate.signIn()}
+            onCancel={() => gate.cancelCeremony()}
           />
         ) : (
           // Deliberately empty: see the note above. The chrome above is already

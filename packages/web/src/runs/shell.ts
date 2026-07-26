@@ -13,6 +13,7 @@
 // control plane returned.
 
 import { startRun } from '../api/client';
+import { shortRunId } from './state';
 import { uiStore } from '../store/ui';
 
 /**
@@ -43,7 +44,7 @@ export async function openShellTerminal(): Promise<string | null> {
   try {
     const { runId } = await startRun(computer, { argv: [...SHELL_ARGV] });
     s().openRunTerminal(computer, runId);
-    s().setNotice(`Terminal · run ${runId}`);
+    s().setNotice(`Terminal · run ${shortRunId(runId)}`);
     return runId;
   } catch {
     // A failure has to be visible: the old behaviour's whole problem was a pane

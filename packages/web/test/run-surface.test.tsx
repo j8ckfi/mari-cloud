@@ -429,6 +429,22 @@ describe('opening a run’s terminal (spec 6.2 target)', () => {
     });
   });
 
+  it('focuses an existing identical pane instead of stacking a twin (double-clicked file)', () => {
+    useUiStore.getState().openComputer('c1');
+    useUiStore.getState().addPane({ kind: 'editor', path: '/a.md' });
+    const opened = useUiStore.getState().layoutFor('c1');
+    const editorId = opened.focused as string;
+    const before = paneIds(opened.root).length;
+
+    // Focus elsewhere, then "open" the same file again (the double-click case).
+    useUiStore.getState().addPane({ kind: 'runs' });
+    useUiStore.getState().addPane({ kind: 'editor', path: '/a.md' });
+
+    const after = useUiStore.getState().layoutFor('c1');
+    expect(paneIds(after.root)).toHaveLength(before + 1); // only the runs pane was new
+    expect(after.focused).toBe(editorId);
+  });
+
   it('opens a separate pane for a different run', () => {
     useUiStore.getState().openRunTerminal('c1', 'r1');
     const before = paneIds(useUiStore.getState().layoutFor('c1').root).length;
