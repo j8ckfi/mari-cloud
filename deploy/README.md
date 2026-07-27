@@ -230,15 +230,19 @@ the store at `/store`.
 > **[deploy/DEPLOY.md](DEPLOY.md) is the runbook** — the ordered commands, what
 > the owner does versus what the orchestrator does, a post-deploy smoke
 > checklist with the exact expected responses, and the rollback. It also records
-> the one thing this section does not: **as configured, `SUBSTRATE_MODE` is
-> `"fake"` in production, so a hosted computer cannot wake.** Read DEPLOY.md §1
-> before deploying. What follows is the reference for the pieces.
+> the credential and DNS ownership boundaries this section summarizes. Read
+> DEPLOY.md §1 before deploying. What follows is the reference for the pieces.
 
 The hosted control plane is the same Hono app on Cloudflare Workers. Its config
 lives in `packages/control-plane/wrangler.jsonc` under `env.production`:
 account `5b7019b38a2b1c0ce119ecf64e92fd92`, D1 `mari`
 (`b423acd3-0b26-482c-a0be-9998393b0cfc`), R2 `mari-store`,
-`BASE_URL=https://app.mari.sh`, `PREVIEW_ZONE=mari.sh`, both `DEV_*` flags off.
+`BASE_URL=https://app.mari.sh`, `PREVIEW_ZONE=mari.sh`, both `DEV_*` flags off,
+and `SUBSTRATE_MODE=cloudflare` so computers wake as real Cloudflare Containers.
+The configured store is `s3://mari-store`; at materialize the Worker rewrites it
+to `s3://mari-store/tenants/<sha256(owner)>`, mints a short-lived credential for
+that opaque account root, and passes the credential as `AWS_*`. Chunks/manifests
+deduplicate among one owner's computers, never across accounts.
 
 ## Secrets — the OWNER sets these, by hand
 
@@ -256,6 +260,8 @@ cd packages/control-plane
 # Generate the value privately (`openssl rand -base64 32`), then paste it at the
 # prompt. 32 characters minimum; the app refuses to start below that.
 wrangler secret put AUTH_SECRET --env production
+wrangler secret put R2_PARENT_ACCESS_KEY_ID --env production
+wrangler secret put R2_PARENT_API_TOKEN --env production
 ```
 
 `AUTH_SECRET` signs every session cookie. On a production environment
@@ -277,11 +283,20 @@ wrangler secret put GITHUB_CLIENT_ID --env production      # optional
 wrangler secret put GITHUB_CLIENT_SECRET --env production  # optional
 ```
 
-To confirm what is set without revealing any value:
+To validate the remote Worker without revealing any value:
 
 ```sh
-wrangler secret list --env production
+../../deploy/check-production-secrets.sh
 ```
+
+The check is mandatory before migration/deploy. `secrets.required` in
+`wrangler.jsonc` affects generated types and local-dev warnings; it does not
+make Wrangler reject a remote production deploy with missing bindings.
+
+`R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` are a private-development fallback
+only, and the code ignores them unless `ALLOW_STATIC_R2_CREDENTIALS=1`. Never put
+that opt-in or the static pair on the hosted Worker: they are bucket-wide and
+defeat the tenant boundary. The production preflight fails if it finds them.
 
 ## Database schema
 
@@ -292,11 +307,44 @@ D1 has no automatic migration on boot. Apply the schema — including the
 wrangler d1 migrations apply mari --env production --remote
 ```
 
-`migrations/0001_init.sql` is generated from `src/db/apply.ts` and every
-statement is `IF NOT EXISTS`, so re-running it is a no-op.
-`test/auth-schema.test.ts` asserts the two are statement-for-statement identical
-and that the `passkey` table matches the plugin's declared fields, so a schema
-change cannot ship to production without the migration.
+The first apply runs three additive migrations / 13 statements:
+
+- `0001_init.sql` — 10 auth, fleet, lineage and vault statements;
+- `0002_limits.sql` — `usage_period`, the per-account quota ledger;
+- `0003_usage.sql` — `usage_ledger` plus its period index, for per-computer cost
+  estimates.
+
+Every statement is `IF NOT EXISTS`, and tests pin each migration to its runtime
+DDL (`auth-schema`, `limits`, `usage`), so re-running is a no-op and drift fails
+the suite.
+
+## Hosted base-manifest bootstrap
+
+A hosted create must return a COLD computer with a real head; a null head makes
+the first file-browser read fail before the first wake. If `BASE_MANIFEST` is
+unset, the control plane creates one deterministic empty manifest in R2. If an
+operator configures a richer base manifest, it remains the single fleet copy at
+the bucket root.
+
+On the account's first wake, the control plane lazily copies the selected base
+manifest and referenced chunks into that account's opaque tenant root. Only then
+does it mint a credential for the tenant root and hand the scoped URI to
+`marid`. This preserves “base stored once” at rest while ensuring the container
+never gets read/list authority over the global root or another account.
+
+Toolchains intended for every hosted computer belong in
+`deploy/Dockerfile.mari`; `/work` itself is the disposable restored workspace,
+not an implicit source of base files.
+
+## Production operations
+
+Production persists structured invocation/application logs at sampling rate
+`1.0`. `/healthz`, log redaction, launch alerts and probe limitations are
+documented in [`docs/observability.md`](../docs/observability.md). The cost model
+and what it deliberately does not meter are in
+[`docs/costs.md`](../docs/costs.md); quota and accounting hook semantics are in
+[`docs/limits-hooks.md`](../docs/limits-hooks.md) and
+[`docs/obs-hooks.md`](../docs/obs-hooks.md).
 
 ## Passkeys
 

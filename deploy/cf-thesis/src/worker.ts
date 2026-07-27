@@ -12,25 +12,19 @@
  * binds a scratch D1 and a scratch R2 bucket (never `mari`/`mari-store`), and is
  * deleted — worker, container application, D1, bucket — by the suite's cleanup.
  *
- * TWO test-only additions, both deliberate and both fenced:
+ * TWO legacy test-only additions, both deliberate and both fenced. Production
+ * now uses direct R2 with tenant-scoped temporary credentials and a TLS
+ * supervisor channel; this scratch Worker does not validate those boundaries.
  *
  *  1. `/__store/*` — an S3-compatible facade over the scratch R2 bucket.
  *
- *     WHY IT HAS TO EXIST: `marid` reads and writes the chunk store through
- *     opendal (`MARI_STORE=fs://…|s3://…`), and on Cloudflare there is no shared
- *     disk, so the store must be R2 over the network. Mari has no way to hand a
- *     container R2 credentials today: `ComputerDO.#maridEnv` (computer-do.ts:765) composes a
- *     FIXED set of variables (MARI_COMPUTER_ID/EPOCH/TOKEN/ROOT/STORE/
- *     CONTROL_URL/RESTORE_MANIFEST) with no seam for `AWS_*`, and R2's real S3
- *     endpoint accepts nothing else. Rather than invent a credential seam in
- *     another lane's file, this facade lets the REAL supervisor speak the REAL
- *     S3 protocol its production build will speak, against the same bucket the
- *     control plane reads manifests from — so every byte the thesis asserts
- *     still makes the full round trip through opendal, R2 and back.
+ *     WHY IT REMAINS: the original thesis harness predates the production
+ *     credential seam. It lets the supervisor speak S3 to a scratch R2 bucket,
+ *     so lifecycle bytes still make an opendal → facade → R2 round trip.
  *
- *     It is decisions.md's "direct-to-R2" rule inverted (chunks transit a
- *     Worker: the memo's path (b)), which is exactly why the suite reports it as
- *     a deviation instead of hiding it.
+ *     It is NOT the hosted data path: chunks transit this Worker, no tenant
+ *     temporary credential is minted, and no direct R2/TLS isolation claim may
+ *     be inferred from a passing lifecycle assertion.
  *
  *     Auth: every request must carry a SigV4 `Authorization` header whose access
  *     key id equals `STORE_ACCESS_KEY_ID` (minted at random per deploy). That is

@@ -30,23 +30,20 @@
 // with a REAL passkey session — auth.ts treats a workers.dev origin as
 // production, so there is no dev sign-in here.
 //
-// TWO DELIBERATE DEVIATIONS, both reported rather than hidden, both forced by
-// gaps this suite exists to find (see the header of deploy/cf-thesis/src/worker.ts):
+// CURRENT COVERAGE BOUNDARY (not a production workaround): the hosted image now
+// builds marid with S3 + TLS, ComputerDO mints tenant-scoped temporary R2
+// credentials, and production uses `wss://`. This older scratch harness still
+// bakes a random key into its image, sends S3 through its short-lived Worker
+// facade, and dials the workers.dev harness over `ws://`.
 //
-//   1. `marid` is built with `--features s3` (one word added to the production
-//      Dockerfile's build line). Without it `MARI_STORE=s3://…` fails at startup:
-//      the production image cannot reach a chunk store on this substrate at all.
-//   2. The store is reached through an S3 facade on the Worker, because
-//      `ComputerDO.#maridEnv` (computer-do.ts:765) has no seam for R2 credentials and R2's real
-//      S3 endpoint accepts nothing else. Chunks therefore transit a Worker
-//      (the memo's path (b)) instead of decisions.md's direct-to-R2 (path (a)).
-//      Byte-for-byte the round trip is the same: opendal → S3 verbs → R2.
-//
-// Also: the supervisor channel is plain `ws://` because `marid` has no TLS
-// backend compiled in (tokio-tungstenite with no TLS feature; reqwest resolves
-// with no TLS backend at all — Cargo.lock), so `wss://` cannot connect today.
-// That is gate 2's finding, unfixed, and it is why the deploy uses the
-// workers.dev origin's port 80.
+// Its assertions are scoped to ephemeral-disk lifecycle/journal continuity, but
+// the current image assembler fails fast until the harness is migrated to the
+// now-S3-enabled production Dockerfile. Even after that migration it does NOT
+// validate the production credential-mint API, tenant prefix/object scope,
+// direct R2 S3 endpoint, credential rotation, or TLS supervisor channel unless
+// those facade/plain-WS paths are removed. Use the production smoke runbook for
+// those boundaries. Never cite the facade as evidence that hosted R2 isolation
+// works.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { decodeCbor, encodeCbor } from '@mari/shared';

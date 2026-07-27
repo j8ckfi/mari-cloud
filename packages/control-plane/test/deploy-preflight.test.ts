@@ -27,6 +27,10 @@
 
 import { describe, it, expect } from 'vitest';
 import wranglerRaw from '../wrangler.jsonc?raw';
+import migration0001 from '../migrations/0001_init.sql?raw';
+import migration0002 from '../migrations/0002_limits.sql?raw';
+import migration0003 from '../migrations/0003_usage.sql?raw';
+import secretPreflightRaw from '../../../deploy/check-production-secrets.sh?raw';
 
 /**
  * Strip `//` line comments outside of strings.
@@ -77,6 +81,17 @@ interface ContainerBlock {
 interface Block {
   vars: Record<string, string>;
   containers?: ContainerBlock[];
+  secrets?: { required?: string[] };
+  observability?: {
+    enabled?: boolean;
+    head_sampling_rate?: number;
+    logs?: {
+      enabled?: boolean;
+      head_sampling_rate?: number;
+      invocation_logs?: boolean;
+      persist?: boolean;
+    };
+  };
 }
 
 interface Config extends Block {
@@ -128,6 +143,35 @@ describe('production substrate wiring', () => {
     const store = prod.vars.STORE_URI;
     expect(store, 'STORE_URI is required with a real substrate').toBeTruthy();
     expect(store, 'a substrate-local fs:// store is discarded on stop').not.toMatch(/^fs:\/\//);
+    expect(store).toMatch(/^s3:\/\//);
+    expect(prod.vars.CF_ACCOUNT_ID, 'CF_ACCOUNT_ID derives the R2 S3 endpoint').toMatch(/^[a-f0-9]{32}$/);
+
+    // Temporary per-computer R2 credentials are a production isolation boundary,
+    // not a convenience. Without these secrets the wake fails before a container
+    // can boot with a bucket-wide or missing store credential.
+    expect(prod.secrets?.required ?? []).toEqual(
+      expect.arrayContaining(['R2_PARENT_ACCESS_KEY_ID', 'R2_PARENT_API_TOKEN']),
+    );
+  });
+
+  it('never enables the bucket-wide static R2 fallback in hosted production', () => {
+    expect(prod.vars.ALLOW_STATIC_R2_CREDENTIALS).toBeUndefined();
+    expect(prod.vars.R2_ACCESS_KEY_ID).toBeUndefined();
+    expect(prod.vars.R2_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(prod.secrets?.required ?? []).not.toContain('R2_ACCESS_KEY_ID');
+    expect(prod.secrets?.required ?? []).not.toContain('R2_SECRET_ACCESS_KEY');
+  });
+
+  it('has an executable remote-secret preflight for every required production binding', () => {
+    expect(secretPreflightRaw).toContain('wrangler secret list');
+    expect(secretPreflightRaw).toContain('--env production');
+    for (const name of prod.secrets?.required ?? []) {
+      expect(secretPreflightRaw, `remote preflight must require ${name}`).toContain(`'${name}'`);
+    }
+    // Accidentally uploading the static pair is also a launch blocker, not just
+    // an operator warning.
+    expect(secretPreflightRaw).toContain("'R2_ACCESS_KEY_ID'");
+    expect(secretPreflightRaw).toContain("'R2_SECRET_ACCESS_KEY'");
   });
 
   it('mirrors max_instances into CF_MAX_INSTANCES so the capacity error cannot lie', () => {
@@ -199,5 +243,27 @@ describe('the platform contract the bundle depends on', () => {
     expect(config.assets?.run_worker_first).toBe(true);
     expect(config.assets?.directory).toBe('../web/dist');
     expect(config.assets?.binding).toBe('ASSETS');
+  });
+
+  it('persists unsampled production logs for launch diagnosis', () => {
+    expect(prod.observability).toEqual({
+      enabled: true,
+      head_sampling_rate: 1,
+      logs: {
+        enabled: true,
+        head_sampling_rate: 1,
+        invocation_logs: true,
+        persist: true,
+      },
+    });
+  });
+
+  it('ships all three D1 migrations and the expected 13 SQL statements', () => {
+    const statementCount = (sql: string): number => sql.match(/;\s*(?:\n|$)/g)?.length ?? 0;
+    expect([
+      statementCount(migration0001),
+      statementCount(migration0002),
+      statementCount(migration0003),
+    ]).toEqual([10, 1, 2]);
   });
 });

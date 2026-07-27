@@ -1059,11 +1059,10 @@ Two tests, both with the failure they exist for:
   blocks being copies, the migration list creating each DO class exactly once, and
   `AUTH_RP_ID` being the app host rather than the preview zone.
 
-**Still missing before a hosted computer can wake, and NOT fixed by this lane**
-(all four are in `deploy/DEPLOY.md` §1): the mode flip; `SUPERVISOR_URL_BASE`; a
-chunk store the container can reach — which needs `--features s3` in
-`deploy/Dockerfile.mari`, an R2-credential seam in `ComputerDO.#maridEnv`, and an
-R2 API token, the three things `e2e/cloudflare.e2e.test.ts` works around and
-declares in its header; and a `BASE_MANIFEST` bootstrap for the Workers entry
-(`src/node/base-image.ts` has no Workers equivalent, so hosted computers get no
-base-image dedup).
+**Resolved for hosted v0.1 (2026-07-27).** Production now flips to the real
+Cloudflare substrate, uses `wss://app.mari.sh`, builds marid with S3, mints
+short-lived tenant-scoped R2 credentials, rewrites the supervisor store into an
+opaque account root, and lazily bootstraps/copies the base manifest into that
+root. The older Cloudflare thesis harness still uses its scratch S3 facade and
+plain workers.dev channel; its header now marks those as coverage gaps, not
+workarounds or evidence for the hosted credential/TLS path.
