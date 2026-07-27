@@ -291,7 +291,7 @@ impl FileFacts {
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
             nlink: st.st_nlink as u64,
-            mode: u32::from(st.st_mode),
+            mode: st.st_mode as u32,
             size: st.st_size.max(0) as u64,
         }
     }

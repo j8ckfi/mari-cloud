@@ -24,7 +24,7 @@ function handlers(): HotkeyHandlers & { calls: string[] } {
     onSplitDown: () => calls.push('split:down'),
     onClosePane: () => calls.push('close'),
     onFleet: () => calls.push('fleet'),
-    onRunCommand: () => calls.push('run'),
+    onNewTerminal: () => calls.push('terminal'),
   };
 }
 
@@ -32,12 +32,12 @@ function ev(o: Partial<KeyboardEvent>): KeyboardEvent {
   return { metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, key: '', ...o } as KeyboardEvent;
 }
 
-describe('run hotkey (spec 8.1 full keyboard operation)', () => {
-  it('opens the run prompt on Mod+R under both Meta and Alt', () => {
+describe('terminal hotkey (spec 8.1 full keyboard operation)', () => {
+  it('opens a new terminal on Mod+R under both Meta and Alt', () => {
     const h = handlers();
     expect(handleKeydown(ev({ altKey: true, key: 'r' }), h)).toBe(true);
     expect(handleKeydown(ev({ metaKey: true, key: 'R' }), h)).toBe(true);
-    expect(h.calls).toEqual(['run', 'run']);
+    expect(h.calls).toEqual(['terminal', 'terminal']);
   });
 
   it('leaves plain "r" alone so it reaches the terminal', () => {
@@ -46,10 +46,10 @@ describe('run hotkey (spec 8.1 full keyboard operation)', () => {
     expect(h.calls).toEqual([]);
   });
 
-  it('does not consume Mod+R when no run handler is installed', () => {
+  it('does not consume Mod+R when no terminal handler is installed', () => {
     const h = handlers();
-    const withoutRun: HotkeyHandlers = { ...h, onRunCommand: undefined };
-    expect(handleKeydown(ev({ altKey: true, key: 'r' }), withoutRun)).toBe(false);
+    const withoutTerminal: HotkeyHandlers = { ...h, onNewTerminal: undefined };
+    expect(handleKeydown(ev({ altKey: true, key: 'r' }), withoutTerminal)).toBe(false);
   });
 
   it('does not swallow Mod+Shift+R (browser hard reload)', () => {
@@ -70,7 +70,7 @@ describe('command registry coverage (spec 8.1: the palette gives ALL commands)',
     // Every pointer-reachable action of the run surface must also be here, or
     // the interface is not fully keyboard-operable.
     for (const id of [
-      'run.start',
+      'pane.new.terminal',
       'run.stop',
       'run.review',
       'run.brief',
@@ -84,17 +84,32 @@ describe('command registry coverage (spec 8.1: the palette gives ALL commands)',
 
   it('finds them by fuzzy query the way a user would type', () => {
     const hit = (q: string) => registry.filter(q).map((r) => r.command.id);
-    expect(hit('run command')).toContain('run.start');
+    // A user reaching for "run a command" must land on the terminal — the
+    // command is typed into the shell, there is no separate prompt.
+    expect(hit('terminal')).toContain('pane.new.terminal');
+    expect(hit('shell')).toContain('pane.new.terminal');
     expect(hit('stop')).toContain('run.stop');
     expect(hit('revert')).toContain('run.review'); // keyword match
     expect(hit('snapshot')).toContain('computer.snapshot');
     expect(hit('waiting')).toContain('attention.open');
   });
 
-  it('"Run command" opens the launcher rather than starting something blind', () => {
-    useUiStore.setState({ runLauncherOpen: false, activeComputer: 'c1' });
-    void registry.get('run.start')!.run();
-    expect(useUiStore.getState().runLauncherOpen).toBe(true);
+  it('"New terminal pane" starts a shell run — no prompt in between', async () => {
+    useUiStore.setState({ activeComputer: 'c1', layouts: {}, workspaces: ['c1'], view: 'workspace' });
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: unknown, init?: RequestInit) => {
+        bodies.push(init?.body as string);
+        return new Response(JSON.stringify({ runId: 'sh-7', state: 'pending' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+    await registry.get('pane.new.terminal')!.run();
+    expect(bodies).toHaveLength(1);
+    expect(JSON.parse(bodies[0]!)).toEqual({ argv: ['/bin/sh', '-i'] });
+    vi.unstubAllGlobals();
   });
 
   it('a run command with no computer open says why instead of failing silently', async () => {

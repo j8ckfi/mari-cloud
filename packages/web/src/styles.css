@@ -109,6 +109,13 @@ kbd {
 .topbar .spacer {
   flex: 1;
 }
+/* The one-line command outcome must never push the topbar controls around. */
+.topbar [data-testid='notice'] {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ws-tabs {
   display: flex;
   gap: 4px;
@@ -465,6 +472,9 @@ kbd {
 .pane {
   display: flex;
   flex-direction: column;
+  /* Panes live inside flex wrappers; without a grow rule they collapse to
+     content width and render as skinny strips. */
+  flex: 1 1 0%;
   min-width: 0;
   min-height: 0;
   border: 1px solid var(--border);
@@ -528,6 +538,16 @@ kbd {
 .term-predict .predicted {
   color: var(--accent);
   text-decoration: underline dotted;
+}
+/* One line of TEXT while the attach socket warms up (spec 8.3: no spinner). */
+.term-connecting {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  pointer-events: none;
 }
 
 /* ---- Files ---- */
@@ -764,16 +784,7 @@ kbd {
   color: var(--attn);
 }
 
-/* ---- Terminal bar ---- */
-.term-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 6px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
-  flex: 0 0 auto;
-}
+/* ---- Terminal ---- */
 .term-wrap {
   position: relative;
   flex: 1 1 auto;

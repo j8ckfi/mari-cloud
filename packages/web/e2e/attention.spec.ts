@@ -50,11 +50,10 @@ test.describe('attention (spec 6.2)', () => {
     });
     supervisor = sup;
 
-    // Start a run so there is something that can wait for the user.
+    // Start a run so there is something that can wait for the user: opening a
+    // terminal starts one (spec 7.1).
     await card.click();
-    await page.getByTestId('workspace-run-command').click();
-    await page.getByTestId('run-launcher-input').fill('read-a-prompt');
-    await page.keyboard.press('Enter');
+    await page.getByTestId('add-terminal-pane').click();
     const runId = await sup.waitForRun(15_000);
 
     // The run blocks on a read: the supervisor emits the content-free event.

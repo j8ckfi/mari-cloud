@@ -54,10 +54,11 @@ export function coreCommands(): Command[] {
       id: 'pane.new.terminal',
       title: 'New terminal pane',
       group: 'Pane',
-      keywords: ['shell', 'console'],
-      // A terminal pane is a view of a RUN (spec 7.1), so this starts one. It
-      // used to open a pane bound to the literal run id 'shell', which never
-      // existed: the pane was permanently blank.
+      hint: '⌥R',
+      keywords: ['shell', 'console', 'run', 'command', 'start', 'exec', 'agent'],
+      // A terminal pane is a view of a RUN (spec 7.1), so this starts one: an
+      // interactive shell. Anything the user wants to run — a build, an agent —
+      // is typed into the shell, not into a prompt about the shell.
       run: async () => {
         await openShellTerminal();
       },
@@ -92,14 +93,6 @@ export function coreCommands(): Command[] {
     },
 
     // ---- Runs (spec 5) ----
-    {
-      id: 'run.start',
-      title: 'Run command',
-      group: 'Run',
-      hint: '⌥R',
-      keywords: ['start', 'exec', 'shell', 'agent'],
-      run: () => s().setRunLauncherOpen(true),
-    },
     {
       id: 'run.brief',
       title: 'Run brief',

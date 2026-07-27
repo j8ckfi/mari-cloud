@@ -285,6 +285,38 @@ export function focusMove(layout: Layout, dir: MoveDir): Layout {
   return { ...layout, focused: best };
 }
 
+/**
+ * Insert `newPane` where it keeps the layout balanced: split the pane with the
+ * largest on-screen area, along its longer on-screen axis. `aspect` is the
+ * width/height ratio of the workspace viewport (rects are normalized to the
+ * unit square, so on-screen width is `rect.w * aspect` relative to height).
+ * This is what "add a pane" uses — always splitting the focused pane produces
+ * ever-narrower nested strips instead of a tiling.
+ */
+export function autoPlace(
+  layout: Layout,
+  newPane: PaneSpec,
+  aspect = 16 / 9,
+  newId = nextNodeId('p'),
+  splitId = nextNodeId('s'),
+): Layout {
+  if (layout.root === null) return singlePane(newPane, newId);
+  const rects = computeRects(layout.root);
+  let targetId: string | null = null;
+  let bestArea = -Infinity;
+  for (const [id, r] of rects) {
+    const area = r.w * r.h;
+    if (area > bestArea + EPS) {
+      bestArea = area;
+      targetId = id;
+    }
+  }
+  if (targetId === null) return layout;
+  const rect = rects.get(targetId) as Rect;
+  const axis: SplitAxis = rect.w * aspect >= rect.h ? 'row' : 'column';
+  return splitPane(layout, targetId, axis, newPane, newId, splitId);
+}
+
 /** Assign each pane a normalized rectangle. Exposed for rendering and tests. */
 export function computeRects(node: WmNode | null): Map<string, Rect> {
   const out = new Map<string, Rect>();

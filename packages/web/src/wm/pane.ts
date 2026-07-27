@@ -3,6 +3,7 @@
 // the Durable Object (spec 8.6) and restored on load.
 
 import type { RunId } from '@mari/shared';
+import { shortRunId } from '../runs/state';
 
 /** Terminal pane: a view of a run (spec 7.1). */
 export interface TerminalPaneSpec {
@@ -72,7 +73,7 @@ export function paneLabel(pane: PaneSpec): string {
   if (pane.title) return pane.title;
   switch (pane.kind) {
     case 'terminal':
-      return `Terminal · ${pane.run}`;
+      return `Terminal · ${shortRunId(pane.run)}`;
     case 'files':
       return `Files · ${pane.path}`;
     case 'editor':
@@ -82,7 +83,7 @@ export function paneLabel(pane: PaneSpec): string {
     case 'runs':
       return 'Runs';
     case 'diff':
-      return pane.run !== undefined ? `Changes · ${pane.run}` : 'Changes';
+      return pane.run !== undefined ? `Changes · ${shortRunId(pane.run)}` : 'Changes';
   }
 }
 
@@ -94,6 +95,31 @@ export function isTerminalFor(pane: PaneSpec, run: RunId): boolean {
 /** Whether a pane is the difference view of a particular run (spec 5.3). */
 export function isDiffFor(pane: PaneSpec, run: RunId): boolean {
   return pane.kind === 'diff' && pane.run === run;
+}
+
+/**
+ * Whether two pane specs are views of the SAME thing — used to focus an
+ * existing pane instead of stacking an identical twin (a double-clicked file,
+ * a second press of "+ Runs"). Titles are cosmetic and ignored.
+ */
+export function samePane(a: PaneSpec, b: PaneSpec): boolean {
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
+    case 'terminal':
+      return a.run === (b as TerminalPaneSpec).run;
+    case 'files':
+      return a.path === (b as FilesPaneSpec).path;
+    case 'editor':
+      return a.path === (b as EditorPaneSpec).path;
+    case 'preview':
+      return a.port === (b as BrowserPreviewPaneSpec).port;
+    case 'runs':
+      return true;
+    case 'diff': {
+      const d = b as DiffPaneSpec;
+      return a.run === d.run && a.base === d.base && a.head === d.head;
+    }
+  }
 }
 
 function basename(path: string): string {

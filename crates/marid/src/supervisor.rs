@@ -470,7 +470,7 @@ async fn connect_and_serve(
                             if matches!(cm, ControlMessage::PrepareForCold) {
                                 info!("prepare_for_cold: beginning shutdown");
                                 bounded_connected_shutdown(
-                                    shared, &mut write, outbox_rx, &mut sent,
+                                    shared, &mut write, &mut read, outbox_rx, &mut sent,
                                 )
                                 .await;
                                 info!("prepared for cold; exiting");
@@ -542,7 +542,8 @@ async fn connect_and_serve(
             // manifest before this process goes away.
             sig = wait_for_shutdown(shutdown) => {
                 info!(%sig, "graceful shutdown: control connection is up");
-                bounded_connected_shutdown(shared, &mut write, outbox_rx, &mut sent).await;
+                bounded_connected_shutdown(shared, &mut write, &mut read, outbox_rx, &mut sent)
+                    .await;
                 info!(%sig, "graceful shutdown complete; exiting");
                 return Ok(SessionOutcome::Exit);
             }
@@ -695,14 +696,16 @@ where
 /// Cloudflare Containers), and a run that refuses to die must not consume it.
 /// Whatever is durable at the deadline is what survives, which is why the run
 /// stop gets only a fraction of the budget and the manifest write gets the rest.
-async fn bounded_connected_shutdown<S>(
+async fn bounded_connected_shutdown<S, R, E>(
     shared: &Arc<Shared>,
     write: &mut S,
+    read: &mut R,
     outbox_rx: &mut UnboundedReceiver<SupervisorMessage>,
     sent: &mut HashMap<RunId, u64>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+    R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
 {
     let grace = shared.config.shutdown_grace();
     match tokio::time::timeout(grace, cold_shutdown(shared, write, outbox_rx, sent)).await {
@@ -712,6 +715,43 @@ async fn bounded_connected_shutdown<S>(
             ?grace,
             "shutdown: grace budget exhausted; exiting with whatever reached the store"
         ),
+    }
+    close_control_socket(write, read).await;
+}
+
+/// Close the control socket with a real WebSocket close handshake instead of
+/// letting process exit slam the TCP connection shut.
+///
+/// This is load-bearing for the final report, not politeness. During a shutdown
+/// the read half is never polled, so the peer's responses to our own shutdown
+/// traffic — journal acks for the flushed tail, the `HeadAdvanceResult` for the
+/// final manifest — sit unread in this socket's receive buffer. Closing a socket
+/// with unread inbound data makes the kernel send **RST**, and an RST discards
+/// data the peer has received but not yet read: the `SnapshotWritten` /
+/// `HeadAdvanceRequest` we just flushed can be thrown away microseconds before
+/// the control plane's application reads them. A Close frame plus a bounded
+/// drain of the read half consumes that pending inbound data (so the close is a
+/// FIN, not an RST) and gives the peer the round-trip it needs to consume the
+/// tail. The bound keeps a black-holed peer from eating the eviction window.
+async fn close_control_socket<S, R, E>(write: &mut S, read: &mut R)
+where
+    S: futures_util::Sink<Message> + Unpin,
+    R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
+{
+    use futures_util::SinkExt;
+    let _ = write.send(Message::Close(None)).await;
+    let drain = async {
+        while let Some(frame) = read.next().await {
+            if matches!(frame, Ok(Message::Close(_)) | Err(_)) {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(2), drain)
+        .await
+        .is_err()
+    {
+        debug!("shutdown: peer did not close within the drain bound; dropping the socket");
     }
 }
 

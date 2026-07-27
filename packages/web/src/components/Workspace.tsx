@@ -18,7 +18,6 @@ export function Workspace({ computer, user }: { computer: string; user: string }
   const setLayout = useUiStore((s) => s.setLayout);
   const addPane = useUiStore((s) => s.addPane);
   const splitFocused = useUiStore((s) => s.splitFocused);
-  const setRunLauncherOpen = useUiStore((s) => s.setRunLauncherOpen);
 
   const layoutQ = useLayout(computer);
   const hydrated = useRef<Set<string>>(new Set());
@@ -51,15 +50,15 @@ export function Workspace({ computer, user }: { computer: string; user: string }
     <div className="app" style={{ height: '100%' }} data-testid="workspace" data-computer={computer}>
       <div className="topbar" style={{ height: 30 }}>
         <span className="hint">panes:</span>
-        {/* A terminal pane is a view of a RUN (spec 7.1), so this starts one —
-            it used to open a pane bound to the fictional run id 'shell', which
-            attached to nothing and stayed blank forever. */}
+        {/* A terminal pane is a view of a RUN (spec 7.1), so this starts one:
+            an interactive shell. Commands are typed into the shell — there is
+            no separate "run command" prompt. */}
         <button
           type="button"
           data-testid="add-terminal-pane"
           onClick={() => void openShellTerminal()}
         >
-          + Terminal
+          + Terminal <kbd>⌥R</kbd>
         </button>
         <button type="button" onClick={() => addPane({ kind: 'files', path: '/' })}>
           + Files
@@ -74,13 +73,6 @@ export function Workspace({ computer, user }: { computer: string; user: string }
           + Runs
         </button>
         <span className="spacer" style={{ flex: 1 }} />
-        <button
-          type="button"
-          data-testid="workspace-run-command"
-          onClick={() => setRunLauncherOpen(true)}
-        >
-          Run command <kbd>⌥R</kbd>
-        </button>
         <span className="hint">
           <kbd>⌥⏎</kbd> split · <kbd>⌥hjkl</kbd> focus · <kbd>⌥W</kbd> close
         </span>

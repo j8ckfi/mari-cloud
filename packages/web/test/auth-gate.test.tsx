@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AuthGate } from '../src/components/AuthGate';
+import type { UseAuthGateOptions } from '../src/auth/gate';
 import type { AuthApi, AuthResult, PasskeyRecord } from '../src/auth/api';
 import type { Account } from '../src/auth/machine';
 import type { Capabilities } from '../src/auth/webauthn';
@@ -72,7 +73,7 @@ interface Harness {
   onSessionEnd: ReturnType<typeof vi.fn>;
 }
 
-function renderGate(caps: Capabilities = CAPABLE): Harness {
+function renderGate(caps: Capabilities = CAPABLE, extra: Partial<UseAuthGateOptions> = {}): Harness {
   const fake = fakeApi();
   const onSessionEnd = vi.fn();
   let fire: () => void = () => {};
@@ -86,6 +87,7 @@ function renderGate(caps: Capabilities = CAPABLE): Harness {
           return () => {};
         },
         onSessionEnd,
+        ...extra,
       }}
     >
       {({ account, signOut }) => (
@@ -223,6 +225,88 @@ describe('AuthGate — signing-in', () => {
     // The email field is focused on arrival, so this is the whole keyboard path.
     await user.keyboard('kbd@mari.test{Enter}');
     await waitFor(() => expect(fake.calls).toContain('create:kbd@mari.test'));
+  });
+});
+
+describe('AuthGate — a stalled ceremony', () => {
+  it('offers a Cancel button during the ceremony, and Cancel gives the buttons back', async () => {
+    const user = userEvent.setup();
+    const { fake } = renderGate();
+    fake.session.resolve(null);
+    await waitFor(() => expect(screen.getByTestId('sign-in-screen')).toBeTruthy());
+    // No cancel button at rest.
+    expect(screen.queryByTestId('auth-cancel')).toBeNull();
+
+    await user.click(screen.getByTestId('auth-signin'));
+    await waitFor(() => expect(isDisabled('auth-signin')).toBe(true));
+    // The ceremony never settles (a stalled platform prompt). Cancel is the way out.
+    await user.click(screen.getByTestId('auth-cancel'));
+
+    const err = await waitFor(() => screen.getByTestId('auth-error'));
+    expect(err.getAttribute('data-code')).toBe('cancelled');
+    expect(isDisabled('auth-signin')).toBe(false);
+    expect(isDisabled('auth-create')).toBe(false);
+    expect(screen.queryByTestId('auth-cancel')).toBeNull();
+    noSpinner();
+  });
+
+  it('a stale failure from a cancelled ceremony cannot clobber the next one', async () => {
+    const user = userEvent.setup();
+    const { fake } = renderGate();
+    fake.session.resolve(null);
+    await waitFor(() => expect(screen.getByTestId('sign-in-screen')).toBeTruthy());
+
+    // Ceremony #1 (sign-in), abandoned via Cancel while still pending.
+    await user.click(screen.getByTestId('auth-signin'));
+    await waitFor(() => expect(isDisabled('auth-signin')).toBe(true));
+    await user.click(screen.getByTestId('auth-cancel'));
+    await waitFor(() => expect(isDisabled('auth-signin')).toBe(false));
+
+    // Ceremony #2 (create) starts.
+    await user.type(screen.getByTestId('auth-email'), 'retry@mari.test');
+    await user.click(screen.getByTestId('auth-create'));
+    await waitFor(() => expect(isDisabled('auth-create')).toBe(true));
+
+    // Ceremony #1's promise finally settles with a failure. It is stale: the
+    // screen must stay in ceremony #2, not flash #1's error.
+    fake.signIn.resolve({
+      ok: false,
+      error: { code: 'NotAllowedError', message: 'The operation was not allowed.', status: 400 },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(isDisabled('auth-create')).toBe(true);
+    expect(screen.queryByTestId('auth-error')).toBeNull();
+
+    // Ceremony #2 completes and signs the user in.
+    fake.create.resolve({ ok: true, value: ACCOUNT });
+    await waitFor(() => expect(screen.getByTestId('app-shell')).toBeTruthy());
+  });
+
+  it('gives up on a ceremony that never settles, with a retry message', async () => {
+    const user = userEvent.setup();
+    const { fake } = renderGate(CAPABLE, { ceremonyTimeoutMs: 40 });
+    fake.session.resolve(null);
+    await waitFor(() => expect(screen.getByTestId('sign-in-screen')).toBeTruthy());
+
+    await user.click(screen.getByTestId('auth-signin'));
+    await waitFor(() => expect(isDisabled('auth-signin')).toBe(true));
+
+    // Nothing resolves; the deadline passes.
+    const err = await waitFor(() => screen.getByTestId('auth-error'));
+    expect(err.textContent).toContain('No response from the passkey prompt');
+    expect(isDisabled('auth-signin')).toBe(false);
+    expect(isDisabled('auth-create')).toBe(false);
+    noSpinner();
+  });
+
+  it('does not start a ceremony for an empty email', async () => {
+    const user = userEvent.setup();
+    const { fake } = renderGate();
+    fake.session.resolve(null);
+    await waitFor(() => expect(screen.getByTestId('sign-in-screen')).toBeTruthy());
+    fireEvent.submit(screen.getByTestId('auth-create').closest('form') as HTMLFormElement);
+    await user.keyboard('{Enter}');
+    expect(fake.calls.filter((c) => c.startsWith('create:'))).toHaveLength(0);
   });
 });
 

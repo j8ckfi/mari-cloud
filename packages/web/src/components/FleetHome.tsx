@@ -114,7 +114,7 @@ export function FleetHome({
               </button>
             )}
             <p className="hint">
-              Then press <kbd>⌥R</kbd> to run something on it. <kbd>⌘K</kbd> lists every command;
+              Then press <kbd>⌥R</kbd> to open a terminal on it. <kbd>⌘K</kbd> lists every command;
               nothing here needs a mouse.
             </p>
           </div>

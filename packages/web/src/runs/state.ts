@@ -111,6 +111,15 @@ export function runStateLabel(state: RunState, exitCode: number | null): string 
 }
 
 /**
+ * A run id cut down for display. Run ids are opaque 32-char hex strings; the
+ * bar, the notice line and the tab all only need enough to tell two runs
+ * apart. The full id belongs in a tooltip (`title`), not in the label.
+ */
+export function shortRunId(run: string): string {
+  return run.length > 10 ? `${run.slice(0, 8)}…` : run;
+}
+
+/**
  * Whether a finished run has changes to review (spec 5.3). A run that never
  * started, or that changed nothing, has no review to offer.
  */

@@ -78,7 +78,6 @@ describe('attention (spec 6.2)', () => {
       activeComputer: null,
       layouts: {},
       paletteOpen: false,
-      runLauncherOpen: false,
     });
   });
   afterEach(() => vi.unstubAllGlobals());

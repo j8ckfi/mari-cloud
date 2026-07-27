@@ -85,6 +85,11 @@ export const EXPIRED: AuthError = {
   message: 'Your session expired. Sign in again to continue.',
 };
 
+export const TIMED_OUT: AuthError = {
+  code: 'unknown',
+  message: 'No response from the passkey prompt. Try again — or reload the page if it keeps happening.',
+};
+
 export const UNSUPPORTED: AuthError = {
   code: 'unsupported',
   message: 'This browser cannot use passkeys. Open Mari in a browser with WebAuthn support.',

@@ -87,7 +87,7 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
     } catch {
       // The save above succeeded, so the brief is on the computer; only the run
       // did not start. Saying so keeps the user from re-saving to "fix" it.
-      setStatus('Saved, but the run did not start. Press ⌥R to try again.');
+      setStatus('Saved, but the run did not start. Run brief again to retry.');
     }
   };
 

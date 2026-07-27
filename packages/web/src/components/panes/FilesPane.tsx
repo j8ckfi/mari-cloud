@@ -134,7 +134,6 @@ export function FilesPane({ computer, spec }: { computer: string; spec: FilesPan
               data-testid="file-entry"
               data-kind={entry.kind}
               data-path={entry.path}
-              onDoubleClick={() => open(entry)}
               onClick={() => open(entry)}
             >
               <span className="ficon">

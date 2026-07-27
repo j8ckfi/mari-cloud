@@ -16,10 +16,13 @@ export function SignInScreen({
   state,
   onCreate,
   onSignIn,
+  onCancel,
 }: {
   state: AuthState;
   onCreate(email: string): void;
   onSignIn(): void;
+  /** Abandon the in-flight ceremony (the escape hatch for a stalled prompt). */
+  onCancel(): void;
 }) {
   const [email, setEmail] = useState('');
   const emailId = useId();
@@ -37,7 +40,12 @@ export function SignInScreen({
   const submit = (e: React.FormEvent): void => {
     e.preventDefault();
     if (busy) return;
-    onCreate(email.trim());
+    const trimmed = email.trim();
+    if (trimmed === '') {
+      emailRef.current?.focus();
+      return;
+    }
+    onCreate(trimmed);
   };
 
   return (
@@ -72,6 +80,7 @@ export function SignInScreen({
           autoCapitalize="off"
           spellCheck={false}
           placeholder="you@example.com"
+          required
           value={email}
           disabled={busy}
           onChange={(e) => setEmail(e.target.value)}
@@ -114,6 +123,19 @@ export function SignInScreen({
             </span>
           )}
         </p>
+
+        {/* The escape hatch: a passkey prompt that stalls (or was dismissed in
+            a way the browser never reports) must not hold the page hostage. */}
+        {busy && (
+          <button
+            type="button"
+            className="auth-secondary"
+            data-testid="auth-cancel"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+        )}
 
         {state.conditional && (
           <p className="hint" data-testid="auth-conditional">
