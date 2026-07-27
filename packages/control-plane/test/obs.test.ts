@@ -102,6 +102,19 @@ describe('structured logger', () => {
     expect(redact({ ok: 1 })).toEqual({ ok: 1 });
   });
 
+  it('redacts credentials embedded in otherwise innocent error strings', () => {
+    const value = redact({
+      error:
+        'upstream said Authorization: Bearer abc.def-123 and api_key=sk-abcdefghijklmnop',
+      jwt: 'failed with eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.deadbeef',
+    }) as Record<string, string>;
+    const raw = JSON.stringify(value);
+    expect(raw).not.toContain('abc.def-123');
+    expect(raw).not.toContain('sk-abcdefghijklmnop');
+    expect(raw).not.toContain('eyJhbGci');
+    expect(raw.match(new RegExp(REDACTED, 'g'))?.length).toBeGreaterThanOrEqual(3);
+  });
+
   it('hashUserId is stable, short, and not the id', () => {
     const id = 'user-123456789';
     expect(hashUserId(id)).toBe(hashUserId(id));
@@ -132,13 +145,12 @@ describe('route templates (log cardinality)', () => {
     );
   });
 
-  it('sanitizes unknown paths instead of echoing them', () => {
-    // A 32-hex id in an unknown path still collapses.
-    const t = routeTemplate(`/unknown/${'a'.repeat(32)}/leafy`);
-    expect(t).toBe('/unknown/:id/leafy');
-    // Long paths are capped, so an attacker cannot inflate log cardinality.
-    const deep = routeTemplate('/a/b/c/d/e/f/g/h/i');
-    expect(deep).toBe('/a/b/c/d/e/f/*');
+  it('collapses every unknown path to one content-free cardinality bucket', () => {
+    expect(routeTemplate(`/unknown/${'a'.repeat(32)}/leafy`)).toBe('/unknown');
+    expect(routeTemplate('/a/b/c/d/e/f/g/h/i')).toBe('/unknown');
+    // Short "safe looking" segments may still be a vault name or tenant
+    // content, so the fallback must not preserve even one of them.
+    expect(routeTemplate('/customer/acme/private-key-name')).toBe('/unknown');
   });
 });
 
@@ -210,6 +222,54 @@ describe('GET /healthz (real bindings)', () => {
     expect(body.d1).toBe('fail');
     expect(body.r2).toBe('fail');
     expect(body.detail?.['d1']).toContain('timed out');
+  });
+
+  it('fails S3 health when scoped-credential configuration is incomplete', async () => {
+    const missing = await healthz({
+      DB: env.DB,
+      STORE: env.STORE,
+      STORE_URI: 's3://mari-store',
+      CF_ACCOUNT_ID: 'account',
+    });
+    expect(missing.status).toBe(503);
+    const missingBody = (await missing.json()) as {
+      ok: boolean;
+      storeConfig: string;
+      detail?: Record<string, string>;
+    };
+    expect(missingBody.ok).toBe(false);
+    expect(missingBody.storeConfig).toBe('fail');
+    expect(missingBody.detail?.['storeConfig']).toContain('R2_PARENT_ACCESS_KEY_ID');
+
+    const configured = await healthz({
+      DB: env.DB,
+      STORE: env.STORE,
+      STORE_URI: 's3://mari-store',
+      CF_ACCOUNT_ID: 'account',
+      R2_PARENT_ACCESS_KEY_ID: 'parent',
+      R2_PARENT_API_TOKEN: 'token',
+    });
+    expect(configured.status).toBe(200);
+    expect((await configured.json()) as { storeConfig: string }).toMatchObject({
+      storeConfig: 'ok',
+    });
+  });
+
+  it('redacts secrets embedded in dependency failure details', async () => {
+    const broken: HealthzEnv = {
+      DB: {
+        prepare: () => ({
+          first: () =>
+            Promise.reject(new Error('upstream Authorization: Bearer do-not-log-this-token')),
+        }),
+      },
+      STORE: env.STORE,
+    };
+    const res = await healthz(broken);
+    const raw = await res.text();
+    expect(res.status).toBe(503);
+    expect(raw).not.toContain('do-not-log-this-token');
+    expect(raw).toContain(REDACTED);
   });
 });
 
