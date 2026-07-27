@@ -31,14 +31,14 @@
 //                a server reboot": hand-started processes do not survive, so
 //                marid must be restarted (the binary is still on the restored
 //                disk, so the download step self-skips).
-//   destroy      POST /boxes/{id}/stop, and FORGET the handle. The platform has
-//                no delete endpoint (verified against the API reference: the
-//                box lifecycle is create/stop/resume/fork, and the stop doc
-//                says the operation "archives rather than deletes"). destroy ==
-//                archive+forget satisfies Mari because the chunk store is the
-//                home of the computer (spec §2, §4.1): an archived box holds
-//                only a stale disk CACHE, bills no compute, accepts no writes,
-//                and is never addressed again once the handle is dropped.
+//   destroy      UNSUPPORTED. Box has no delete endpoint; `stop` archives a
+//                snapshot and the FAQ says it is retained for the life of the
+//                box. Archive is valid WARM, but it cannot satisfy Mari's
+//                destroy contract ("no substrate resources exist"). The driver
+//                archives to stop compute, then rejects so the caller cannot
+//                record a false COLD transition. Construction itself requires
+//                an explicit test/lab opt-in, which keeps Box out of production
+//                scheduling until the platform offers bounded deletion.
 //   exec         POST /boxes/{id}/commands {command, timeoutSeconds}. The API
 //                takes ONE SHELL STRING, not an argv, so argv is single-quoted
 //                per element (§3.5's "NOT shell-interpreted" is preserved by
@@ -60,16 +60,20 @@
 //   1. download a static (musl) marid binary from a configurable URL
 //      (`MARID_BINARY_URL`, a deployment var — skipped when the binary is
 //      already executable on disk, which is the resume-from-archive case);
-//   2. export the whole `spec.env` (MARI_COMPUTER_ID / EPOCH / TOKEN /
-//      CONTROL_URL / STORE, AWS_* creds) — values are shell-quoted and NEVER
-//      logged;
-//   3. start it DETACHED: `setsid nohup … >>/var/log/marid.log 2>&1 </dev/null &`
-//      so the 60 s-capped command call returns immediately while marid dials
-//      the control plane over its own wss://.
+//   2. write the whole `spec.env` (MARI_COMPUTER_ID / EPOCH / TOKEN /
+//      CONTROL_URL / STORE, AWS_* creds) into a mode-0700 launcher under /run.
+//      /run is runtime state, not part of the archived disk; values are
+//      shell-quoted and NEVER logged or placed on the durable handle;
+//   3. install a static systemd unit whose only persisted configuration is the
+//      path to that runtime launcher, then `enable` and `restart` it. Systemd is
+//      Box's documented long-running-task primitive. The bootstrap proves the
+//      MainPID remains alive before it reports success.
 //
-// `spec.cmd` (tests) replaces step 3's program; `spec.env`/binary URL/cmd are
-// recorded on the handle so `wake` can rebuild the exact same bootstrap from
-// the handle alone (provider.ts: a driver instance does not outlive a request).
+// `spec.cmd` (tests) replaces step 3's program. The env/binary URL/cmd live only
+// in the provider's in-memory bootstrap map. A handle therefore stays safe to
+// persist in a Durable Object. If an activation loses that map, `wake` rejects
+// BEFORE resuming the archived machine: the driver never wakes a box whose
+// supervisor credentials it can no longer reconstruct.
 //
 // ── Documented gaps where the API has no exact §3.5 equivalent ───────────────
 // * image/mounts/resources: one fixed machine size, no host filesystem, no
@@ -110,12 +114,16 @@ export const DEFAULT_BOX_BASE_URL = 'https://ascii.dev/api/box/v1';
 /** Where the bootstrap installs the static marid binary inside the box. */
 export const DEFAULT_MARID_BIN_PATH = '/usr/local/bin/marid';
 
-/** Where the detached marid process appends its log inside the box. */
+/** Where the systemd-managed marid process appends its log inside the box. */
 export const DEFAULT_MARID_LOG_PATH = '/var/log/marid.log';
 
-/** Marker the bootstrap prints; its presence in stdout proves the script ran
- *  to the detach line (the detached process itself is not awaited). */
+/** Marker the bootstrap prints after systemd reports a stable live MainPID. */
 const BOOTSTRAP_OK = 'mari-box-bootstrap-ok';
+
+/** Static unit name. The unit contains no credentials; its launcher is in /run. */
+const MARID_SERVICE = 'mari-supervisor.service';
+const MARID_RUNTIME_DIR = '/run/mari-box';
+const MARID_RUNTIME_LAUNCHER = `${MARID_RUNTIME_DIR}/marid-start`;
 
 /** The server-side cap on one command's `timeoutSeconds` (API-documented). */
 const MAX_COMMAND_TIMEOUT_S = 60;
@@ -205,21 +213,13 @@ export class BoxSubstrateError extends Error {
 }
 
 /**
- * Box handle. Extends the base handle with everything `wake` needs to rebuild
- * the marid bootstrap from the handle alone: the env (secret — never logged),
- * the binary URL, and the test-only cmd override. Fully serializable for DO
- * storage.
+ * Persistable Box handle. Deliberately contains no bootstrap environment,
+ * credentials, binary URL, or command. Those stay in provider memory only.
  */
 export interface BoxHandle extends SubstrateHandle {
   readonly substrate: typeof BOX_SUBSTRATE;
   /** The box id (`bx_…`) — the `{boxId}` path segment. */
   readonly id: string;
-  /** marid's whole configuration, re-exported by every bootstrap. Secret. */
-  readonly env: Readonly<Record<string, string>>;
-  /** Entrypoint override (tests), or `null` for the marid bootstrap. */
-  readonly cmd: readonly string[] | null;
-  /** Where the bootstrap downloads marid from; `null` when `cmd` replaces it. */
-  readonly maridBinaryUrl: string | null;
   /** Ports the caller asked for. Recorded only: Box's hosting API registers a
    *  port at expose time (`host <port>`), no create-time publish exists. */
   readonly ports: readonly number[];
@@ -240,6 +240,16 @@ export interface BoxConfig {
    * carries a `cmd` override (tests).
    */
   readonly maridBinaryUrl?: string;
+  /**
+   * Explicit test/lab opt-in for a provider whose platform cannot delete boxes.
+   *
+   * Box archives snapshots indefinitely and currently exposes no DELETE
+   * endpoint, so it cannot satisfy SubstrateProvider.destroy. The constructor
+   * rejects unless this is exactly true. This flag must never be enabled in a
+   * production substrate candidate list; it exists only for bounded driver
+   * tests while the platform contract is incomplete.
+   */
+  readonly allowRetainedBoxesForTesting?: boolean;
   /**
    * Platform auto-archive TTL. Defaults to `null` (disabled) because Box's TTL
    * counts from CREATION and would archive an active computer; Mari's tier
@@ -307,6 +317,13 @@ interface CommandFinishedResponse extends BoxEnvelope {
   readonly timedOut?: boolean;
 }
 
+/** Secret bootstrap state which must never cross the provider-memory boundary. */
+interface BootstrapConfig {
+  readonly env: Readonly<Record<string, string>>;
+  readonly cmd: readonly string[] | null;
+  readonly maridBinaryUrl: string | null;
+}
+
 function isBoxHandle(handle: SubstrateHandle): asserts handle is BoxHandle {
   if (handle.substrate !== BOX_SUBSTRATE) {
     throw new Error(`BoxProvider received a "${handle.substrate}" handle`);
@@ -325,9 +342,20 @@ export class BoxProvider implements SubstrateProvider {
   readonly supportsWarm = true;
 
   readonly #cfg: BoxConfig;
+  /** Bootstrap credentials live only as long as this provider activation. */
+  readonly #bootstraps = new Map<string, BootstrapConfig>();
 
   constructor(config: BoxConfig) {
     if (!config.apiKey) throw new Error('BoxProvider requires an API key');
+    if (config.allowRetainedBoxesForTesting !== true) {
+      throw new BoxSubstrateError(
+        'protocol',
+        'BoxProvider is not production-ready: Box has no delete endpoint and retains ' +
+          'archived snapshots for the life of the box, so destroy cannot guarantee that ' +
+          'no substrate resources remain. Set allowRetainedBoxesForTesting only in a ' +
+          'bounded test/lab environment.',
+      );
+    }
     this.#cfg = config;
   }
 
@@ -363,11 +391,9 @@ export class BoxProvider implements SubstrateProvider {
       {
         // Disabled by default; Mari's tier alarm is the idle policy (header).
         ttlSeconds: this.#cfg.ttlSeconds ?? null,
-        // The computer's own configuration. Belt-and-braces: the bootstrap also
-        // exports it explicitly, because create-time env surviving a resume is
-        // not documented and marid's env must not depend on it.
-        env: { ...spec.env },
         // Never inherit the Ascii account's secrets into a Mari computer.
+        // Per-box env is intentionally omitted: Box persists it across resume
+        // and fork, while supervisor credentials belong only to this activation.
         noEnv: true,
       },
       `create box for computer "${spec.computer}"`,
@@ -377,44 +403,68 @@ export class BoxProvider implements SubstrateProvider {
       throw new BoxSubstrateError('protocol', 'create box: response had no box.id');
     }
 
-    const ready = await this.#pollUntilRunning(box.id, deadline, `computer "${spec.computer}"`);
+    const bootstrap: BootstrapConfig = {
+      env: { ...spec.env },
+      cmd,
+      maridBinaryUrl: binaryUrl,
+    };
+    this.#bootstraps.set(box.id, bootstrap);
     const handle: BoxHandle = {
       substrate: BOX_SUBSTRATE,
       computer: spec.computer,
       id: box.id,
-      env: { ...spec.env },
-      cmd,
-      maridBinaryUrl: binaryUrl,
       ports: [...(spec.ports ?? [])],
-      subdomain: ready.subdomain ?? box.subdomain ?? null,
+      subdomain: box.subdomain ?? null,
     };
 
     try {
-      await this.#bootstrap(handle);
+      const ready = await this.#pollUntilRunning(box.id, deadline, `computer "${spec.computer}"`);
+      await this.#bootstrap(handle, bootstrap, deadline);
+      return {
+        ...handle,
+        subdomain: ready.subdomain ?? handle.subdomain,
+      };
     } catch (err) {
       // A box whose supervisor never started must not be left billing; archive
       // it (the platform's terminal state) before reporting the failure.
+      this.#bootstraps.delete(handle.id);
       await this.#stopQuietly(handle.id);
       throw err;
     }
-    return handle;
   }
 
   // ── spec §3.5: destroy ─────────────────────────────────────────────────────
 
   /**
-   * `destroy` == archive + forget (see the file header: the platform has no
-   * delete endpoint; stop/archive is its terminal state). After this resolves
-   * nothing bills, nothing accepts writes, and the handle is never used again —
-   * the archived snapshot is a stale cache of a computer whose truth is the
-   * chunk store (spec §4.1). Destroying an already-gone handle resolves
-   * without error (provider.ts).
+   * Fail closed: stop compute, verify the box is archived, then reject because
+   * Box retains the snapshot indefinitely. A caller must not record COLD from
+   * an archive. Only a platform-side 404 is real, idempotent destruction.
    */
   async destroy(handle: SubstrateHandle): Promise<void> {
     isBoxHandle(handle);
-    await this.#stopBox(handle.id, `destroy computer "${handle.computer}"`);
-    // No poll to `archived`: the 202 means archival is the platform's problem
-    // now, and destroy has nothing left to wait for.
+    try {
+      await this.#stopBox(handle.id, `destroy computer "${handle.computer}"`);
+      const deadline =
+        this.#now() + this.#num(this.#cfg.archiveTimeoutMs, DEFAULT_ARCHIVE_TIMEOUT_MS);
+      await this.#pollUntilState(
+        handle.id,
+        (s) => s === 'archived',
+        (s) => PENDING_STATES.has(s) || RUNNING_STATES.has(s) || s === 'archiving',
+        deadline,
+        `destroy computer "${handle.computer}": box did not reach archived`,
+      );
+    } catch (err) {
+      // A 404 is the only state which actually satisfies destroy. #stopBox
+      // treats it as idempotent success, so the following poll is what observes
+      // and resolves the already-gone case.
+      if (err instanceof BoxSubstrateError && err.kind === 'not_found') {
+        this.#bootstraps.delete(handle.id);
+        return;
+      }
+      throw err;
+    }
+    this.#bootstraps.delete(handle.id);
+    throw retainedBoxError(handle.id);
   }
 
   // ── spec §3.5: sleep ───────────────────────────────────────────────────────
@@ -450,6 +500,15 @@ export class BoxProvider implements SubstrateProvider {
    */
   async wake(handle: SubstrateHandle): Promise<void> {
     isBoxHandle(handle);
+    const bootstrap = this.#bootstraps.get(handle.id);
+    if (!bootstrap) {
+      throw new BoxSubstrateError(
+        'protocol',
+        `cannot wake computer "${handle.computer}": its secret Box bootstrap state was ` +
+          'intentionally not persisted and this provider activation no longer has it; ' +
+          'the archived box was left stopped',
+      );
+    }
     const deadline = this.#now() + this.#num(this.#cfg.resumeTimeoutMs, DEFAULT_RESUME_TIMEOUT_MS);
     try {
       await this.#request<BoxEnvelope>(
@@ -465,7 +524,7 @@ export class BoxProvider implements SubstrateProvider {
       if (!(err instanceof BoxSubstrateError) || err.kind !== 'conflict') throw err;
     }
     await this.#pollUntilRunning(handle.id, deadline, `computer "${handle.computer}"`);
-    await this.#bootstrap(handle);
+    await this.#bootstrap(handle, bootstrap, deadline);
   }
 
   // ── spec §3.5: exec ────────────────────────────────────────────────────────
@@ -603,39 +662,94 @@ export class BoxProvider implements SubstrateProvider {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  /** Assemble and run the marid bootstrap (file header). Fails loudly on a
-   *  non-zero exit or a missing marker; the DETACHED process is not awaited. */
-  async #bootstrap(handle: BoxHandle): Promise<void> {
+  /**
+   * Install/restart marid as Box's documented systemd long-running service.
+   *
+   * The persisted unit contains no secrets. Its launcher lives under /run and
+   * is reconstructed from provider memory on each explicit wake. A stable
+   * MainPID check proves the process survived the command request; merely
+   * reaching a shell `&` line is not readiness.
+   */
+  async #bootstrap(
+    handle: BoxHandle,
+    bootstrap: BootstrapConfig,
+    readinessDeadline: number,
+  ): Promise<void> {
     const bin = this.#cfg.maridBinPath ?? DEFAULT_MARID_BIN_PATH;
     const log = this.#cfg.maridLogPath ?? DEFAULT_MARID_LOG_PATH;
     const lines: string[] = ['set -eu'];
-    if (handle.maridBinaryUrl) {
+    if (bootstrap.maridBinaryUrl) {
       lines.push(
-        `mkdir -p ${shq(parentDir(bin))} ${shq(parentDir(log))}`,
+        `sudo -n install -d -m 0755 ${shq(parentDir(bin))} ${shq(parentDir(log))}`,
         // Idempotent: a resumed box's restored disk still holds the binary.
         // curl first (present in the box image), wget as the fallback.
         `if [ ! -x ${shq(bin)} ]; then ` +
-          `(curl -fsSL ${shq(handle.maridBinaryUrl)} -o ${shq(bin)} || ` +
-          `wget -qO ${shq(bin)} ${shq(handle.maridBinaryUrl)}) && chmod +x ${shq(bin)}; fi`,
+          `tmp=$(mktemp); ` +
+          `(curl -fsSL ${shq(bootstrap.maridBinaryUrl)} -o "$tmp" || ` +
+          `wget -qO "$tmp" ${shq(bootstrap.maridBinaryUrl)}); ` +
+          `sudo -n install -m 0755 "$tmp" ${shq(bin)}; rm -f "$tmp"; fi`,
       );
     } else {
-      lines.push(`mkdir -p ${shq(parentDir(log))}`);
+      lines.push(`sudo -n install -d -m 0755 ${shq(parentDir(log))}`);
     }
-    for (const [key, value] of Object.entries(handle.env)) {
+
+    const launcher: string[] = ['#!/bin/sh', 'set -eu'];
+    for (const [key, value] of Object.entries(bootstrap.env)) {
       assertEnvName(key);
-      lines.push(`export ${key}=${shq(value)}`);
+      launcher.push(`export ${key}=${shq(value)}`);
     }
-    const program = handle.cmd ? handle.cmd.map(shq).join(' ') : shq(bin);
+    const program = bootstrap.cmd ? bootstrap.cmd.map(shq).join(' ') : shq(bin);
+    launcher.push(`exec ${program}`, '');
+
+    const unit = [
+      '[Unit]',
+      'Description=Mari supervisor',
+      'After=network-online.target',
+      'Wants=network-online.target',
+      `ConditionPathIsExecutable=${MARID_RUNTIME_LAUNCHER}`,
+      '',
+      '[Service]',
+      'Type=simple',
+      'User=user',
+      `ExecStart=${MARID_RUNTIME_LAUNCHER}`,
+      'Restart=always',
+      'RestartSec=1',
+      `StandardOutput=append:${log}`,
+      'StandardError=inherit',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+      '',
+    ].join('\n');
+    const unitPath = `/etc/systemd/system/${MARID_SERVICE}`;
     lines.push(
-      // setsid: survive the command session; nohup: ignore HUP; </dev/null:
-      // nothing holds the command's stdin open, so the API call can return.
-      `setsid nohup ${program} >> ${shq(log)} 2>&1 < /dev/null &`,
+      `sudo -n install -d -o user -g user -m 0700 ${shq(MARID_RUNTIME_DIR)}`,
+      `printf %s ${shq(toBase64(launcher.join('\n')))} | base64 -d | ` +
+        `sudo -n tee ${shq(MARID_RUNTIME_LAUNCHER)} >/dev/null`,
+      `sudo -n chown user:user ${shq(MARID_RUNTIME_LAUNCHER)}`,
+      `sudo -n chmod 0700 ${shq(MARID_RUNTIME_LAUNCHER)}`,
+      `printf %s ${shq(toBase64(unit))} | base64 -d | ` +
+        `sudo -n tee ${shq(unitPath)} >/dev/null`,
+      'sudo -n systemctl daemon-reload',
+      `sudo -n systemctl enable ${shq(MARID_SERVICE)} >/dev/null`,
+      `sudo -n systemctl restart ${shq(MARID_SERVICE)}`,
+      // `is-active` immediately after restart can catch a crash/restart loop in
+      // its transient active phase. Require the same live MainPID one second
+      // later, which is also proof that the process outlived this shell request.
+      `mari_pid_before=$(sudo -n systemctl show -p MainPID --value ${shq(MARID_SERVICE)})`,
+      'case "$mari_pid_before" in ""|0|*[!0-9]*) exit 1;; esac',
+      'sleep 1',
+      `mari_pid_after=$(sudo -n systemctl show -p MainPID --value ${shq(MARID_SERVICE)})`,
+      '[ "$mari_pid_before" = "$mari_pid_after" ]',
+      'sudo -n kill -0 "$mari_pid_after"',
+      `sudo -n systemctl is-active --quiet ${shq(MARID_SERVICE)}`,
       `echo ${BOOTSTRAP_OK}`,
     );
-    const result = await this.#command(
+    const result = await this.#commandWhenReady(
       handle.id,
       lines.join('\n'),
       `bootstrap marid on computer "${handle.computer}"`,
+      readinessDeadline,
     );
     if (result.exitCode !== 0 || !result.stdout.includes(BOOTSTRAP_OK)) {
       throw new BoxSubstrateError(
@@ -643,6 +757,39 @@ export class BoxProvider implements SubstrateProvider {
         `bootstrap on computer "${handle.computer}" failed (exit ${result.exitCode})` +
           `${result.stderr ? ` — ${result.stderr.trim()}` : ''}`,
       );
+    }
+  }
+
+  /**
+   * The GET lifecycle state can become `ready` before the command transport is
+   * ready. Box then returns 502 `box_direct_failed` with `box_restoring` in the
+   * envelope. Retry only that documented/transient readiness shape, bounded by
+   * the same create/resume deadline; do not hide arbitrary command failures.
+   */
+  async #commandWhenReady(
+    boxId: string,
+    command: string,
+    context: string,
+    deadline: number,
+  ): Promise<ExecResult> {
+    const interval = this.#num(this.#cfg.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
+    let last: BoxSubstrateError | null = null;
+    for (;;) {
+      try {
+        return await this.#command(boxId, command, context);
+      } catch (err) {
+        if (!isRestoreReadinessError(err)) throw err;
+        last = err;
+      }
+      const remaining = deadline - this.#now();
+      if (remaining <= 0) {
+        throw new BoxSubstrateError(
+          'timeout',
+          `${context}: Box command transport did not become ready before the lifecycle deadline`,
+          { cause: last },
+        );
+      }
+      await this.#sleep(Math.min(interval, remaining));
     }
   }
 
@@ -859,6 +1006,10 @@ export class BoxProvider implements SubstrateProvider {
  * `BOX_BASE_URL`, and `MARID_BINARY_URL` (the deployment var the bootstrap
  * downloads marid from) from the passed env record (default: `process.env`
  * when present, else `{}` — Workers pass their own env in).
+ *
+ * This intentionally does not read a production env switch for
+ * `allowRetainedBoxesForTesting`: the unsafe-retention acknowledgement can only
+ * be supplied explicitly in `overrides` by a bounded test/lab caller.
  */
 export function createBoxProvider(
   env: Record<string, string | undefined> = typeof process !== 'undefined' ? process.env : {},
@@ -969,6 +1120,24 @@ function assertPort(port: number): void {
 
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function isRestoreReadinessError(err: unknown): err is BoxSubstrateError {
+  if (!(err instanceof BoxSubstrateError)) return false;
+  if (err.code === 'box_restoring' || err.code === 'box_securing') return true;
+  return (
+    err.code === 'box_direct_failed' &&
+    /\bbox_(?:restoring|securing)\b/i.test(err.message)
+  );
+}
+
+function retainedBoxError(boxId: string): BoxSubstrateError {
+  return new BoxSubstrateError(
+    'protocol',
+    `Box ${boxId} was archived to stop compute, but not destroyed: the Box API has ` +
+      'no delete endpoint and retains the latest snapshot for the life of the box. ' +
+      'Mari must keep this computer WARM and must not record it COLD.',
+  );
 }
 
 /** Map an HTTP status + error envelope onto a typed error. */

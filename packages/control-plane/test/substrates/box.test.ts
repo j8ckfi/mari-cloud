@@ -85,6 +85,7 @@ function provider(fetchImpl: typeof fetch, over: Partial<BoxConfig> = {}): BoxPr
   const clock = fakeClock();
   return new BoxProvider({
     apiKey: KEY,
+    allowRetainedBoxesForTesting: true,
     baseUrl: BASE,
     maridBinaryUrl: BIN_URL,
     fetch: fetchImpl,
@@ -114,16 +115,29 @@ const handle = (over: Partial<BoxHandle> = {}): BoxHandle => ({
   substrate: BOX_SUBSTRATE,
   computer: 'comp-1',
   id: 'bx_abcdefgh',
-  env: { MARI_TOKEN: 'tok', MARI_EPOCH: '3' },
-  cmd: null,
-  maridBinaryUrl: BIN_URL,
   ports: [],
   subdomain: 'silly-word-slug',
   ...over,
 });
 
+function runtimeLauncher(command: string): string {
+  const encoded = /printf %s '([^']+)' \| base64 -d \| sudo -n tee '\/run\/mari-box\/marid-start'/.exec(
+    command,
+  )?.[1];
+  expect(encoded).toBeTruthy();
+  return Buffer.from(encoded!, 'base64').toString('utf8');
+}
+
+function persistedUnit(command: string): string {
+  const encoded = /printf %s '([^']+)' \| base64 -d \| sudo -n tee '\/etc\/systemd\/system\/mari-supervisor\.service'/.exec(
+    command,
+  )?.[1];
+  expect(encoded).toBeTruthy();
+  return Buffer.from(encoded!, 'base64').toString('utf8');
+}
+
 describe('BoxProvider materialize', () => {
-  it('creates, polls provisioning→ready, then bootstraps marid detached', async () => {
+  it('creates with no persisted env, then installs a systemd bootstrap from memory', async () => {
     const s = stub([
       // POST /boxes — the create body is the whole platform contract here.
       (req) => {
@@ -135,7 +149,6 @@ describe('BoxProvider materialize', () => {
           // Platform TTL disabled: it counts from CREATION; the DO tier alarm
           // owns idle policy.
           ttlSeconds: null,
-          env: { MARI_COMPUTER_ID: 'comp-1', MARI_EPOCH: '7', MARI_TOKEN: 's3cret' },
           // A Mari computer never inherits the Ascii account's secrets.
           noEnv: true,
         });
@@ -157,16 +170,26 @@ describe('BoxProvider materialize', () => {
         const c = body.command;
         // Download-if-absent from the deployment var URL, then chmod.
         expect(c).toContain(`if [ ! -x '/usr/local/bin/marid' ]`);
-        expect(c).toContain(`curl -fsSL '${BIN_URL}' -o '/usr/local/bin/marid'`);
-        expect(c).toContain(`chmod +x '/usr/local/bin/marid'`);
-        // The whole marid env exported, values single-quoted.
-        expect(c).toContain(`export MARI_COMPUTER_ID='comp-1'`);
-        expect(c).toContain(`export MARI_EPOCH='7'`);
-        expect(c).toContain(`export MARI_TOKEN='s3cret'`);
-        // Detached start: the command returns while marid keeps running.
-        expect(c).toContain(
-          `setsid nohup '/usr/local/bin/marid' >> '/var/log/marid.log' 2>&1 < /dev/null &`,
-        );
+        expect(c).toContain(`curl -fsSL '${BIN_URL}' -o "$tmp"`);
+        expect(c).toContain(`install -m 0755 "$tmp" '/usr/local/bin/marid'`);
+        // Systemd, Box's documented long-running primitive, owns marid. The
+        // persisted unit points at /run and contains no secret values.
+        expect(c).toContain(`systemctl enable 'mari-supervisor.service'`);
+        expect(c).toContain(`systemctl restart 'mari-supervisor.service'`);
+        expect(c).toContain('mari_pid_before=');
+        expect(c).toContain('[ "$mari_pid_before" = "$mari_pid_after" ]');
+        expect(c).not.toContain('setsid nohup');
+        // The launcher is base64-transported into /run. Decode it to prove the
+        // secret env and program are in runtime state, not the handle or unit.
+        const launcher = runtimeLauncher(c);
+        expect(launcher).toContain(`export MARI_COMPUTER_ID='comp-1'`);
+        expect(launcher).toContain(`export MARI_EPOCH='7'`);
+        expect(launcher).toContain(`export MARI_TOKEN='s3cret'`);
+        expect(launcher).toContain(`exec '/usr/local/bin/marid'`);
+        const unit = persistedUnit(c);
+        expect(unit).toContain('ExecStart=/run/mari-box/marid-start');
+        expect(unit).not.toContain('s3cret');
+        expect(unit).not.toContain('MARI_TOKEN');
         return [200, okCommand({ stdout: 'mari-box-bootstrap-ok\n' })];
       },
     ]);
@@ -183,12 +206,11 @@ describe('BoxProvider materialize', () => {
       substrate: 'box',
       computer: 'comp-1',
       id: 'bx_abcdefgh',
-      env: { MARI_COMPUTER_ID: 'comp-1', MARI_EPOCH: '7', MARI_TOKEN: 's3cret' },
-      cmd: null,
-      maridBinaryUrl: BIN_URL,
       ports: [8080],
       subdomain: 'silly-word-slug',
     });
+    expect(JSON.stringify(h)).not.toContain('s3cret');
+    expect(JSON.stringify(h)).not.toContain(BIN_URL);
     s.assertDrained();
   });
 
@@ -199,7 +221,8 @@ describe('BoxProvider materialize', () => {
       (req) => {
         const c = (req.body as { command: string }).command;
         expect(c).not.toContain('curl');
-        expect(c).toContain(`setsid nohup '/bin/sh' '-c' 'echo hi' >> '/var/log/marid.log'`);
+        const launcher = runtimeLauncher(c);
+        expect(launcher).toContain(`exec '/bin/sh' '-c' 'echo hi'`);
         return [200, okCommand({ stdout: 'mari-box-bootstrap-ok\n' })];
       },
     ]);
@@ -210,8 +233,8 @@ describe('BoxProvider materialize', () => {
       env: {},
       cmd: ['/bin/sh', '-c', 'echo hi'],
     });
-    expect(h.cmd).toEqual(['/bin/sh', '-c', 'echo hi']);
-    expect(h.maridBinaryUrl).toBeNull();
+    expect(h).not.toHaveProperty('cmd');
+    expect(h).not.toHaveProperty('maridBinaryUrl');
     s.assertDrained();
   });
 
@@ -406,6 +429,10 @@ describe('BoxProvider sleep / wake', () => {
 
   it('wake resumes, polls to ready, and re-runs the bootstrap (reboot semantics)', async () => {
     const s = stub([
+      // Materialize seeds the provider-memory-only bootstrap config.
+      () => [202, { ok: true, type: 'box.created', box: box('provisioning') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
       (req) => {
         expect(req.method).toBe('POST');
         expect(req.path).toBe('/boxes/bx_abcdefgh/resume');
@@ -416,20 +443,29 @@ describe('BoxProvider sleep / wake', () => {
       (req) => {
         expect(req.path).toBe('/boxes/bx_abcdefgh/commands');
         const c = (req.body as { command: string }).command;
-        // Same bootstrap, rebuilt from the handle alone: env re-exported, and
+        // Same bootstrap, rebuilt from provider memory: env re-exported, and
         // the download self-skips (the restored disk still has the binary).
-        expect(c).toContain(`export MARI_TOKEN='tok'`);
+        expect(runtimeLauncher(c)).toContain(`export MARI_TOKEN='tok'`);
         expect(c).toContain(`if [ ! -x '/usr/local/bin/marid' ]`);
-        expect(c).toContain('setsid nohup');
+        expect(c).toContain(`systemctl restart 'mari-supervisor.service'`);
         return [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })];
       },
     ]);
-    await provider(s.fetchImpl).wake(handle());
+    const p = provider(s.fetchImpl);
+    const h = await p.materialize({
+      computer: 'comp-1',
+      image: 'x',
+      env: { MARI_TOKEN: 'tok' },
+    });
+    await p.wake(h);
     s.assertDrained();
   });
 
   it('wake tolerates a 409 resume conflict when the box is already running', async () => {
     const s = stub([
+      () => [202, { ok: true, type: 'box.created', box: box('ready') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
       () => [
         409,
         { ok: false, type: 'box.error', status: 409, code: 'box_not_archived', message: 'running' },
@@ -437,38 +473,118 @@ describe('BoxProvider sleep / wake', () => {
       () => [200, { ok: true, type: 'box.info', box: box('idle') }],
       () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
     ]);
-    await provider(s.fetchImpl).wake(handle());
+    const p = provider(s.fetchImpl);
+    const h = await p.materialize({ computer: 'comp-1', image: 'x', env: {} });
+    await p.wake(h);
+    s.assertDrained();
+  });
+
+  it('retries a bounded transient box_restoring command transport after resume', async () => {
+    const s = stub([
+      () => [202, { ok: true, type: 'box.created', box: box('ready') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
+      () => [202, { ok: true, type: 'box.resuming', box: box('provisioning') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      () => [
+        502,
+        {
+          ok: false,
+          type: 'box.error',
+          status: 502,
+          code: 'box_direct_failed',
+          message: 'box_restoring',
+          requestId: 'req_restore',
+        },
+      ],
+      () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
+    ]);
+    const p = provider(s.fetchImpl, { resumeTimeoutMs: 5_000, pollIntervalMs: 1_000 });
+    const h = await p.materialize({ computer: 'comp-1', image: 'x', env: {} });
+    await p.wake(h);
+    expect(s.requests.filter((r) => r.path.endsWith('/commands'))).toHaveLength(3);
+    s.assertDrained();
+  });
+
+  it('bounds repeated box_restoring transport failures by the resume deadline', async () => {
+    const restoring = (): [number, unknown] => [
+      502,
+      {
+        ok: false,
+        type: 'box.error',
+        status: 502,
+        code: 'box_direct_failed',
+        message: 'box_restoring',
+      },
+    ];
+    const s = stub([
+      () => [202, { ok: true, type: 'box.created', box: box('ready') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      () => [200, okCommand({ stdout: 'mari-box-bootstrap-ok' })],
+      () => [202, { ok: true, type: 'box.resuming', box: box('provisioning') }],
+      () => [200, { ok: true, type: 'box.info', box: box('ready') }],
+      restoring,
+      restoring,
+      restoring,
+    ]);
+    const p = provider(s.fetchImpl, { resumeTimeoutMs: 1_500, pollIntervalMs: 1_000 });
+    const h = await p.materialize({ computer: 'comp-1', image: 'x', env: {} });
+    await expect(p.wake(h)).rejects.toMatchObject({
+      kind: 'timeout',
+      message: expect.stringContaining('command transport did not become ready'),
+    });
+    s.assertDrained();
+  });
+
+  it('fails before resume after provider activation loss (secrets never persisted)', async () => {
+    const s = stub([]);
+    const p = provider(s.fetchImpl);
+    await expect(p.wake(handle())).rejects.toMatchObject({
+      kind: 'protocol',
+      message: expect.stringContaining('left stopped'),
+    });
+    expect(s.requests).toHaveLength(0);
     s.assertDrained();
   });
 });
 
 describe('BoxProvider destroy', () => {
-  it('destroy is archive+forget: POST stop, no poll (no delete endpoint exists)', async () => {
+  it('archives to stop compute but rejects because retained disk is not destroy', async () => {
     const s = stub([
       (req) => {
         expect(req.method).toBe('POST');
         expect(req.path).toBe('/boxes/bx_abcdefgh/stop');
         return [202, { ok: true, type: 'box.stopping', status: 'archiving' }];
       },
+      () => [200, { ok: true, type: 'box.info', box: box('archiving') }],
+      () => [200, { ok: true, type: 'box.info', box: box('archived') }],
     ]);
-    await provider(s.fetchImpl).destroy(handle());
+    await expect(provider(s.fetchImpl).destroy(handle())).rejects.toMatchObject({
+      kind: 'protocol',
+      message: expect.stringContaining('not destroyed'),
+    });
     s.assertDrained();
   });
 
   it('destroying an already-gone box (404) resolves without error', async () => {
     const s = stub([
       () => [404, { ok: false, type: 'box.error', status: 404, code: 'not_found' }],
+      // #stopBox treats the first 404 as idempotent, then the poll verifies it.
+      () => [404, { ok: false, type: 'box.error', status: 404, code: 'not_found' }],
     ]);
     await provider(s.fetchImpl).destroy(handle());
     s.assertDrained();
   });
 
-  it('a 409 whose state reads archived is success; any other 409 is not', async () => {
+  it('a 409 whose state reads archived still fails closed; any other 409 is not', async () => {
     const ok = stub([
       () => [409, { ok: false, type: 'box.error', status: 409, code: 'conflict' }],
       () => [200, { ok: true, type: 'box.info', box: box('archived') }],
+      () => [200, { ok: true, type: 'box.info', box: box('archived') }],
     ]);
-    await provider(ok.fetchImpl).destroy(handle());
+    await expect(provider(ok.fetchImpl).destroy(handle())).rejects.toMatchObject({
+      kind: 'protocol',
+    });
     ok.assertDrained();
 
     const bad = stub([
@@ -583,6 +699,7 @@ describe('BoxProvider deadlines and envelopes', () => {
       })) as typeof fetch;
     const p = new BoxProvider({
       apiKey: KEY,
+      allowRetainedBoxesForTesting: true,
       baseUrl: BASE,
       fetch: hanging,
       requestTimeoutMs: 50, // real timer: this test proves the abort actually fires
@@ -634,14 +751,29 @@ describe('BoxProvider deadlines and envelopes', () => {
 });
 
 describe('createBoxProvider / registry surface', () => {
-  it('reads BOX_API_KEY / BOX_BASE_URL / MARID_BINARY_URL from env', () => {
-    const p = createBoxProvider({
-      BOX_API_KEY: 'box_k',
-      BOX_BASE_URL: 'https://example.test/v1',
-      MARID_BINARY_URL: BIN_URL,
-    });
-    expect(p.name).toBe(BOX_SUBSTRATE);
+  it('fails closed by default because Box cannot delete retained snapshots', () => {
+    expect(
+      () =>
+        createBoxProvider({
+          BOX_API_KEY: 'box_k',
+          BOX_BASE_URL: 'https://example.test/v1',
+          MARID_BINARY_URL: BIN_URL,
+        }),
+    ).toThrow(/not production-ready.*no delete endpoint/i);
+    expect(() => new BoxProvider({ apiKey: 'box_k' })).toThrow(/not production-ready/i);
     expect(() => createBoxProvider({})).toThrow(/BOX_API_KEY/);
+  });
+
+  it('allows explicit bounded test/lab construction only', () => {
+    const p = createBoxProvider(
+      {
+        BOX_API_KEY: 'box_k',
+        BOX_BASE_URL: 'https://example.test/v1',
+        MARID_BINARY_URL: BIN_URL,
+      },
+      { allowRetainedBoxesForTesting: true },
+    );
+    expect(p.name).toBe(BOX_SUBSTRATE);
   });
 
   it('declares WARM supported (archive IS warm) and resume-before-cold', () => {
