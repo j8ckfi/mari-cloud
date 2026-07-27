@@ -82,6 +82,8 @@ export class AttachClient {
   #reconnectHandle: number | null = null;
   /** Highest journal offset applied, so re-delivered frames can be skipped. */
   #appliedOffset = 0;
+  /** Whether a grid snapshot has ever been applied (first attach vs. re-attach). */
+  #sawGrid = false;
 
   constructor(opts: AttachOptions) {
     this.#opts = {
@@ -178,6 +180,17 @@ export class AttachClient {
     if (msg === null) return;
     switch (msg.t) {
       case 'grid':
+        // A RE-ATTACH replays the grid the DO already sent us. If nothing was
+        // missed while the socket was down (the snapshot's base offset is not
+        // beyond what this client already applied), the terminal's buffer is
+        // ALREADY the truth: repainting would clear the viewport for no reason
+        // and a caller that resets scrollback on a grid would lose history over
+        // a network blip. So a redundant snapshot is dropped and the applied
+        // offset keeps its high-water mark — later frames still de-duplicate
+        // by offset exactly as before. A snapshot from BEYOND our offset means
+        // output happened while we were away, and only then do we repaint.
+        if (this.#sawGrid && msg.baseOffset <= this.#appliedOffset) return;
+        this.#sawGrid = true;
         this.#appliedOffset = msg.baseOffset;
         this.#opts.handlers.onGrid?.(msg);
         break;

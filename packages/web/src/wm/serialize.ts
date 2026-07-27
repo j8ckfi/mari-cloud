@@ -48,6 +48,7 @@ const PANE_KINDS = new Set<PaneSpec['kind']>([
   'preview',
   'runs',
   'diff',
+  'vault',
 ]);
 
 function isValidNode(node: unknown): node is WmNode {

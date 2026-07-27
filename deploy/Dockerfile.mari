@@ -11,8 +11,12 @@
 # else — account image storage is capped at 50 GB, and every megabyte here is
 # multiplied by the base-image catalogue:
 #
-#   * `marid`, the supervisor, built --release for amd64 from this repo. It is the
-#     ENTRYPOINT, so `materialize` needs no command override.
+#   * `marid`, the supervisor, built --release for amd64 from this repo **with
+#     `--features s3`**: the hosted chunk store is R2's S3 endpoint
+#     (`STORE_URI=s3://mari-store`, deploy/DEPLOY.md §1 item 3), and a marid
+#     without the feature exits at startup with "s3 store requested but marid was
+#     built without the `s3` feature". It is the ENTRYPOINT, so `materialize`
+#     needs no command override.
 #   * a plain POSIX userland (`/bin/sh`, coreutils incl. `base64`) because a run is
 #     an arbitrary program the user brought (spec §2 "Agent"), and control-plane
 #     file writes are expressed as `/bin/sh -c … base64 -d > path` runs
@@ -21,6 +25,18 @@
 #     supervisor's journal and control channel are an outbound `wss://` on 443,
 #     verified against this store (measured: TLSv1.3 / TLS_AES_256_GCM_SHA384,
 #     certificate verified, HTTP/1.1 101). Every agent the user brings needs it too.
+#   * the agent runtimes a hosted computer actually runs (spec §2 "the user brings
+#     the agents", and the agents people bring are coding agents): `git`, `curl`,
+#     `python3`, Node.js 22 (official binary tarball, checksum-verified against
+#     nodejs.org's SHASUMS256 — no NodeSource repo, no apt pin to go stale), and
+#     the two first-party CLIs preinstalled globally: `@anthropic-ai/claude-code`
+#     and `@openai/codex`. Preinstalled because a fresh computer's first run is
+#     routinely `claude …` or `codex …`, and an `npm i -g` on every wake would
+#     cost more transfer per fleet-day than the image bytes cost once.
+#     Deliberately NOT build-essential: neither CLI compiles native modules at
+#     install (verified by the image build itself — `npm install -g` succeeds in
+#     this stage, which has no compiler), and a user who needs a toolchain
+#     installs it into /work where it snapshots with the computer.
 #
 # DELIBERATELY ABSENT:
 #   * fuse3 / fuse-overlayfs. Nothing in the storage contract needs them today
@@ -79,23 +95,66 @@ RUN rustup target add x86_64-unknown-linux-gnu
 
 # Cache mounts keep the cargo registry and target dir out of the image; the binary
 # is copied out inside the same RUN because a cache mount does not survive a layer.
+#
+# `--features s3` is LOAD-BEARING, not an option: `env.production.vars.STORE_URI`
+# is `s3://mari-store` and marid built without the feature refuses that URI at
+# startup (crates/marid/src/store_uri.rs), which on this substrate means every
+# wake materializes a container that exits immediately. The preflight suite
+# (packages/control-plane/test/deploy-preflight.test.ts) asserts this line still
+# carries the flag whenever the production store is `s3://`.
 ARG TARGET=x86_64-unknown-linux-gnu
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/repo/target,sharing=locked \
     set -eux; \
-    cargo build -p marid --locked --release --target "$TARGET"; \
+    cargo build -p marid --locked --release --features s3 --target "$TARGET"; \
     cp "/repo/target/$TARGET/release/marid" /marid; \
     test -s /marid
 
 # ---- stage 2: the base image (linux/amd64) -----------------------------------
 FROM --platform=${IMAGE_PLATFORM} debian:bookworm-slim
 
+# The OS layer plus the agent substrate: git/curl for every coding agent's
+# fetch-and-clone loop, python3 because half the tools a run touches assume it.
+# One layer, one apt transaction, lists removed — the usual slim hygiene.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+        ; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /work /etc/mari/agents.d
 
+# Node.js 22 (LTS) from the official binary tarball, pinned and verified against
+# nodejs.org's own SHASUMS256 for that release — a compromised mirror or a
+# truncated download fails the build instead of shipping. The tarball is used
+# instead of NodeSource because it adds no apt source to rot and nothing beyond
+# /usr/local. Docs/man pages are dropped; nothing on a computer reads them.
+ARG NODE_VERSION=22.23.1
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz"; \
+    curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"; \
+    grep " node-v${NODE_VERSION}-linux-x64.tar.gz\$" SHASUMS256.txt | sha256sum -c -; \
+    tar -xzf "node-v${NODE_VERSION}-linux-x64.tar.gz" -C /usr/local --strip-components=1 \
+        --no-same-owner \
+        --exclude='*/share/doc' --exclude='*/share/man' --exclude='*/include'; \
+    rm -f "/tmp/node-v${NODE_VERSION}-linux-x64.tar.gz" /tmp/SHASUMS256.txt; \
+    node --version; npm --version
+
+# The two coding-agent CLIs, globally, so a fresh computer's first `claude` or
+# `codex` run starts in milliseconds instead of an npm install. Their versions
+# float on purpose: both ship weekly and pinning here would strand every hosted
+# computer on a stale agent until the next image push. `npm cache clean` keeps
+# ~100 MB of tarball cache out of the layer.
+RUN set -eux; \
+    npm install -g @anthropic-ai/claude-code @openai/codex; \
+    npm cache clean --force; \
+    command -v claude; command -v codex
+
+# Last, because it changes most often: a marid rebuild invalidates nothing above.
 COPY --from=build /marid /usr/local/bin/marid
 
 # Defaults for the marid env contract (contracts.md §5.1, crates/marid/src/config.rs).

@@ -598,13 +598,15 @@ async fn handle_control(shared: &Arc<Shared>, msg: ControlMessage, sent: &mut Ha
             env_names,
             cwd,
         } => {
-            info!(%run, ?argv, "start_run");
+            // Never log the argv itself: a write's argv carries the file's
+            // full payload (decisions appendix: the write-argv log leak).
+            info!(%run, argv = %crate::run::argv_for_log(&argv), "start_run");
             if let Err(e) = shared
                 .run_manager
                 .start_run(run.clone(), argv, env_names, cwd)
                 .await
             {
-                warn!(%run, "start_run failed: {e:#}");
+                warn!(%run, "start_run failed: {}", crate::run::bound_str(&format!("{e:#}"), 512));
             }
         }
         ControlMessage::StopRun { run } => {

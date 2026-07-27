@@ -81,6 +81,15 @@ export interface Env {
   /** WARM -> COLD idle threshold, ms (default 30 min). */
   COLD_IDLE_MS?: string;
 
+  // ---- per-user quotas (spec 10.3; src/limits.ts owns the policy) ----------
+
+  /** Computers one account may hold. Unset: 3 on a production environment,
+   *  unlimited elsewhere. `<= 0` means explicitly unlimited. */
+  LIMIT_MAX_COMPUTERS?: string;
+  /** AWAKE compute-hours one account may spend per UTC month. Unset: 100 on a
+   *  production environment, unlimited elsewhere. `<= 0` means unlimited. */
+  LIMIT_COMPUTE_HOURS?: string;
+
   // ---- liveness and recovery (computer-do.ts) ------------------------------
   // A substrate evicts an instance and tells nobody; these four numbers are how
   // long Mari waits before it stops believing its own record of AWAKE.

@@ -49,6 +49,7 @@ import {
   previewUrlFor,
   previewUserLabel,
 } from './preview';
+import { canCreateComputer, canWake, limitsSummary } from './limits';
 
 function newComputerId(): string {
   return crypto.randomUUID().replace(/-/g, '');
@@ -382,6 +383,14 @@ export function createApp(env?: Env): Hono<AppEnv> {
     return c.json({ computers });
   });
 
+  // ---- the caller's own quota position (spec 10.3; limits.ts) ----
+  // What the web app renders next to "New computer" and the wake affordances:
+  // the caps (null = unlimited), this UTC month's metered compute spend, and
+  // the computer count. Per USER, no computer id, no substrate call.
+  app.get('/api/me/limits', async (c) => {
+    return c.json(await limitsSummary(c.env.DB, c.env, c.get('user').id));
+  });
+
   // ---- computers CRUD ----
   app.get('/api/computers', async (c) => {
     const rows = await listComputers(c.env.DB, c.get('user').id);
@@ -398,6 +407,20 @@ export function createApp(env?: Env): Hono<AppEnv> {
   });
 
   app.post('/api/computers', async (c) => {
+    // Spec 10.3: the account's computer-count cap gates creation, BEFORE any
+    // row or Durable Object exists. The refusal names the numbers so the UI can
+    // say them (limits.ts owns the policy).
+    const createGate = await canCreateComputer(c.env.DB, c.env, c.get('user').id);
+    if (!createGate.ok) {
+      return c.json(
+        {
+          error: createGate.reason,
+          computers: createGate.computers,
+          maxComputers: createGate.maxComputers,
+        },
+        403,
+      );
+    }
     const body = (await c.req.json().catch(() => ({}))) as { name?: string };
     const name = (body.name ?? 'computer').toString().slice(0, 200);
     const id = newComputerId();
@@ -445,6 +468,16 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.post('/api/computers/:id/wake', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
+    // Spec 10.3 compute cap, checked AFTER ownership (a non-owner's answer must
+    // stay 404, indistinguishable from a missing computer) and BEFORE the DO is
+    // addressed, so a refused wake costs no substrate call.
+    const wakeGate = await canWake(c.env.DB, c.env, c.get('user').id);
+    if (!wakeGate.ok) {
+      return c.json(
+        { error: wakeGate.reason, usedMs: wakeGate.usedMs, capMs: wakeGate.capMs },
+        403,
+      );
+    }
     const res = await stubFor(c.env, row.id).wake(row.id);
     if (res.ok) return c.json({ state: res.state, epoch: res.epoch });
     if (res.retrying) {
@@ -521,6 +554,19 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.post('/api/computers/:id/fork', async (c) => {
     const src = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!src) return c.json({ error: 'not_found' }, 404);
+    // A fork is a NEW computer (spec 9.1) and holds a fleet slot, so it passes
+    // the same spec 10.3 gate as create. Ownership first: a non-owner sees 404.
+    const forkGate = await canCreateComputer(c.env.DB, c.env, c.get('user').id);
+    if (!forkGate.ok) {
+      return c.json(
+        {
+          error: forkGate.reason,
+          computers: forkGate.computers,
+          maxComputers: forkGate.maxComputers,
+        },
+        403,
+      );
+    }
     const body = (await c.req.json().catch(() => ({}))) as { name?: string };
 
     // Source head is authoritative in the DO (may be ahead of the D1 mirror).
@@ -688,6 +734,14 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.post('/api/computers/:id/runs', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
+    // Spec 10.3: a run on a non-AWAKE computer IS a wake (enqueueRun starts one
+    // in the background), so run creation passes the compute gate. After
+    // ownership (a non-owner stays 404), before the DO (a refusal costs no
+    // substrate call and enqueues nothing).
+    const runGate = await canWake(c.env.DB, c.env, c.get('user').id);
+    if (!runGate.ok) {
+      return c.json({ error: runGate.reason, usedMs: runGate.usedMs, capMs: runGate.capMs }, 403);
+    }
     const body = (await c.req.json().catch(() => ({}))) as {
       argv?: unknown;
       cwd?: unknown;
@@ -1003,9 +1057,19 @@ export function createApp(env?: Env): Hono<AppEnv> {
     );
   };
 
+  // A file write starts a wake (spec 8.4), so both write routes pass the
+  // spec 10.3 compute gate — after ownership, before the DO.
+  const writeWakeGate = async (c: Context<AppEnv>): Promise<Response | null> => {
+    const gate = await canWake(c.env.DB, c.env, c.get('user').id);
+    if (gate.ok) return null;
+    return c.json({ error: gate.reason, usedMs: gate.usedMs, capMs: gate.capMs }, 403);
+  };
+
   app.put('/api/computers/:id/file', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
+    const refused = await writeWakeGate(c);
+    if (refused) return refused;
     const body = new Uint8Array(await c.req.arrayBuffer());
     return writeHandler(c, new URL(c.req.url).searchParams.get('path'), body);
   });
@@ -1013,6 +1077,8 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.post('/api/computers/:id/upload', async (c) => {
     const row = await getOwnedComputer(c.env.DB, c.req.param('id'), c.get('user').id);
     if (!row) return c.json({ error: 'not_found' }, 404);
+    const refused = await writeWakeGate(c);
+    if (refused) return refused;
     const url = new URL(c.req.url);
     const contentType = c.req.header('content-type') ?? '';
 

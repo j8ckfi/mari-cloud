@@ -74,10 +74,11 @@ describe('selectSubstrate (spec §3.6)', () => {
 
 describe('registry', () => {
   it('exposes every substrate name and its profile', () => {
-    expect([...SUBSTRATE_NAMES].sort()).toEqual(['cloudflare', 'docker', 'sprites']);
+    expect([...SUBSTRATE_NAMES].sort()).toEqual(['box', 'cloudflare', 'docker', 'sprites']);
     expect(SUBSTRATE_PROFILES.docker).toBeDefined();
     expect(SUBSTRATE_PROFILES.sprites).toBeDefined();
     expect(SUBSTRATE_PROFILES.cloudflare).toBeDefined();
+    expect(SUBSTRATE_PROFILES.box).toBeDefined();
     expect(SUBSTRATE_PROFILES.docker!.usdPerHour).toBe(0);
     // Every name in the registry must be selectable, or `selectSubstrate` would
     // silently ignore it (it drops candidates with no profile).

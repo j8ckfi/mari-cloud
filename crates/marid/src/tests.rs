@@ -788,6 +788,200 @@ async fn cold_wake_restores_root_ordered_by_heat_and_updates_heat() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Spawn failure and the write-argv log leak.
+//
+// A run whose process cannot be spawned (E2BIG from an oversized argv element,
+// ENOENT from a missing binary) must fail THAT RUN with a terminal RunCompleted
+// — never wedge or kill the daemon — and no argv payload may ever reach a log
+// line (decisions appendix: 1,063,564 bytes of base64 in docker logs).
+// ---------------------------------------------------------------------------
+
+/// Log capture: a process-global tracing subscriber writing into a shared
+/// buffer. Global (not thread-scoped `with_default`) because the supervisor
+/// logs from spawned tasks on other worker threads. Installed once; every test
+/// in this process shares it, and only these tests assert on it.
+fn install_log_capture() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    static LOG_BUF: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    LOG_BUF
+        .get_or_init(|| {
+            let buf: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+            struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for CaptureWriter {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let writer_buf = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || CaptureWriter(writer_buf.clone()))
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            buf.clone()
+        })
+        .clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn huge_argv_never_reaches_logs_and_spawn_failure_fails_only_that_run() {
+    let logs = install_log_capture();
+
+    let cp = FakeControlPlane::start().await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let config = ws_config(&cp, root.path(), store_dir.path());
+    let sup = tokio::spawn(crate::run(config));
+
+    assert!(
+        cp.wait_until(Duration::from_secs(5), |s| !s.hellos.is_empty())
+            .await,
+        "supervisor must connect and handshake"
+    );
+
+    // An argv element far past Linux's MAX_ARG_STRLEN (131072): exec fails with
+    // E2BIG. The canary sits at the END of the payload, past any bounded
+    // prefix a redacted log line may legitimately show.
+    let canary = "MARI-LEAK-CANARY-7f3e2a91";
+    let payload = format!("{}{canary}", "A".repeat(200_000));
+    let run = RunId::new("run-e2big");
+    cp.queue_control(ControlMessage::StartRun {
+        run: run.clone(),
+        argv: vec!["/bin/echo".into(), payload],
+        env_names: vec![],
+        cwd: root.path().to_str().unwrap().to_string(),
+    });
+
+    // The run — not the daemon — fails, with a terminal completion event.
+    // E2BIG surfaces in one of two shapes depending on where exec fails:
+    // portable-pty's pre_exec closes std's exec-error pipe, so the kernel may
+    // report it as a post-fork child abort (Signaled) rather than a spawn error
+    // (Exited 127). Either way the contract holds: a terminal, non-success
+    // completion for THIS run, and a daemon that keeps serving.
+    assert!(
+        cp.wait_until(Duration::from_secs(10), |s| s
+            .run_completed
+            .iter()
+            .any(|(r, exit, ..)| *r == run && *exit != ExitStatus::Exited { code: 0 }))
+            .await,
+        "an unspawnable run must complete with a failure status"
+    );
+
+    // The daemon lives: a subsequent normal run on the SAME connection works
+    // end to end (journal bytes and a clean completion).
+    let run2 = RunId::new("run-after-e2big");
+    let marker = "STILL-ALIVE-AFTER-E2BIG";
+    cp.queue_control(ControlMessage::StartRun {
+        run: run2.clone(),
+        argv: vec!["sh".into(), "-c".into(), format!("printf '{marker}'")],
+        env_names: vec![],
+        cwd: root.path().to_str().unwrap().to_string(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(10), |s| {
+            journal_has(s, &run2, marker.as_bytes())
+                && s.run_completed
+                    .iter()
+                    .any(|(r, exit, ..)| *r == run2 && *exit == ExitStatus::Exited { code: 0 })
+        })
+        .await,
+        "a run after the spawn failure must work normally"
+    );
+    cp.with_state(|s| {
+        assert_eq!(
+            s.connections, 1,
+            "the daemon must not have crashed or reconnected"
+        );
+        assert!(s.errors.is_empty(), "journal errors: {:?}", s.errors);
+    });
+
+    // The log leak: no fragment of the argv payload may appear in any log line.
+    let captured = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    assert!(
+        !captured.contains(canary),
+        "argv payload leaked into logs (canary found)"
+    );
+    assert!(
+        !captured.contains(&"A".repeat(1024)),
+        "argv payload leaked into logs (1KiB of payload found)"
+    );
+    // The redacted line still tells an operator what happened: the run id and
+    // the argv's shape (count + total bytes), never its content.
+    assert!(
+        captured.contains("run-e2big") && captured.contains("2 args"),
+        "the redacted start_run line (run id + arg count) must be logged"
+    );
+
+    sup.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_binary_fails_run_with_completion_and_daemon_survives() {
+    let cp = FakeControlPlane::start().await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let config = ws_config(&cp, root.path(), store_dir.path());
+    let sup = tokio::spawn(crate::run(config));
+
+    assert!(
+        cp.wait_until(Duration::from_secs(5), |s| !s.hellos.is_empty())
+            .await,
+        "supervisor must connect and handshake"
+    );
+
+    let run = RunId::new("run-enoent");
+    cp.queue_control(ControlMessage::StartRun {
+        run: run.clone(),
+        argv: vec!["/nonexistent/mari-no-such-binary".into()],
+        env_names: vec![],
+        cwd: root.path().to_str().unwrap().to_string(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(10), |s| s
+            .run_completed
+            .iter()
+            .any(|(r, exit, ..)| *r == run && *exit == ExitStatus::Exited { code: 127 }))
+            .await,
+        "a missing binary must fail the run with exit 127, not the daemon"
+    );
+
+    // A pre-run snapshot was still reported (the run had a baseline), and the
+    // next run works.
+    cp.with_state(|s| {
+        assert!(
+            s.snapshots
+                .iter()
+                .any(|(_, _, reason)| *reason == SnapshotReason::PreRun),
+            "the failed run still reports its pre-run snapshot"
+        );
+    });
+    let run2 = RunId::new("run-after-enoent");
+    cp.queue_control(ControlMessage::StartRun {
+        run: run2.clone(),
+        argv: vec!["sh".into(), "-c".into(), "printf OK-ENOENT".into()],
+        env_names: vec![],
+        cwd: root.path().to_str().unwrap().to_string(),
+    });
+    assert!(
+        cp.wait_until(Duration::from_secs(10), |s| journal_has(
+            s,
+            &run2,
+            b"OK-ENOENT"
+        ))
+        .await,
+        "the daemon must keep serving runs after a spawn failure"
+    );
+    cp.with_state(|s| assert_eq!(s.connections, 1, "no crash, no reconnect"));
+
+    sup.abort();
+}
+
+// ---------------------------------------------------------------------------
 // 7. store URI parsing.
 // ---------------------------------------------------------------------------
 

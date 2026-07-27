@@ -58,13 +58,20 @@ export interface DiffPaneSpec {
   title?: string;
 }
 
+/** Vault pane: the write-only credential vault of one computer (spec 10.1). */
+export interface VaultPaneSpec {
+  kind: 'vault';
+  title?: string;
+}
+
 export type PaneSpec =
   | TerminalPaneSpec
   | FilesPaneSpec
   | EditorPaneSpec
   | BrowserPreviewPaneSpec
   | RunsPaneSpec
-  | DiffPaneSpec;
+  | DiffPaneSpec
+  | VaultPaneSpec;
 
 export type PaneKind = PaneSpec['kind'];
 
@@ -84,6 +91,8 @@ export function paneLabel(pane: PaneSpec): string {
       return 'Runs';
     case 'diff':
       return pane.run !== undefined ? `Changes · ${shortRunId(pane.run)}` : 'Changes';
+    case 'vault':
+      return 'Vault';
   }
 }
 
@@ -119,6 +128,8 @@ export function samePane(a: PaneSpec, b: PaneSpec): boolean {
       const d = b as DiffPaneSpec;
       return a.run === d.run && a.base === d.base && a.head === d.head;
     }
+    case 'vault':
+      return true; // one vault per computer
   }
 }
 

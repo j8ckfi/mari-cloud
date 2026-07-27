@@ -168,6 +168,67 @@ export interface SecretNamesResponse {
   names: string[];
 }
 
+/**
+ * A computer-level incident: something Mari had to do that nobody asked for
+ * (`GET /api/computers/:id/incidents`). Content-free like the attention log —
+ * a kind, a time (Unix ms), and the epoch it happened under. The interface
+ * turns the kind into plain English; the server never sends prose.
+ */
+export type IncidentKind =
+  | 'substrate_lost'
+  | 'substrate_unknown'
+  | 'supervisor_lost'
+  | 'final_snapshot_missed'
+  | 'destroy_failed'
+  | 'wake_abandoned'
+  | 'recovery_exhausted';
+
+/** One recorded incident, newest first in the listing. */
+export interface IncidentRecord {
+  id: number;
+  kind: IncidentKind;
+  /** When it happened, Unix milliseconds. */
+  at: number;
+  epoch: number;
+}
+
+/** `GET /api/computers/:id/incidents`. */
+export interface IncidentsResponse {
+  incidents: IncidentRecord[];
+}
+
+/**
+ * `GET /api/computers/:id/usage` (spec 8.2 cost meter, landing this phase).
+ * The client hides the meter entirely when the endpoint 404s — an older
+ * control plane must not render as a broken one.
+ */
+export interface UsageResponse {
+  /** Total AWAKE time metered, milliseconds. */
+  awakeMs: number;
+  /** Total substrate-materialized (box) time, milliseconds. */
+  boxMs: number;
+  /** Metered estimate in USD. Internal accounting; there is no billing. */
+  estimatedUsd: number;
+}
+
+/** `GET /api/me/limits` (spec 10.3 surface, landing this phase). */
+export interface LimitsResponse {
+  computeSecondsCap: number;
+  computeSecondsUsed: number;
+  maxComputers: number;
+}
+
+/**
+ * The decoded outcome of `POST /api/computers/:id/wake`, which is honest in
+ * every outcome (spec 8.3): `ok` (200), `retrying` (202 `wake_retrying` with
+ * the time the DO will try again), or `refused` (503 — the state the computer
+ * actually landed in, plus the reason, e.g. `substrate_not_configured`).
+ */
+export type WakeOutcome =
+  | { outcome: 'ok'; state: ComputerState; epoch?: number }
+  | { outcome: 'retrying'; state: ComputerState; retryAt: number | null; error: string }
+  | { outcome: 'refused'; state: ComputerState | null; error: string };
+
 /** `GET /api/computers/:id/preview?port=` (spec 8.5). */
 export interface PreviewResponse {
   computer: ComputerId;

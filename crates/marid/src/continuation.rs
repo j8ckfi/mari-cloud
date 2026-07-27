@@ -213,7 +213,11 @@ pub(crate) async fn run_startup_continuation(shared: &Arc<Shared>) {
                     .continue_run(&record, argv, base, seq)
                     .await
                 {
-                    warn!(run = %record.run, "could not continue run: {e:#}");
+                    warn!(
+                        run = %record.run,
+                        "could not continue run: {}",
+                        crate::run::bound_str(&format!("{e:#}"), 512)
+                    );
                     // Continuation failed: the run is not running and nobody
                     // knows. That is exactly the interrupted case.
                     shared.run_manager.interrupt_run(&record.run).await;
