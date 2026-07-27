@@ -3243,10 +3243,10 @@ export class ComputerDO extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const now = Date.now();
     if (this.#meta.state === 'awake') this.#closeAwakeStretch(true);
-    let due: DeadlineName[] = DEADLINES.filter((name) => {
+    let due: { name: DeadlineName; forced: boolean }[] = DEADLINES.filter((name) => {
       const at = this.#deadlineAt(name);
       return at !== null && at <= now;
-    });
+    }).map((name) => ({ name, forced: false }));
     if (due.length === 0) {
       // Fired ahead of its scheduled time. Both test harnesses do exactly this —
       // `runDurableObjectAlarm` (workers pool) and `runAlarmNow` (Node) are how a
@@ -3260,10 +3260,13 @@ export class ComputerDO extends DurableObject<Env> {
         if (best === null || at < best) earliest = name;
       }
       if (earliest === null) return;
-      due = [earliest];
+      due = [{ name: earliest, forced: true }];
     }
 
-    for (const name of due) {
+    for (const { name, forced } of due) {
+      const scheduled = this.#deadlineAt(name);
+      if (scheduled === null) continue;
+      if (!forced && scheduled > now) continue;
       // Clear the slot BEFORE running the handler: a handler that re-arms (the
       // tier's WARM->COLD, the recurring liveness check) sets it again, and a
       // handler that throws must not leave a deadline that can never be reached

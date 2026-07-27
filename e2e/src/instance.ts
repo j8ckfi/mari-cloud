@@ -4,12 +4,16 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { boot, type BootOptions, type NodeInstance } from '../../packages/control-plane/src/node.js';
 import { waitUntil } from './wait.js';
 
 export type { NodeInstance };
+
+const exec = promisify(execFile);
 
 /**
  * A scratch directory the DOCKER DAEMON can also see. On macOS the daemon runs
@@ -23,8 +27,35 @@ export async function makeSharedDir(prefix: string): Promise<string> {
   return mkdtemp(join(root, `${prefix}-`));
 }
 
-export function removeDir(dir: string): Promise<void> {
-  return rm(dir, { recursive: true, force: true });
+export async function removeDir(dir: string): Promise<void> {
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EACCES') throw err;
+    await chownDockerStore(dir);
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function chownDockerStore(dir: string): Promise<void> {
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') return;
+  const image = process.env.MARI_BASE_IMAGE ?? 'mari/base:v0';
+  await exec(
+    'docker',
+    [
+      'run',
+      '--rm',
+      '-v',
+      `${dir}:/target`,
+      '--entrypoint',
+      'chown',
+      image,
+      '-R',
+      `${process.getuid()}:${process.getgid()}`,
+      '/target',
+    ],
+    { timeout: 120_000, maxBuffer: 1024 * 1024 },
+  );
 }
 
 export interface InstanceOptions extends BootOptions {

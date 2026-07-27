@@ -55,16 +55,15 @@ describe('dev seed', () => {
     // Drive it exactly as the web e2e does: a run through the REST surface,
     // reported by a supervisor with those two manifest ids.
     const stub = computerStub(computerId);
+    const w = await stub.wake(computerId);
+    const sup = await FakeSupervisor.connect(computerId);
+    await sup.handshake(computerId, w.epoch, w.token);
     const started = await apiPost<{ runId: string }>(
       `/api/computers/${computerId}/runs`,
       cookie,
       { argv: ['/bin/true'] },
     );
     const runId = started.body.runId;
-    await waitUntil(async () => (await stub.getState()) === 'awake', 3000, 'wake');
-    const w = await stub.wake(computerId);
-    const sup = await FakeSupervisor.connect(computerId);
-    await sup.handshake(computerId, w.epoch, w.token);
     // The full Workers pool exercises many DOs concurrently. Key derivation and
     // materialization are real async work, so keep this bounded without making
     // a three-second scheduler hiccup look like a protocol failure.
@@ -111,16 +110,15 @@ describe('dev seed', () => {
     const { cookie, computerId, manifest } = await seedSession();
     const stub = computerStub(computerId);
 
+    const w = await stub.wake(computerId);
+    const sup = await FakeSupervisor.connect(computerId);
+    await sup.handshake(computerId, w.epoch, w.token);
     const started = await apiPost<{ runId: string }>(
       `/api/computers/${computerId}/runs`,
       cookie,
       { argv: ['/bin/sleep', '30'] },
     );
     const runId = started.body.runId;
-    await waitUntil(async () => (await stub.getState()) === 'awake', 3000, 'wake');
-    const w = await stub.wake(computerId);
-    const sup = await FakeSupervisor.connect(computerId);
-    await sup.handshake(computerId, w.epoch, w.token);
     await sup.recv.waitForTag('start_run', 10_000);
     sup.runStarted(runId, manifest);
     sup.attention(runId, 'blocked_read');
