@@ -28,9 +28,12 @@ import type { BrowserPreviewPaneSpec } from '../../wm/pane';
 export function BrowserPreviewPane({
   computer,
   spec,
+  path,
 }: {
   computer: string;
   spec: BrowserPreviewPaneSpec;
+  /** Optional path/query inside the exposed service (computer browser uses it). */
+  path?: string;
 }) {
   const [nonce, setNonce] = useState(0);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
@@ -67,7 +70,8 @@ export function BrowserPreviewPane({
     };
   }, [computer, spec.port]);
 
-  const src = preview === null ? null : loaded.current ? preview.stableUrl : preview.url;
+  const base = preview === null ? null : loaded.current ? preview.stableUrl : preview.url;
+  const src = base === null ? null : previewPath(base, path);
   if (preview !== null) loaded.current = true;
 
   return (
@@ -111,4 +115,15 @@ export function BrowserPreviewPane({
       )}
     </div>
   );
+}
+
+/** Replace the service path while preserving Mari's one-shot capability query. */
+function previewPath(base: string, path: string | undefined): string {
+  if (path === undefined) return base;
+  const source = new URL(base);
+  const target = new URL(path, source.origin);
+  for (const [name, value] of source.searchParams) {
+    if (!target.searchParams.has(name)) target.searchParams.set(name, value);
+  }
+  return target.toString();
 }

@@ -46,6 +46,7 @@ const PANE_KINDS = new Set<PaneSpec['kind']>([
   'files',
   'editor',
   'preview',
+  'browser',
   'runs',
   'diff',
   'vault',

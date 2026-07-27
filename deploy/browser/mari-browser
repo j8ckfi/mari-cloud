@@ -1,0 +1,159 @@
+#!/bin/sh
+set -eu
+
+PORT=6080
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port)
+      [ "$#" -ge 2 ] || { echo "mari-browser: --port needs a value" >&2; exit 2; }
+      PORT=$2
+      shift 2
+      ;;
+    *)
+      echo "mari-browser: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+case "$PORT" in
+  ''|*[!0-9]*) echo "mari-browser: port must be an integer" >&2; exit 2 ;;
+esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || {
+  echo "mari-browser: port must be in 1..65535" >&2
+  exit 2
+}
+
+KEY_FILE=/run/mari/browser-profile.key
+PROFILE_DIR=/work/.mari/browser-profile
+ARCHIVE=/work/.mari-browser-profile.enc
+TAR=/run/mari/browser-profile.tar
+DISPLAY_NUM=:99
+VNC_PORT=5900
+PID_DIR=/run/mari/browser
+LOCK_DIR=/run/mari/browser.lock
+ARCHIVER=/usr/local/lib/mari/profile-archive.mjs
+
+[ -r "$KEY_FILE" ] || {
+  echo "mari-browser: encrypted profile key is unavailable" >&2
+  exit 1
+}
+
+acquire_lock() {
+  if mkdir -m 0700 "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCK_DIR/pid"
+    return 0
+  fi
+
+  owner=
+  [ ! -r "$LOCK_DIR/pid" ] || owner=$(cat "$LOCK_DIR/pid")
+  case "$owner" in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 "$owner" 2>/dev/null; then
+        echo "mari-browser: another browser run is already active (pid $owner)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+
+  # A previous launcher was killed without running its trap. Runtime state is
+  # disposable, so an ownerless lock is safe to replace.
+  rm -rf "$LOCK_DIR"
+  mkdir -m 0700 "$LOCK_DIR"
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+}
+
+XVFB_PID=
+VNC_PID=
+WEB_PID=
+CHROME_PID=
+profile_initialized=0
+cleaned=0
+cleanup() {
+  [ "$cleaned" -eq 0 ] || return 0
+  cleaned=1
+  for pid in "$CHROME_PID" "$WEB_PID" "$VNC_PID" "$XVFB_PID"; do
+    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+  done
+  for pid in "$CHROME_PID" "$WEB_PID" "$VNC_PID" "$XVFB_PID"; do
+    [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
+  done
+  if [ "$profile_initialized" -eq 1 ]; then
+    save_profile || echo "mari-browser: final encrypted profile checkpoint failed" >&2
+  fi
+  rm -rf "$LOCK_DIR"
+}
+trap cleanup EXIT HUP INT TERM
+
+acquire_lock
+mkdir -p "$PROFILE_DIR" "$PID_DIR"
+chmod 0700 /work/.mari "$PROFILE_DIR" "$PID_DIR"
+
+restore_profile() {
+  [ -f "$ARCHIVE" ] || return 0
+  rm -f "$TAR"
+  if ! node "$ARCHIVER" decrypt "$KEY_FILE" "$ARCHIVE" "$TAR"; then
+    # Forks intentionally receive a different profile key. Preserve a corrupt
+    # or foreign archive only in the excluded supervisor directory for
+    # diagnosis, then start the fork with an empty browser session.
+    quarantine=/work/.mari/browser-profile.unreadable.enc
+    mv "$ARCHIVE" "$quarantine"
+    echo "mari-browser: profile belongs to another computer or is corrupt; starting empty" >&2
+    return 0
+  fi
+  rm -rf "$PROFILE_DIR"
+  mkdir -p "$PROFILE_DIR"
+  tar -xf "$TAR" -C "$PROFILE_DIR"
+  rm -f "$TAR"
+}
+
+save_profile() {
+  tmp_tar="${TAR}.tmp"
+  rm -f "$tmp_tar" "$TAR"
+  tar -cf "$tmp_tar" -C "$PROFILE_DIR" .
+  mv "$tmp_tar" "$TAR"
+  node "$ARCHIVER" encrypt "$KEY_FILE" "$TAR" "$ARCHIVE"
+  rm -f "$TAR"
+}
+
+restore_profile
+profile_initialized=1
+
+Xvfb "$DISPLAY_NUM" -screen 0 1440x900x24 -ac -nolisten tcp >"$PID_DIR/xvfb.log" 2>&1 &
+XVFB_PID=$!
+export DISPLAY=$DISPLAY_NUM
+
+i=0
+while [ ! -S /tmp/.X11-unix/X99 ]; do
+  kill -0 "$XVFB_PID" 2>/dev/null || {
+    cat "$PID_DIR/xvfb.log" >&2
+    exit 1
+  }
+  i=$((i + 1))
+  [ "$i" -lt 100 ] || { echo "mari-browser: Xvfb did not become ready" >&2; exit 1; }
+  sleep 0.05
+done
+
+x11vnc -display "$DISPLAY_NUM" -forever -shared -localhost -nopw \
+  -rfbport "$VNC_PORT" >"$PID_DIR/x11vnc.log" 2>&1 &
+VNC_PID=$!
+
+websockify --web=/usr/share/novnc/ "$PORT" "127.0.0.1:$VNC_PORT" \
+  >"$PID_DIR/websockify.log" 2>&1 &
+WEB_PID=$!
+
+chromium --no-sandbox --disable-dev-shm-usage --disable-gpu \
+  --user-data-dir="$PROFILE_DIR" --window-size=1440,900 \
+  --no-first-run --no-default-browser-check about:blank \
+  >"$PID_DIR/chromium.log" 2>&1 &
+CHROME_PID=$!
+
+echo "Mari browser ready on port $PORT"
+while kill -0 "$CHROME_PID" 2>/dev/null; do
+  sleep 60 &
+  wait $! || true
+  kill -0 "$CHROME_PID" 2>/dev/null || break
+  save_profile || echo "mari-browser: encrypted profile checkpoint failed" >&2
+done
+
+wait "$CHROME_PID"

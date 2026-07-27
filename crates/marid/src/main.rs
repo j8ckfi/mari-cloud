@@ -1,6 +1,10 @@
 //! marid — the Mari supervisor. Owns all runs on an AWAKE computer.
 
 use marid::Config;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use tracing::error;
 
 #[cfg(target_os = "linux")]
@@ -23,6 +27,33 @@ fn protect_supervisor_environment() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn materialize_browser_profile_key() -> std::io::Result<()> {
+    let Some(key) = std::env::var_os("MARI_BROWSER_PROFILE_KEY") else {
+        return Ok(());
+    };
+    let dir = "/run/mari";
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(format!("{dir}/browser-profile.key"))?;
+    file.write_all(key.as_encoded_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn materialize_browser_profile_key() -> std::io::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -35,6 +66,10 @@ async fn main() {
 
     if let Err(err) = protect_supervisor_environment() {
         error!("cannot protect supervisor environment from process inspection: {err}");
+        std::process::exit(1);
+    }
+    if let Err(err) = materialize_browser_profile_key() {
+        error!("cannot materialize the browser profile key: {err}");
         std::process::exit(1);
     }
 

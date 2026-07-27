@@ -126,6 +126,13 @@ export function Workspace({ computer }: { computer: string }) {
         <button type="button" onClick={() => addPane({ kind: 'preview', port: 3000 })}>
           + Preview
         </button>
+        <button
+          type="button"
+          onClick={() => addPane({ kind: 'browser', port: 6080 })}
+          data-testid="add-computer-browser-pane"
+        >
+          + Browser
+        </button>
         <button type="button" onClick={() => addPane({ kind: 'runs' })} data-testid="add-runs-pane">
           + Runs
         </button>

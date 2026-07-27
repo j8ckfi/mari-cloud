@@ -7,7 +7,9 @@ target/
 .git/
 packages/
 docs/
-deploy/
+deploy/*
+!deploy/browser/
+!deploy/browser/**
 e2e/
 **/dist/
 **/.wrangler/

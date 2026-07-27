@@ -31,6 +31,8 @@ import migration0001 from '../migrations/0001_init.sql?raw';
 import migration0002 from '../migrations/0002_limits.sql?raw';
 import migration0003 from '../migrations/0003_usage.sql?raw';
 import secretPreflightRaw from '../../../deploy/check-production-secrets.sh?raw';
+import imageRaw from '../../../deploy/Dockerfile.mari?raw';
+import browserLauncherRaw from '../../../deploy/browser/mari-browser?raw';
 
 /**
  * Strip `//` line comments outside of strings.
@@ -265,5 +267,17 @@ describe('the platform contract the bundle depends on', () => {
       statementCount(migration0002),
       statementCount(migration0003),
     ]).toEqual([10, 1, 2]);
+  });
+
+  it('ships browser computer mode in the hosted image without exposing VNC', () => {
+    for (const binary of ['chromium', 'novnc', 'websockify', 'x11vnc', 'xvfb', 'neofetch']) {
+      expect(imageRaw).toContain(binary);
+    }
+    expect(imageRaw).toContain('deploy/browser/mari-browser');
+    expect(imageRaw).toContain('deploy/browser/profile-archive.mjs');
+    expect(browserLauncherRaw).toContain('x11vnc');
+    expect(browserLauncherRaw).toContain('-localhost');
+    expect(browserLauncherRaw).toContain('profile-archive.mjs');
+    expect(browserLauncherRaw).toContain('browser-profile.key');
   });
 });

@@ -65,7 +65,10 @@ describe('dev seed', () => {
     const w = await stub.wake(computerId);
     const sup = await FakeSupervisor.connect(computerId);
     await sup.handshake(computerId, w.epoch, w.token);
-    await sup.recv.waitForTag('start_run');
+    // The full Workers pool exercises many DOs concurrently. Key derivation and
+    // materialization are real async work, so keep this bounded without making
+    // a three-second scheduler hiccup look like a protocol failure.
+    await sup.recv.waitForTag('start_run', 10_000);
 
     sup.runStarted(runId, manifest);
     sup.runCompleted(runId, postRunManifest, { t: 'exited', c: { code: 0 } }, {
@@ -118,7 +121,7 @@ describe('dev seed', () => {
     const w = await stub.wake(computerId);
     const sup = await FakeSupervisor.connect(computerId);
     await sup.handshake(computerId, w.epoch, w.token);
-    await sup.recv.waitForTag('start_run');
+    await sup.recv.waitForTag('start_run', 10_000);
     sup.runStarted(runId, manifest);
     sup.attention(runId, 'blocked_read');
 

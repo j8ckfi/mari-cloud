@@ -54,7 +54,7 @@ import { ensureManifestNamespace } from './manifest-store';
 // ONE definition of "this is a deployed origin" for the whole control plane
 // (auth.ts's three OR'd triggers). A second copy here is the drift that would let
 // the auth layer and the substrate layer disagree about what production means.
-import { isProductionEnv } from './auth';
+import { isProductionEnv, resolveAuthConfig } from './auth';
 import { MiniVtEngine } from './grid';
 import { updateComputerState, listSecrets } from './db/fleet';
 import {
@@ -100,6 +100,26 @@ type EmitEvent =
  * a bound BLOB.
  */
 const FLUSH_MS = 100;
+
+/** Stable, computer-specific key for the authenticated browser-profile archive.
+ * The control plane keeps the root secret; the container receives only this
+ * HMAC output for its own profile. A fork has a different computer id and
+ * therefore cannot decrypt the source computer's browser session. */
+async function browserProfileKey(env: Env, owner: string, computer: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(resolveAuthConfig(env).secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const mac = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`mari-browser-profile:v1:${owner}:${computer}`),
+  );
+  return toBase64(new Uint8Array(mac));
+}
 
 /**
  * A wake that fails (no capacity, image pull error, daemon down) with a run
@@ -1769,7 +1789,7 @@ export class ComputerDO extends DurableObject<Env> {
     if (this.#meta.computerId) {
       try {
         for (const s of await listSecrets(this.env.DB, this.#meta.computerId)) {
-          if (s.name.startsWith('MARI_')) continue;
+          if (s.name.startsWith('MARI_') || s.name.startsWith('AWS_')) continue;
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.name)) continue;
           env[s.name] = s.value;
         }
@@ -1789,6 +1809,7 @@ export class ComputerDO extends DurableObject<Env> {
     env.MARI_TOKEN = token;
     env.MARI_ROOT = this.env.COMPUTER_ROOT ?? DEFAULT_COMPUTER_ROOT;
     env.MARI_STORE = scopedStore;
+    if (owner) env.MARI_BROWSER_PROFILE_KEY = await browserProfileKey(this.env, owner, computer);
     Object.assign(env, await composeStoreEnv({ ...this.env, STORE_URI: scopedStore }, computer));
     const base = this.env.SUPERVISOR_URL_BASE;
     if (base) {

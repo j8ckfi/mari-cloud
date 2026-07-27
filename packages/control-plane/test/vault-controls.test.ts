@@ -74,6 +74,7 @@ describe('credential vault (spec 10.1)', () => {
     // ...and marid's own configuration is intact beside it.
     expect(env.MARI_COMPUTER_ID).toBe(id);
     expect(env.MARI_TOKEN).toMatch(/.+/);
+    expect(Buffer.from(env.MARI_BROWSER_PROFILE_KEY as string, 'base64')).toHaveLength(32);
 
     // A run started with no explicit envNames names the vault's variables, so the
     // supervisor injects them into the child (contracts.md §5.2: NAMES only).

@@ -7,6 +7,7 @@ import { BrowserPreviewPane } from './BrowserPreviewPane';
 import { RunsPane } from './RunsPane';
 import { DiffPane } from './DiffPane';
 import { VaultPane } from './VaultPane';
+import { ComputerBrowserPane } from './ComputerBrowserPane';
 
 /** Renders one leaf pane: a header plus the type-specific body. */
 export function PaneHost({
@@ -56,6 +57,7 @@ export function PaneHost({
         {pane.kind === 'files' && <FilesPane computer={computer} spec={pane} />}
         {pane.kind === 'editor' && <EditorPane computer={computer} spec={pane} />}
         {pane.kind === 'preview' && <BrowserPreviewPane computer={computer} spec={pane} />}
+        {pane.kind === 'browser' && <ComputerBrowserPane computer={computer} spec={pane} />}
         {pane.kind === 'runs' && <RunsPane computer={computer} />}
         {pane.kind === 'diff' && <DiffPane computer={computer} spec={pane} />}
         {pane.kind === 'vault' && <VaultPane computer={computer} />}
