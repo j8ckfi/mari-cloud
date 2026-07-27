@@ -129,10 +129,8 @@
     "PREVIEW_ZONE": "mari.sh",
     "DEV_AUTH": "0",
     "DEV_SEED": "0",
-    // `"cloudflare"` switches the DO onto the container driver. Left at `"fake"`
-    // until the driver has run a week (the memo's maturity note: `exec()` shipped
-    // 2026-06-18), and because a real substrate must not be enabled by the same
-    // commit that first defines it.
+    // Test/default bindings stay fake. The production environment below is the
+    // hosted v0.1 surface and flips this to Cloudflare Containers explicitly.
     "SUBSTRATE_MODE": "fake",
     // Mirror of `containers[].max_instances`, so the driver's capacity error can
     // name the real cap instead of guessing the platform default.
@@ -188,25 +186,41 @@
         // unauthenticated session-minting seed route.
         "DEV_AUTH": "0",
         "DEV_SEED": "0",
-        // Still the fake driver: a real substrate must not be switched on by the
-        // same change that first defines it (see the top-level note).
-        "SUBSTRATE_MODE": "fake",
-        "CF_MAX_INSTANCES": "20"
+        // Hosted v0.1 runs real per-computer Cloudflare Containers. The container
+        // is the always-available brainstem (marid PTY/session/journal); its
+        // `/work` disk is a disposable hydrate/cache over the durable R2 store.
+        "SUBSTRATE_MODE": "cloudflare",
+        "CF_MAX_INSTANCES": "20",
+        "COMPUTER_ROOT": "/work",
+        "STORE_URI": "s3://mari-store",
+        "CF_ACCOUNT_ID": "5b7019b38a2b1c0ce119ecf64e92fd92",
+        "SUPERVISOR_URL_BASE": "wss://app.mari.sh"
       },
 
-      // EXPECTED WARNING, do not "fix" it: `wrangler types --env production`
-      // says AUTH_SECRET "exists at the top level, but not on
-      // env.production.vars ... Please add these vars". Adding it is precisely
-      // the forged-session hole this environment exists to close. It is declared
-      // below as a SECRET instead, which is how it should arrive.
-      //
-      // Declared so wrangler warns when it is unset rather than letting the
-      // Worker boot without it. GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET are
+      // `secrets.required` drives generated types and LOCAL-development missing
+      // secret warnings. It does NOT verify the remote production Worker before
+      // `wrangler deploy`; deploy/check-production-secrets.sh is the mandatory
+      // remote preflight. GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET are
       // deliberately NOT required: GitHub OAuth stays configured-but-optional
       // (decisions.md) and activates only if both are ever set. There is no
       // OAuth app today, so passkeys are the whole hosted auth story.
       "secrets": {
-        "required": ["AUTH_SECRET"]
+        "required": ["AUTH_SECRET", "R2_PARENT_ACCESS_KEY_ID", "R2_PARENT_API_TOKEN"]
+      },
+
+      // Persist every structured control-plane log in v0.1. This is an explicit
+      // launch setting: sampling request failures or lifecycle incidents before
+      // alert thresholds exist would make a first production diagnosis guesswork.
+      // Revisit the 1.0 rate with measured volume and retention cost.
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "enabled": true,
+          "head_sampling_rate": 1,
+          "invocation_logs": true,
+          "persist": true
+        }
       },
 
       "durable_objects": {

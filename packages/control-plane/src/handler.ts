@@ -13,9 +13,15 @@ import {
   readCookie,
   verifyPreviewToken,
 } from './preview';
+import { healthz, makeLogger, routeTemplate, withRequestId } from './obs';
+import { tryUsageRoute } from './usage';
+import { canWake } from './limits';
 import type { Env } from './types';
 
 const app = createApp();
+
+/** Base logger for the request pipeline (docs/observability.md). */
+const log = makeLogger({ service: 'control-plane' });
 
 /** One WebSocket label under the control-plane origin: `/attach/:id` (a client
  *  terminal attach, spec 7.3) or `/supervisor/:id` (the marid supervisor
@@ -136,6 +142,20 @@ async function tryWakeProxy(request: Request, env: Env): Promise<Response | null
 
   if (!authorized) return previewRefused(401, 'preview_unauthorized');
 
+  // The proxy calls ComputerDO.wake() below. Apply the same account compute
+  // ceiling as POST /wake and run/file triggers before addressing the DO, so a
+  // preview capability cannot bypass the denial-of-wallet gate.
+  const wakeGate = await canWake(env.DB, env, row.userId);
+  if (!wakeGate.ok) {
+    return new Response('compute limit reached\n', {
+      status: 403,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-mari-preview': wakeGate.reason,
+      },
+    });
+  }
+
   // A capability that arrived in the query string becomes a cookie for this
   // preview host and is redirected out of the URL, so the iframe's subsequent
   // asset requests carry it and the token stops appearing in the address bar,
@@ -190,6 +210,46 @@ export async function handleFetch(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  // Per-request access log (docs/observability.md): one JSON line with the
+  // ROUTE TEMPLATE (never the raw path — ids and secret names are path
+  // segments), the status, the duration, and a request id that is also echoed
+  // as `x-request-id`. A preview host's paths belong to the USER'S server, so
+  // they are logged only as the preview surface, content-free.
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const url = new URL(request.url);
+  const previewHost = parsePreviewHost(
+    url.host || request.headers.get('host'),
+    env.PREVIEW_ZONE ?? 'mari.sh',
+  );
+  const route = previewHost ? 'preview:host' : routeTemplate(url.pathname);
+  const reqLog = log.child({ requestId });
+  try {
+    const res = await dispatch(request, env, ctx, url);
+    reqLog.info('http_access', {
+      method: request.method,
+      route,
+      status: res.status,
+      durationMs: Date.now() - startedAt,
+    });
+    return withRequestId(res, requestId);
+  } catch (err) {
+    reqLog.error('http_error', {
+      method: request.method,
+      route,
+      durationMs: Date.now() - startedAt,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+}
+
+async function dispatch(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  url: URL,
+): Promise<Response> {
   // FAIL CLOSED, before anything else can consult a session. This must live
   // here and not only in the Hono app, because `tryWsRoute` authenticates the
   // `/attach/:id` terminal socket and `tryWakeProxy` forwards a preview host —
@@ -202,5 +262,12 @@ export async function handleFetch(
   if (ws) return ws;
   const proxied = await tryWakeProxy(request, env);
   if (proxied) return proxied;
+  // /healthz: unauthenticated, tenant-content-free, and AFTER the proxy check
+  // so a preview host's own /healthz still belongs to the user's server.
+  if (url.pathname === '/healthz') return healthz(env);
+  // GET /api/computers/:id/usage — owner-authed inside (usage.ts); lives here
+  // because app.ts is another lane's file this phase.
+  const usage = await tryUsageRoute(request, env);
+  if (usage) return usage;
   return app.fetch(request, env, ctx);
 }

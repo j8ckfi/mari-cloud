@@ -5,7 +5,11 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { AttachClient, attachUrl } from '../../ws/attach';
 import { EchoPredictor } from '../../terminal/predictor';
+import { terminalStatus } from '../../terminal/status';
 import { shortRunId } from '../../runs/state';
+import { useFleet } from '../../api/queries';
+import { useEventsStore } from '../../store/events';
+import { liveState } from '../../events/reducer';
 import type { GridSnapshot } from '@mari/shared';
 import type { TerminalPaneSpec } from '../../wm/pane';
 
@@ -27,6 +31,14 @@ function writeGrid(term: Terminal, grid: GridSnapshot): void {
  * EchoPredictor}, which are reconciled against the authoritative frames without
  * tearing (predictions live in a separate overlay strip, never written into the
  * authoritative buffer).
+ *
+ * Lifecycle honesty (spec 8.3): the pane never blocks and never spins. Until
+ * the first byte it shows one line of text saying what is happening — "waking
+ * your computer" when the computer is COLD/WAKING (the wake runs behind the
+ * pane), plain "connecting" otherwise — and when a live socket drops it shows
+ * a quiet "reconnecting" strip while the AttachClient's backoff does its work.
+ * Scrollback survives a reconnect: a redundant grid replay is dropped in the
+ * attach layer, so the buffer is never cleared for a network blip.
  */
 export function TerminalPane({
   computer,
@@ -41,15 +53,23 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   const [renderer, setRenderer] = useState<'webgl' | 'dom'>('dom');
   const [predict, setPredict] = useState<{ text: string; pending: number }>({ text: '', pending: 0 });
-  // Whether the attach socket has delivered ANYTHING for this run yet. Until it
-  // has, the pane is a black rectangle — which reads as broken. A line of text
-  // (not a spinner, spec 8.3) says what the pane is waiting for.
+  // Whether the attach socket has delivered ANYTHING for this run yet, and
+  // whether it is currently open. Together with the computer's lifecycle state
+  // they decide the one-line status strip (see terminal/status.ts).
   const [sawData, setSawData] = useState(false);
+  const [socketUp, setSocketUp] = useState(false);
+
+  // The computer's lifecycle state: the event stream beats the polled fleet.
+  const pushed = useEventsStore((s) => liveState(s.model, computer));
+  const fleet = useFleet();
+  const polled = fleet.data?.computers.find((c) => c.id === computer)?.state ?? null;
+  const computerState = pushed ?? polled;
 
   useEffect(() => {
     const el = host.current;
     if (!el) return;
     setSawData(false);
+    setSocketUp(false);
 
     const term = new Terminal({
       convertEol: false,
@@ -92,6 +112,8 @@ export function TerminalPane({
       cols: term.cols,
       rows: term.rows,
       handlers: {
+        onOpen: () => setSocketUp(true),
+        onClose: () => setSocketUp(false),
         onGrid: (m) => {
           setSawData(true);
           writeGrid(term, m.grid);
@@ -143,6 +165,8 @@ export function TerminalPane({
     if (focused) termRef.current?.focus();
   }, [focused]);
 
+  const status = terminalStatus(sawData, socketUp, computerState);
+
   return (
     <div
       style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}
@@ -156,11 +180,13 @@ export function TerminalPane({
           the shell's. */}
       <div className="term-wrap">
         <div className="term-host" ref={host} />
-        {!sawData && (
-          <div className="term-connecting" data-testid="term-connecting">
-            <span className="hint">
-              Connecting to the run — output appears as soon as the computer answers.
-            </span>
+        {status !== null && (
+          <div
+            className={`term-status ${status.phase}`}
+            data-testid="term-status"
+            data-phase={status.phase}
+          >
+            <span className="hint">{status.text}</span>
           </div>
         )}
         {predict.pending > 0 && (

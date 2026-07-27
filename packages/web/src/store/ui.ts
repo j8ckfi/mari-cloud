@@ -57,6 +57,8 @@ interface UiState {
   openComputer(id: string): void;
   switchToSlot(index: number): void;
   goFleet(): void;
+  /** Drop every account-scoped UI artifact on sign-out/session expiry. */
+  resetForSession(): void;
 
   // ---- layout ----
   layoutFor(id: string): Layout;
@@ -107,6 +109,15 @@ export const useUiStore = create<UiState>((set, get) => ({
   },
 
   goFleet: () => set({ view: 'fleet' }),
+  resetForSession: () =>
+    set({
+      view: 'fleet',
+      workspaces: [],
+      activeComputer: null,
+      layouts: {},
+      paletteOpen: false,
+      notice: '',
+    }),
 
   layoutFor: (id) => get().layouts[id] ?? defaultLayout(),
 

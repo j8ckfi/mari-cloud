@@ -104,7 +104,13 @@ export class DockerProvider implements SubstrateProvider {
       (m) => `${m.source}:${m.target}${m.readOnly ? ':ro' : ''}`,
     );
 
-    const hostConfig: DockerT.HostConfig = { PortBindings: portBindings };
+    const hostConfig: DockerT.HostConfig = {
+      PortBindings: portBindings,
+      // The private-instance supervisor URL uses this stable host name. Linux
+      // Docker does not add it automatically (unlike Docker Desktop), so a real
+      // marid container otherwise fails DNS before it can attach.
+      ExtraHosts: ['host.docker.internal:host-gateway'],
+    };
     if (binds.length > 0) hostConfig.Binds = binds;
     if (spec.resources?.memoryMiB != null) {
       hostConfig.Memory = Math.round(spec.resources.memoryMiB * 1024 * 1024);

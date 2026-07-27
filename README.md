@@ -18,6 +18,7 @@ owns each run, so closing your laptop does not stop one.
 - Normative spec: [docs/spec.md](docs/spec.md)
 - Locked decisions and v0 ground rules: [docs/decisions.md](docs/decisions.md)
 - Wire protocol and storage formats: [docs/contracts.md](docs/contracts.md)
+- Hosted v0.1 runtime and cost model: [docs/v0.1-runtime.md](docs/v0.1-runtime.md)
 - Cloudflare Containers as a substrate: [docs/substrates-cloudflare.md](docs/substrates-cloudflare.md)
 - How to work on it: [CONTRIBUTING.md](CONTRIBUTING.md)
 
@@ -147,11 +148,14 @@ Each one keeps the spec-pure path behind an interface; see *v0 deviations* in
 
 ### Spec features that are not implemented
 
-- **Browser *computer mode*** (spec 8.5) — a Chromium instance on the computer,
-  streamed into a pane, with a persistent profile. Not built. Preview mode (a
-  stable URL per port, waking on request) *is* built. Because there is no
-  browser profile, spec 10.2 (profile chunks encrypted, forks excluding the
-  profile, diffs never showing cookie content) protects nothing yet.
+- **Browser computer mode has a narrow v0.1 surface.** Chromium runs inside the
+  computer on Xvfb and streams through noVNC over the same authenticated preview
+  proxy as application ports. Its live profile is excluded from manifests; an
+  AES-256-GCM archive is checkpointed with a per-computer derived key, so a fork
+  quarantines the inherited archive and starts with a fresh profile instead of
+  receiving the source computer's sessions. Native clipboard, file
+  download handoff, camera/microphone, and browser-specific automation controls
+  are not built yet.
 - **Fork differences and merges** (spec 9.2). Creating a fork works over the API
   (`POST /api/computers/:id/fork`: lineage recorded, no bulk data copied) but
   there is no fork button in the web app, no control-plane route that diffs two
@@ -160,11 +164,13 @@ Each one keeps the spec-pure path behind an interface; see *v0 deviations* in
 - **The grid at a past time of a run** (spec 7.6). The journal is complete and
   the control plane replays it to an attaching client, but there is no
   time-travel view over it.
-- **CPU-hour and egress limits** (spec 10.3). Nothing enforces a cap. A run that
-  spins for a week on your own Docker daemon will do exactly that.
-- **Client-side encryption of chunks with per-user keys** (spec 10.4). The spec
-  calls it an option; it is not implemented, so a hosted instance can read a
-  user's computer.
+- **Egress limits** (spec 10.3). Hosted v0.1 enforces an atomic computer-count
+  cap and a monthly AWAKE compute-hour cap on explicit wakes, runs, writes,
+  uploads, and preview wakes. It cannot yet attribute provider egress to an
+  account, so it does not pretend to enforce an egress ceiling.
+- **General client-side encryption of workspace chunks with per-user keys**
+  (spec 10.4). The browser profile is encrypted separately as described above,
+  but ordinary workspace chunks are not, so a hosted operator can read them.
 
 ### Wired but not reachable
 
@@ -182,14 +188,21 @@ Each one keeps the spec-pure path behind an interface; see *v0 deviations* in
   (the DO replays from its own SQLite), and deliberately not patched: whose
   prefix it is, is a cross-lane decision. Recorded in
   [docs/decisions.md](docs/decisions.md).
-- **The cost meter is real; its prices are a guess.** It meters AWAKE seconds
-  honestly and multiplies by a static per-substrate list price. Local Docker is
-  priced at zero (it is your machine). The Sprites, Sail and Northflank numbers
-  are v0 placeholders — actual published rates are an open item in spec 13. It
-  is internal accounting only: there is no billing anywhere in this repo, by
-  decision, and none of it gates a wake.
+- **The cost meter is an estimate, not an invoice.** It meters AWAKE intervals
+  and completed-run time, and uses sourced Cloudflare, R2, and Box list rates.
+  The Sprites, Sail and Northflank rows remain planning placeholders. Provider
+  invoice reconciliation, free-tier allocation, and egress attribution do not
+  exist; the separate hosted quota ledger is what gates new compute.
 
 ### Unverified, and the hosted instance
+
+- **Box escalation is deliberately not in production scheduling.** The real Box
+  API can create, archive/resume, execute, and expose ports, but it has no delete
+  operation and retains an archived snapshot for the life of the box. That
+  cannot satisfy Mari's `destroy`/account-deletion contract. The driver therefore
+  fails closed unless a destructive-retention test opt-in is supplied. Hosted
+  v0.1 executes in the isolated Cloudflare computer itself; the Box provider
+  remains behind the substrate interface until bounded deletion exists.
 
 - **Cloudflare Containers may not be fit to be the default substrate.** A
   `destroy()` followed by a `start()` on the same Durable Object is refused by

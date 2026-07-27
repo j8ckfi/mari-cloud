@@ -85,11 +85,25 @@ export function coreCommands(): Command[] {
       run: () => s().addPane({ kind: 'preview', port: 3000 }),
     },
     {
+      id: 'pane.new.browser',
+      title: 'Open computer browser',
+      group: 'Pane',
+      keywords: ['chromium', 'novnc', 'visual', 'website'],
+      run: () => s().addPane({ kind: 'browser', port: 6080 }),
+    },
+    {
       id: 'pane.new.runs',
       title: 'Show runs',
       group: 'Pane',
       keywords: ['run', 'list', 'jobs', 'tasks'],
       run: () => s().addPane({ kind: 'runs' }),
+    },
+    {
+      id: 'pane.new.vault',
+      title: 'Open credential vault',
+      group: 'Pane',
+      keywords: ['secret', 'api key', 'credentials', 'anthropic', 'openai'],
+      run: () => s().addPane({ kind: 'vault' }),
     },
 
     // ---- Runs (spec 5) ----

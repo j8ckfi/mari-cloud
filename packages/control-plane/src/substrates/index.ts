@@ -14,6 +14,8 @@ import { SPRITES_SUBSTRATE, SpritesProvider, createSpritesProvider } from './spr
 import type { SpritesConfig } from './sprites.js';
 import { CLOUDFLARE_SUBSTRATE, CloudflareProvider } from './cloudflare.js';
 import type { CloudflareConfig } from './cloudflare.js';
+import { BOX_SUBSTRATE, BoxProvider } from './box.js';
+import type { BoxConfig } from './box.js';
 
 export type { SubstrateName } from './provider.js';
 import type { SubstrateName } from './provider.js';
@@ -40,6 +42,14 @@ export type {
   CloudflareErrorKind,
   ContainerExitInfo,
 } from './cloudflare.js';
+export {
+  BOX_SUBSTRATE,
+  DEFAULT_BOX_BASE_URL,
+  BoxProvider,
+  BoxSubstrateError,
+  createBoxProvider,
+} from './box.js';
+export type { BoxHandle, BoxConfig, BoxErrorKind } from './box.js';
 export type {
   DockerProvider,
   DockerHandle,
@@ -55,6 +65,7 @@ export const SUBSTRATE_NAMES = [
   DOCKER_SUBSTRATE,
   SPRITES_SUBSTRATE,
   CLOUDFLARE_SUBSTRATE,
+  BOX_SUBSTRATE,
 ] as const;
 
 /**
@@ -76,13 +87,14 @@ export function createSubstrate(
   name: typeof CLOUDFLARE_SUBSTRATE,
   config: CloudflareConfig,
 ): SubstrateProvider;
+export function createSubstrate(name: typeof BOX_SUBSTRATE, config: BoxConfig): SubstrateProvider;
 export function createSubstrate(
   name: SubstrateName,
-  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig,
+  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig | BoxConfig,
 ): SubstrateProvider | Promise<SubstrateProvider>;
 export function createSubstrate(
   name: SubstrateName,
-  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig,
+  config?: DockerProviderOptions | SpritesConfig | CloudflareConfig | BoxConfig,
 ): SubstrateProvider | Promise<SubstrateProvider> {
   switch (name) {
     case DOCKER_SUBSTRATE:
@@ -96,6 +108,10 @@ export function createSubstrate(
       // beyond the live `ctx.container` handed to it here, so unlike docker.js it
       // needs no lazy import.
       return new CloudflareProvider(config as CloudflareConfig);
+    case BOX_SUBSTRATE:
+      // fetch-only, so like Sprites it constructs synchronously and is safe on
+      // both the Workers and the Node entry.
+      return new BoxProvider(config as BoxConfig);
     default:
       throw new Error(`unknown substrate "${name}"`);
   }
@@ -113,6 +129,7 @@ export const substrateRegistry = {
     createSubstrate(SPRITES_SUBSTRATE, config),
   [CLOUDFLARE_SUBSTRATE]: (config: CloudflareConfig): SubstrateProvider =>
     createSubstrate(CLOUDFLARE_SUBSTRATE, config),
+  [BOX_SUBSTRATE]: (config: BoxConfig): SubstrateProvider => createSubstrate(BOX_SUBSTRATE, config),
 } as const;
 
 // ── Wake scheduling (spec §3.6) ──────────────────────────────────────────────
@@ -152,6 +169,16 @@ export const SUBSTRATE_PROFILES: Readonly<Record<string, SubstrateProfile>> = {
   //          errors a wake past it, so real capacity is a fleet-level fact this
   //          static table cannot know.
   [CLOUDFLARE_SUBSTRATE]: { usdPerHour: 0.0452, capacity: 0.95, wakeLatencyMs: 1000 },
+  // Box (box.ascii.dev). NOT measured yet — placeholders behind the interface,
+  // like docker/sprites (spec §13 wants real numbers before anyone budgets):
+  //   price: the machine is a Hetzner CX33 (4 shared vCPU / 8 GB / 75 GB NVMe,
+  //          per docs.ascii.dev/box/machines) billed per second while running;
+  //          the CX33 list price is on the order of $0.01/h, and archived boxes
+  //          bill no compute — but Box's own margin over Hetzner is unpublished,
+  //          so this row deliberately does not undercut Cloudflare's MEASURED one.
+  //   latency: a wake from WARM is resume-from-archive (snapshot restore + boot,
+  //          plausibly tens of seconds), far slower than a Cloudflare start.
+  [BOX_SUBSTRATE]: { usdPerHour: 0.05, capacity: 0.9, wakeLatencyMs: 15_000 },
 };
 
 /**

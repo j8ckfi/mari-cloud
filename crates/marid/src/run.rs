@@ -273,8 +273,40 @@ impl RunManager {
                 epoch: self.ctx.epoch,
             },
         );
-        self.spawn_run(run, argv, env_names, cwd, pre_id, 0, 0)
+        match self
+            .spawn_run(run.clone(), argv, env_names, cwd, pre_id.clone(), 0, 0)
             .await
+        {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                // The process never existed (E2BIG, ENOENT, openpty failure).
+                // That is THIS run's failure, never the daemon's: complete the
+                // run with an error result so the control plane sees a terminal
+                // event, and leave the supervisor fully serviceable (spec 5.5).
+                self.fail_unspawned_run(&run, &pre_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// A run whose child could not be spawned still gets a terminal result: mark
+    /// the durable record `Completed` (a restart must not try to resume a run
+    /// that never had a process) and emit `RunCompleted` with exit code 127 (the
+    /// shell's command-not-found convention) against the pre-run manifest —
+    /// nothing ran, so nothing changed.
+    async fn fail_unspawned_run(&self, run: &RunId, pre_id: &ManifestId) {
+        if let Err(e) = self.ctx.state.set_phase(run, RunPhase::Completed).await {
+            warn!(%run, "marking unspawned run completed failed: {e:#}");
+        }
+        emit(
+            &self.ctx.outbox,
+            SupervisorMessage::RunCompleted {
+                run: run.clone(),
+                exit: ExitStatus::Exited { code: 127 },
+                post_run_manifest: pre_id.clone(),
+                diff: Default::default(),
+            },
+        );
     }
 
     /// Continue an unfinished run after a supervisor restart (spec 5.6), or
@@ -322,7 +354,7 @@ impl RunManager {
         if let Err(e) = self.ctx.state.set_epoch(&run, self.ctx.epoch).await {
             warn!(%run, "updating run record epoch failed: {e:#}");
         }
-        info!(%run, ?argv, journal_base, "continuing unfinished run");
+        info!(%run, argv = %argv_for_log(&argv), journal_base, "continuing unfinished run");
         self.spawn_run(
             run,
             argv,
@@ -366,27 +398,74 @@ impl RunManager {
         let mut cmd = CommandBuilder::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.cwd(&cwd);
+        // portable-pty's CommandBuilder starts with std::env::vars_os(). A run
+        // must not inherit the supervisor's fencing token, R2 session
+        // credential, or every vault value merely because they configure PID 1.
+        // Start from an empty environment, restore only ordinary process
+        // ergonomics, then add the vault names explicitly requested by the
+        // control plane.
+        cmd.env_clear();
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "TZ",
+            "TMPDIR",
+            "COLORTERM",
+        ] {
+            if let Ok(val) = std::env::var(name) {
+                cmd.env(name, val);
+            }
+        }
+        for (name, val) in std::env::vars() {
+            if name.starts_with("LC_") || name.starts_with("XDG_") {
+                cmd.env(name, val);
+            }
+        }
         // Inject vault variables by name from the supervisor's environment; the
         // values never traveled in the StartRun message (spec 10.1).
         for name in &env_names {
+            if name.starts_with("MARI_") || name.starts_with("AWS_") {
+                warn!(%run, env = %name, "refusing supervisor-reserved run environment name");
+                continue;
+            }
             if let Ok(val) = std::env::var(name) {
                 cmd.env(name, val);
             }
         }
 
-        let child = pair
+        // The spawn error is bounded before it becomes our error: portable-pty
+        // embeds the executable path, whose size we do not control.
+        let mut child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| anyhow::anyhow!("spawn_command: {e}"))?;
-        let killer = child.clone_killer();
-        let reader = pair
+            .map_err(|e| anyhow::anyhow!("spawn_command: {}", bound_str(&e.to_string(), 512)))?;
+        let mut killer = child.clone_killer();
+        let wired = pair
             .master
             .try_clone_reader()
-            .map_err(|e| anyhow::anyhow!("try_clone_reader: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("try_clone_reader: {e}"))
+            .and_then(|reader| {
+                let writer = pair
+                    .master
+                    .take_writer()
+                    .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?;
+                Ok((reader, writer))
+            });
+        let (reader, writer) = match wired {
+            Ok(rw) => rw,
+            Err(e) => {
+                // The child exists but we cannot wire it up: it must not be left
+                // running unobserved. Kill and reap it before failing the spawn.
+                let _ = killer.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         // Drop the slave handle so the master reader sees EOF when the child
         // exits (the child keeps its own descriptor).
         drop(pair.slave);
@@ -739,6 +818,39 @@ fn housekeeping_tick(threshold: Duration) -> Duration {
     }
     let fifth = threshold / 5;
     fifth.clamp(Duration::from_millis(20), Duration::from_millis(250))
+}
+
+/// Bound a string for logging: at most `max` bytes (on a char boundary), with
+/// the original length appended when truncated. Any string whose size we do not
+/// control — an argv element, a composed error chain — must pass through this
+/// before it reaches a log line (decisions appendix: the write-argv log leak).
+pub(crate) fn bound_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated, {} bytes total]", &s[..end], s.len())
+}
+
+/// Render an argv for logging without its payloads: the first two elements
+/// (each bounded), then the argument count and total byte size. A run's argv
+/// can carry megabytes (a file write's base64 body travels as positional
+/// parameters); none of it may reach a log.
+pub(crate) fn argv_for_log(argv: &[String]) -> String {
+    let total: usize = argv.iter().map(String::len).sum();
+    let mut shown: Vec<String> = argv.iter().take(2).map(|a| bound_str(a, 96)).collect();
+    if argv.len() > 2 {
+        shown.push("...".to_string());
+    }
+    format!(
+        "[{}] ({} args, {} bytes)",
+        shown.join(" "),
+        argv.len(),
+        total
+    )
 }
 
 fn emit(outbox: &UnboundedSender<SupervisorMessage>, msg: SupervisorMessage) {

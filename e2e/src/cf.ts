@@ -91,17 +91,11 @@ export function wranglerQuiet(args: string[], timeoutMs = 300_000, useConfig = t
 // ---------------------------------------------------------------------------
 
 /**
- * The production base-image Dockerfile, with the SMALLEST possible delta:
- *
- *  1. `--features s3` on the marid build. Without it `MARI_STORE=s3://…` fails at
- *     startup with "marid was built without the `s3` feature" — the production
- *     image cannot reach a chunk store on this substrate at all (finding, not a
- *     workaround: `deploy/Dockerfile.mari` builds no s3 feature and
- *     `ComputerDO.#maridEnv` (computer-do.ts:765) has no seam for credentials).
- *  2. `ENV AWS_*` so opendal's default credential chain finds the endpoint and
- *     the key pair for the S3 facade in `deploy/cf-thesis/src/worker.ts`.
- *
- * Both are asserted by the suite so the delta cannot silently grow.
+ * Legacy scratch image assembler. Production now builds marid with S3 + TLS and
+ * injects tenant-scoped temporary R2 credentials at materialize. This harness
+ * still expects the pre-fix Dockerfile and bakes `ENV AWS_*` for its short-lived
+ * S3 facade; until migrated, a gated run intentionally fails the exact-delta
+ * assertion instead of silently claiming production R2/TLS coverage.
  */
 export function assembleContext(opts: {
   endpoint: string;
@@ -142,8 +136,9 @@ export function assembleContext(opts: {
       '',
       '# ---- thesis-e2e only ---------------------------------------------------',
       '# The chunk store lives off-container (all disk here is ephemeral), and Mari',
-      '# has no way to hand a computer store credentials yet: ComputerDO composes a',
-      '# fixed env set. These reach opendal through its default credential chain.',
+      '# now hands hosted computers temporary tenant credentials. This legacy scratch',
+      '# harness instead bakes a random facade key for its own short lifetime.',
+      '# These values reach opendal through its default credential chain.',
       `ENV AWS_ENDPOINT_URL=${opts.endpoint} \\`,
       '    AWS_REGION=auto \\',
       `    AWS_ACCESS_KEY_ID=${opts.keyId} \\`,

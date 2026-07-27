@@ -9,6 +9,8 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { WebSocket } from 'ws';
 import {
   FrameReader,
@@ -18,6 +20,8 @@ import {
   encodeFrame,
 } from '@mari/shared';
 import { boot, type BootOptions, type NodeInstance } from '../../src/node.js';
+
+const exec = promisify(execFile);
 
 export const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -125,7 +129,34 @@ export async function startInstance(options: TestInstanceOptions = {}): Promise<
 }
 
 export async function removeDir(dir: string): Promise<void> {
-  await rm(dir, { recursive: true, force: true });
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EACCES') throw err;
+    await chownDockerStore(dir);
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function chownDockerStore(dir: string): Promise<void> {
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') return;
+  const image = process.env.MARI_BASE_IMAGE ?? 'mari/base:v0';
+  await exec(
+    'docker',
+    [
+      'run',
+      '--rm',
+      '-v',
+      `${dir}:/target`,
+      '--entrypoint',
+      'chown',
+      image,
+      '-R',
+      `${process.getuid()}:${process.getgid()}`,
+      '/target',
+    ],
+    { timeout: 120_000, maxBuffer: 1024 * 1024 },
+  );
 }
 
 // ---------------------------------------------------------------------------

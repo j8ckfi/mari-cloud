@@ -11,6 +11,11 @@
 
 /** USD per AWAKE hour, per substrate (spec 3.5 providers). v0 list prices. */
 export const SUBSTRATE_PRICE_PER_HOUR: Readonly<Record<string, number>> = {
+  /** Cloudflare Containers standard-1 at the fleet's documented 20% mean CPU
+   * duty assumption (usage.ts / docs/costs.md). */
+  cloudflare: 0.0452,
+  /** box.ascii.dev active VM-second rate. */
+  box: 0.036,
   sprites: 0.12,
   sail: 0.1,
   northflank: 0.15,

@@ -44,10 +44,17 @@ import {
   CLOUDFLARE_SUBSTRATE,
   createCloudflareProvider,
 } from './substrates/cloudflare';
+import {
+  composeStoreEnv,
+  parseS3StoreUri,
+  tempCredentialTtlSeconds,
+  tenantStoreUri,
+} from './r2-credentials';
+import { ensureManifestNamespace } from './manifest-store';
 // ONE definition of "this is a deployed origin" for the whole control plane
 // (auth.ts's three OR'd triggers). A second copy here is the drift that would let
 // the auth layer and the substrate layer disagree about what production means.
-import { isProductionEnv } from './auth';
+import { isProductionEnv, resolveAuthConfig } from './auth';
 import { MiniVtEngine } from './grid';
 import { updateComputerState, listSecrets } from './db/fleet';
 import {
@@ -64,6 +71,8 @@ import {
 } from './runs';
 import { toBase64 } from './bytes';
 import type { EventRunState, FleetEvent } from './events-do';
+import { accumulateAwakeInterval } from './limits';
+import { noteAwakeInterval, noteRunExecution } from './usage';
 
 /** An event as raised inside the DO: the computer id is filled in by `#emit`. */
 type EmitEvent =
@@ -91,6 +100,26 @@ type EmitEvent =
  * a bound BLOB.
  */
 const FLUSH_MS = 100;
+
+/** Stable, computer-specific key for the authenticated browser-profile archive.
+ * The control plane keeps the root secret; the container receives only this
+ * HMAC output for its own profile. A fork has a different computer id and
+ * therefore cannot decrypt the source computer's browser session. */
+async function browserProfileKey(env: Env, owner: string, computer: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(resolveAuthConfig(env).secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const mac = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`mari-browser-profile:v1:${owner}:${computer}`),
+  );
+  return toBase64(new Uint8Array(mac));
+}
 
 /**
  * A wake that fails (no capacity, image pull error, daemon down) with a run
@@ -312,7 +341,10 @@ export type IncidentKind =
   | 'wake_abandoned'
   /** Recovery was attempted RECOVERY_STREAK_MAX times without a supervisor ever
    *  authenticating; the computer is left COLD with its work queued. */
-  | 'recovery_exhausted';
+  | 'recovery_exhausted'
+  /** A scoped R2 session credential approached expiry, so the generation was
+   * cleanly snapshotted and replaced before durable writes could start failing. */
+  | 'credential_rotation';
 
 /** One recorded incident (kinds and times only — never content). */
 export interface Incident {
@@ -348,7 +380,7 @@ export type LivenessVerdict =
  *  this every new deadline had to fight the tier policy for it — which is why
  *  several transitions had no deadline at all and could never advance without an
  *  external event. Processing order is the order below: recovery before policy. */
-const DEADLINES = ['wakeRetry', 'waking', 'liveness', 'cold', 'tier'] as const;
+const DEADLINES = ['wakeRetry', 'waking', 'liveness', 'credential', 'cold', 'tier'] as const;
 type DeadlineName = (typeof DEADLINES)[number];
 
 /** What `describe()` returns to the REST layer (spec 8.2 fleet/detail data). */
@@ -446,6 +478,9 @@ interface Meta {
   idleSince: number;
   armedIdleSince: number | null;
   coldPending: boolean;
+  /** Credential-expiry rotation cannot be cancelled by a run heartbeat racing
+   * the clean-stop handshake. */
+  rotationPending: boolean;
   /** When a failed wake is to be retried by the alarm, or null when none is
    *  pending. One of the deadline slots multiplexed onto the single alarm. */
   wakeRetryAt: number | null;
@@ -458,6 +493,8 @@ interface Meta {
   livenessAt: number | null;
   /** Deadline for the AWAKE/WARM → COLD handshake to complete on its own. */
   coldAt: number | null;
+  /** Rotate the current generation before its scoped R2 credential expires. */
+  credentialAt: number | null;
   /** Watchdog for a computer left in WAKING (a transition, not a state). */
   wakingAt: number | null;
   /** When the CURRENT wake generation reached AWAKE, or null when not AWAKE.
@@ -497,11 +534,13 @@ function initialMeta(): Meta {
     idleSince: 0,
     armedIdleSince: null,
     coldPending: false,
+    rotationPending: false,
     wakeRetryAt: null,
     wakeFailures: 0,
     tierAt: null,
     livenessAt: null,
     coldAt: null,
+    credentialAt: null,
     wakingAt: null,
     generationAt: null,
     supervisorSeen: false,
@@ -824,11 +863,33 @@ export class ComputerDO extends DurableObject<Env> {
     return (this.#meta.awakeMs + open) / 1000;
   }
 
-  /** Close out the current AWAKE stretch; idempotent. */
-  #closeAwakeStretch(): void {
+  /** Close out the current AWAKE stretch; idempotent. Every close is written to
+   * both the per-account quota and per-computer accounting ledgers. `reopen`
+   * checkpoints a still-AWAKE computer on its recurring alarm so a long run
+   * cannot remain invisible to the monthly cap indefinitely. */
+  #closeAwakeStretch(reopen = false): void {
     if (this.#meta.awakeSince === null) return;
-    this.#meta.awakeMs += Math.max(0, Date.now() - this.#meta.awakeSince);
-    this.#meta.awakeSince = null;
+    const startedAt = this.#meta.awakeSince;
+    const endedAt = Date.now();
+    const elapsed = Math.max(0, endedAt - startedAt);
+    this.#meta.awakeMs += elapsed;
+    this.#meta.awakeSince = reopen ? endedAt : null;
+    if (elapsed > 0) this.ctx.waitUntil(this.#recordAwakeInterval(startedAt, endedAt));
+  }
+
+  async #recordAwakeInterval(startedAt: number, endedAt: number): Promise<void> {
+    const owner = await this.#ownerId();
+    const computer = this.#meta.computerId;
+    const writes: Promise<unknown>[] = [
+      noteAwakeInterval(this.env.DB, computer, startedAt, endedAt),
+    ];
+    if (owner) writes.push(accumulateAwakeInterval(this.env.DB, owner, startedAt, endedAt));
+    const results = await Promise.allSettled(writes);
+    if (results.some((result) => result.status === 'rejected')) {
+      console.warn(
+        `mari: quota usage write failed computer=${computer ?? '?'} interval_ms=${endedAt - startedAt}`,
+      );
+    }
   }
 
   /** Seed a freshly-forked computer's head WITHOUT waking (spec 9.1). */
@@ -837,6 +898,34 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.head = head;
     this.#meta.state = 'cold';
     await this.#persist();
+  }
+
+  /** Terminal teardown used by DELETE /api/computers/:id. Unlike ordinary
+   * lifecycle recovery this is strict: the fleet row is not removed unless the
+   * substrate confirms destruction, otherwise create→wake→delete could orphan
+   * paid instances while freeing the account's computer-count slot. */
+  async deletePermanently(
+    computerId: string,
+  ): Promise<{ ok: boolean; error: 'destroy_failed' | null }> {
+    this.#setComputerId(computerId);
+    const handle = this.#meta.handle;
+    if (handle) {
+      try {
+        await this.#bounded(this.substrate.destroy(handle), this.#wakeTimeoutMs(), 'destroy');
+      } catch (err) {
+        console.warn(
+          `mari: permanent destroy failed computer=${computerId} handle=${handle.id}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { ok: false, error: 'destroy_failed' };
+      }
+    }
+    this.#closeAwakeStretch();
+    this.#dropSupervisorSockets('computer deleted');
+    this.#meta.handle = null;
+    this.#meta.token = null;
+    await this.ctx.storage.deleteAll();
+    return { ok: true, error: null };
   }
 
   /**
@@ -1001,6 +1090,7 @@ export class ComputerDO extends DurableObject<Env> {
     // woke (CP-COLDRACE-1). The epoch bump additionally fences that stale
     // snapshot at the #onSupervisorMessage gate; this keeps the flag honest too.
     this.#meta.coldPending = false;
+    this.#meta.rotationPending = false;
     const token = crypto.randomUUID().replace(/-/g, '');
     this.#meta.token = token;
     const computer = this.#meta.computerId ?? 'unknown';
@@ -1022,12 +1112,13 @@ export class ComputerDO extends DurableObject<Env> {
         // COLD -> AWAKE: materialize from the base image; marid restores the
         // delta from the manifest head using the injected config env.
         const handle = await this.#bounded(
-          this.substrate.materialize({
-            computer,
-            image: this.env.BASE_IMAGE ?? BASE_IMAGE,
-            env: await this.#maridEnv(computer, token),
-            ports: [],
-          }),
+          (async () =>
+            this.substrate.materialize({
+              computer,
+              image: this.env.BASE_IMAGE ?? BASE_IMAGE,
+              env: await this.#maridEnv(computer, token),
+              ports: [],
+            }))(),
           this.#wakeTimeoutMs(),
           'materialize',
         );
@@ -1078,6 +1169,13 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.wakeFailures = 0;
     this.#meta.wakeRetryAt = null;
     this.#meta.generationAt = Date.now();
+    if ((this.env.STORE_URI ?? '').startsWith('s3://')) {
+      const ttlMs = tempCredentialTtlSeconds(this.env) * 1000;
+      const leadMs = Math.min(60 * 60_000, Math.floor(ttlMs / 10));
+      this.#setDeadline('credential', Date.now() + ttlMs - leadMs);
+    } else {
+      this.#setDeadline('credential', null);
+    }
     this.#setDeadline('waking', null);
     // Open a new AWAKE stretch for the cost meter (spec 8.2). Only compute time
     // accrues; WARM and COLD are storage, not compute.
@@ -1170,6 +1268,7 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.supervisorSeen = false;
     this.#setDeadline('waking', null);
     this.#setDeadline('liveness', null);
+    this.#setDeadline('credential', null);
     this.#closeAwakeStretch();
     this.#meta.wakeFailures += 1;
     this.#meta.wakeRetryAt = null;
@@ -1373,6 +1472,7 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.token = null;
     this.#meta.state = 'cold';
     this.#meta.coldPending = false;
+    this.#meta.rotationPending = false;
     this.#meta.generationAt = null;
     this.#meta.supervisorSeen = false;
     this.#meta.supervisorLostAt = null;
@@ -1380,6 +1480,7 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.recoveryStreak += 1;
     this.#closeAwakeStretch();
     this.#setDeadline('liveness', null);
+    this.#setDeadline('credential', null);
     this.#setDeadline('cold', null);
     this.#setDeadline('waking', null);
     this.#setDeadline('tier', null);
@@ -1568,6 +1669,8 @@ export class ComputerDO extends DurableObject<Env> {
         return this.#meta.livenessAt;
       case 'cold':
         return this.#meta.coldAt;
+      case 'credential':
+        return this.#meta.credentialAt;
       case 'tier':
         return this.#meta.tierAt;
     }
@@ -1587,6 +1690,9 @@ export class ComputerDO extends DurableObject<Env> {
       case 'cold':
         this.#meta.coldAt = at;
         return;
+      case 'credential':
+        this.#meta.credentialAt = at;
+        return;
       case 'tier':
         this.#meta.tierAt = at;
         return;
@@ -1600,6 +1706,8 @@ export class ComputerDO extends DurableObject<Env> {
         return this.#livenessMs();
       case 'cold':
         return this.#coldFinalizeMs();
+      case 'credential':
+        return this.#wakeTimeoutMs();
       case 'waking':
         return this.#wakeTimeoutMs();
       case 'wakeRetry':
@@ -1658,6 +1766,12 @@ export class ComputerDO extends DurableObject<Env> {
    */
   async #maridEnv(computer: string, token: string): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
+    const owner = await this.#ownerId();
+    const configuredStore = this.env.STORE_URI ?? DEFAULT_STORE_URI;
+    if (configuredStore.startsWith('s3://') && !owner) {
+      throw new Error(`cannot scope S3 store for computer=${computer}: owner row is missing`);
+    }
+    const scopedStore = owner ? await tenantStoreUri(configuredStore, owner) : configuredStore;
 
     // ---- the credential vault (spec 10.1) --------------------------------
     //
@@ -1675,7 +1789,7 @@ export class ComputerDO extends DurableObject<Env> {
     if (this.#meta.computerId) {
       try {
         for (const s of await listSecrets(this.env.DB, this.#meta.computerId)) {
-          if (s.name.startsWith('MARI_')) continue;
+          if (s.name.startsWith('MARI_') || s.name.startsWith('AWS_')) continue;
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.name)) continue;
           env[s.name] = s.value;
         }
@@ -1694,13 +1808,24 @@ export class ComputerDO extends DurableObject<Env> {
     env.MARI_EPOCH = String(this.#meta.epoch);
     env.MARI_TOKEN = token;
     env.MARI_ROOT = this.env.COMPUTER_ROOT ?? DEFAULT_COMPUTER_ROOT;
-    env.MARI_STORE = this.env.STORE_URI ?? DEFAULT_STORE_URI;
+    env.MARI_STORE = scopedStore;
+    if (owner) env.MARI_BROWSER_PROFILE_KEY = await browserProfileKey(this.env, owner, computer);
+    Object.assign(env, await composeStoreEnv({ ...this.env, STORE_URI: scopedStore }, computer));
     const base = this.env.SUPERVISOR_URL_BASE;
     if (base) {
       env.MARI_CONTROL_URL = `${base.replace(/\/+$/, '')}/supervisor/${encodeURIComponent(computer)}`;
     }
     const restore = this.#meta.head ?? this.env.BASE_MANIFEST ?? null;
-    if (restore) env.MARI_RESTORE_MANIFEST = restore;
+    if (restore) {
+      const parsed = parseS3StoreUri(scopedStore);
+      if (parsed?.root) {
+        // A fleet base is authored once at the bucket root, then copied lazily
+        // into the account namespace before a supervisor receives credentials
+        // that cannot (and must not) read that root.
+        await ensureManifestNamespace(this.env.STORE, restore, parsed.root);
+      }
+      env.MARI_RESTORE_MANIFEST = restore;
+    }
     return env;
   }
 
@@ -2400,7 +2525,7 @@ export class ComputerDO extends DurableObject<Env> {
   /** The current generation's supervisor socket closed while the computer is
    *  AWAKE. Arm the grace window; nothing else changes yet. */
   async #onSupervisorLost(): Promise<void> {
-    if (this.#meta.state !== 'awake') return;
+    if (this.#meta.state !== 'awake' && this.#meta.state !== 'warm') return;
     if (this.#liveSupervisor()) return;
     this.#meta.supervisorLostAt = Date.now();
     this.#setDeadline('liveness', Date.now() + this.#supervisorGraceMs());
@@ -2888,10 +3013,12 @@ export class ComputerDO extends DurableObject<Env> {
     diff: { added: number; modified: number; removed: number },
   ): void {
     if (!this.#runRow(run)) this.#onRunStarted(run, postManifest);
+    const before = this.#runRow(run);
+    const endedAt = Date.now();
     this.ctx.storage.sql.exec(
       `UPDATE runs SET status = 'completed', endedAt = ?, postManifest = ?, exitKind = ?, exitCode = ?,
          diffAdded = ?, diffModified = ?, diffRemoved = ? WHERE id = ?`,
-      Date.now(),
+      endedAt,
       postManifest,
       exit.kind,
       exit.code,
@@ -2900,6 +3027,12 @@ export class ComputerDO extends DurableObject<Env> {
       diff.removed,
       run,
     );
+    if (before?.['status'] !== 'completed') {
+      const startedAt = Number(before?.['startedAt'] ?? endedAt);
+      this.ctx.waitUntil(
+        noteRunExecution(this.env.DB, this.#meta.computerId, Math.max(0, endedAt - startedAt)),
+      );
+    }
     this.#emit({
       type: 'run',
       runId: run,
@@ -3081,8 +3214,10 @@ export class ComputerDO extends DurableObject<Env> {
       // heartbeat or a new request inside that window must not be answered by
       // tearing the computer down when the supervisor's `snapshot_written{final}`
       // lands. The next idle deadline asks again.
-      this.#meta.coldPending = false;
-      this.#setDeadline('cold', null);
+      if (!this.#meta.rotationPending) {
+        this.#meta.coldPending = false;
+        this.#setDeadline('cold', null);
+      }
       await this.#armTier(this.#warmIdleMs());
     }
   }
@@ -3107,10 +3242,11 @@ export class ComputerDO extends DurableObject<Env> {
    */
   override async alarm(): Promise<void> {
     const now = Date.now();
-    let due: DeadlineName[] = DEADLINES.filter((name) => {
+    if (this.#meta.state === 'awake') this.#closeAwakeStretch(true);
+    let due: { name: DeadlineName; forced: boolean }[] = DEADLINES.filter((name) => {
       const at = this.#deadlineAt(name);
       return at !== null && at <= now;
-    });
+    }).map((name) => ({ name, forced: false }));
     if (due.length === 0) {
       // Fired ahead of its scheduled time. Both test harnesses do exactly this —
       // `runDurableObjectAlarm` (workers pool) and `runAlarmNow` (Node) are how a
@@ -3124,10 +3260,13 @@ export class ComputerDO extends DurableObject<Env> {
         if (best === null || at < best) earliest = name;
       }
       if (earliest === null) return;
-      due = [earliest];
+      due = [{ name: earliest, forced: true }];
     }
 
-    for (const name of due) {
+    for (const { name, forced } of due) {
+      const scheduled = this.#deadlineAt(name);
+      if (scheduled === null) continue;
+      if (!forced && scheduled > now) continue;
       // Clear the slot BEFORE running the handler: a handler that re-arms (the
       // tier's WARM->COLD, the recurring liveness check) sets it again, and a
       // handler that throws must not leave a deadline that can never be reached
@@ -3147,6 +3286,9 @@ export class ComputerDO extends DurableObject<Env> {
             break;
           case 'cold':
             await this.#onColdDeadline();
+            break;
+          case 'credential':
+            await this.#onCredentialDeadline();
             break;
           case 'tier':
             await this.#onTierDeadline();
@@ -3307,6 +3449,18 @@ export class ComputerDO extends DurableObject<Env> {
     await this.#finalizeCold(null);
   }
 
+  /** Scoped R2 credentials cannot be refreshed inside an already-running
+   * container. Rotate the generation before expiry through the ordinary clean
+   * cold handshake: snapshot first, fence/destroy, then the next request mints a
+   * fresh credential. This is a bounded maximum generation lifetime, never a
+   * silent "day seven" store failure. */
+  async #onCredentialDeadline(): Promise<void> {
+    if (this.#meta.state !== 'awake' && this.#meta.state !== 'warm') return;
+    this.#recordIncident('credential_rotation');
+    this.#meta.rotationPending = true;
+    await this.#beginCold();
+  }
+
   /** The tier policy (spec 4.4). */
   async #onTierDeadline(): Promise<void> {
     // Only progress if no activity happened since the deadline was armed.
@@ -3434,6 +3588,7 @@ export class ComputerDO extends DurableObject<Env> {
   async #finalizeCold(finalManifest: ManifestId | null): Promise<void> {
     if (finalManifest) this.#setHead(finalManifest);
     this.#meta.coldPending = false;
+    this.#meta.rotationPending = false;
     await this.#tearDownInstance('cold finalize');
     this.#meta.token = null;
     this.#meta.state = 'cold';
@@ -3443,6 +3598,7 @@ export class ComputerDO extends DurableObject<Env> {
     this.#meta.livenessStrikes = 0;
     this.#closeAwakeStretch();
     this.#setDeadline('liveness', null);
+    this.#setDeadline('credential', null);
     this.#setDeadline('cold', null);
     this.#setDeadline('tier', null);
     this.#setDeadline('waking', null);

@@ -37,6 +37,15 @@ export interface BrowserPreviewPaneSpec {
   title?: string;
 }
 
+/** Browser computer mode: Chromium runs inside the computer and is streamed
+ * through the authenticated preview proxy via noVNC. */
+export interface ComputerBrowserPaneSpec {
+  kind: 'browser';
+  /** Internal noVNC HTTP/WebSocket port. */
+  port: number;
+  title?: string;
+}
+
 /** Runs pane: the run list of one computer (spec 5, spec 8.2 "active runs"). */
 export interface RunsPaneSpec {
   kind: 'runs';
@@ -58,13 +67,21 @@ export interface DiffPaneSpec {
   title?: string;
 }
 
+/** Vault pane: the write-only credential vault of one computer (spec 10.1). */
+export interface VaultPaneSpec {
+  kind: 'vault';
+  title?: string;
+}
+
 export type PaneSpec =
   | TerminalPaneSpec
   | FilesPaneSpec
   | EditorPaneSpec
   | BrowserPreviewPaneSpec
+  | ComputerBrowserPaneSpec
   | RunsPaneSpec
-  | DiffPaneSpec;
+  | DiffPaneSpec
+  | VaultPaneSpec;
 
 export type PaneKind = PaneSpec['kind'];
 
@@ -80,10 +97,14 @@ export function paneLabel(pane: PaneSpec): string {
       return `Editor · ${basename(pane.path)}`;
     case 'preview':
       return `Preview · :${pane.port}`;
+    case 'browser':
+      return 'Browser';
     case 'runs':
       return 'Runs';
     case 'diff':
       return pane.run !== undefined ? `Changes · ${shortRunId(pane.run)}` : 'Changes';
+    case 'vault':
+      return 'Vault';
   }
 }
 
@@ -113,12 +134,16 @@ export function samePane(a: PaneSpec, b: PaneSpec): boolean {
       return a.path === (b as EditorPaneSpec).path;
     case 'preview':
       return a.port === (b as BrowserPreviewPaneSpec).port;
+    case 'browser':
+      return a.port === (b as ComputerBrowserPaneSpec).port;
     case 'runs':
       return true;
     case 'diff': {
       const d = b as DiffPaneSpec;
       return a.run === d.run && a.base === d.base && a.head === d.head;
     }
+    case 'vault':
+      return true; // one vault per computer
   }
 }
 

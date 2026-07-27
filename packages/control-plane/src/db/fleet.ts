@@ -83,6 +83,47 @@ export async function insertComputer(db: D1Database, input: CreateComputerInput)
   return row;
 }
 
+/** Atomic count-cap + insert. The older `canCreateComputer` read is retained so
+ * routes can return a helpful current count, but this single D1 statement is the
+ * authority: concurrent create/fork requests cannot both pass a COUNT then
+ * overfill the account. `null` means the cap was already full. */
+export async function insertComputerWithinLimit(
+  db: D1Database,
+  input: CreateComputerInput,
+  maxComputers: number,
+): Promise<ComputerRow | null> {
+  const row: ComputerRow = {
+    id: input.id,
+    name: input.name,
+    userId: input.userId,
+    parentComputer: input.parentComputer ?? null,
+    head: input.head ?? null,
+    state: input.state ?? 'cold',
+    excludeGlobs: input.excludeGlobs ?? [],
+    createdAt: Date.now(),
+  };
+  const result = await db
+    .prepare(
+      `INSERT INTO computers (id, name, userId, parentComputer, head, state, excludeGlobs, createdAt)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE (SELECT COUNT(*) FROM computers WHERE userId = ?) < ?`,
+    )
+    .bind(
+      row.id,
+      row.name,
+      row.userId,
+      row.parentComputer,
+      row.head,
+      row.state,
+      JSON.stringify(row.excludeGlobs),
+      row.createdAt,
+      row.userId,
+      Math.max(0, Math.floor(maxComputers)),
+    )
+    .run();
+  return (result.meta?.changes ?? 0) > 0 ? row : null;
+}
+
 export async function getComputer(db: D1Database, id: string): Promise<ComputerRow | null> {
   const r = await db.prepare(`SELECT * FROM computers WHERE id = ?`).bind(id).first();
   return r ? rowToComputer(r as Record<string, unknown>) : null;
@@ -123,11 +164,26 @@ export async function renameComputer(
 }
 
 export async function deleteComputer(db: D1Database, id: string, userId: string): Promise<boolean> {
-  const res = await db
-    .prepare(`DELETE FROM computers WHERE id = ? AND userId = ?`)
-    .bind(id, userId)
-    .run();
-  return (res.meta?.changes ?? 0) > 0;
+  // Ownership is checked by the caller before substrate teardown. Keep it on
+  // the final delete too, then remove all content-bearing D1 dependants in the
+  // same batch so "delete" cannot leave vault values or lineage behind.
+  const results = await db.batch([
+    db.prepare(`DELETE FROM secrets WHERE computerId = ?`).bind(id),
+    db.prepare(`DELETE FROM lineage WHERE child = ? OR parent = ?`).bind(id, id),
+    db.prepare(`DELETE FROM computers WHERE id = ? AND userId = ?`).bind(id, userId),
+  ]);
+  const deleted = (results[2]?.meta?.changes ?? 0) > 0;
+  if (deleted) {
+    // Usage is non-content accounting and migration 0003 may not exist on an
+    // old private install yet. Remove it when present without turning a
+    // successful secure delete into an error on that legacy schema.
+    try {
+      await db.prepare(`DELETE FROM usage_ledger WHERE computerId = ?`).bind(id).run();
+    } catch {
+      // Table not migrated yet.
+    }
+  }
+  return deleted;
 }
 
 /** Denormalized state/head update, called by the DO on a transition. */

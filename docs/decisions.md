@@ -1059,11 +1059,46 @@ Two tests, both with the failure they exist for:
   blocks being copies, the migration list creating each DO class exactly once, and
   `AUTH_RP_ID` being the app host rather than the preview zone.
 
-**Still missing before a hosted computer can wake, and NOT fixed by this lane**
-(all four are in `deploy/DEPLOY.md` §1): the mode flip; `SUPERVISOR_URL_BASE`; a
-chunk store the container can reach — which needs `--features s3` in
-`deploy/Dockerfile.mari`, an R2-credential seam in `ComputerDO.#maridEnv`, and an
-R2 API token, the three things `e2e/cloudflare.e2e.test.ts` works around and
-declares in its header; and a `BASE_MANIFEST` bootstrap for the Workers entry
-(`src/node/base-image.ts` has no Workers equivalent, so hosted computers get no
-base-image dedup).
+**Resolved for hosted v0.1 (2026-07-27).** Production now flips to the real
+Cloudflare substrate, uses `wss://app.mari.sh`, builds marid with S3, mints
+short-lived tenant-scoped R2 credentials, rewrites the supervisor store into an
+opaque account root, and lazily bootstraps/copies the base manifest into that
+root. The older Cloudflare thesis harness still uses its scratch S3 facade and
+plain workers.dev channel; its header now marks those as coverage gaps, not
+workarounds or evidence for the hosted credential/TLS path.
+
+## Appendix — Hosted v0.1 integration supersedes the earlier gap inventory
+
+_Appended by the v0.1 integration lane on 2026-07-27. The older sections remain
+above because this log is append-only; this appendix is the current verdict._
+
+The earlier appendices accurately described the branch at the time, but their
+lists of missing product surfaces are no longer the v0.1 boundary:
+
+- Browser computer mode now runs Chromium inside the computer on Xvfb, binds VNC
+  to loopback, and streams noVNC through the authenticated preview proxy. The
+  live profile stays under excluded `.mari`; only an AES-256-GCM archive enters
+  the manifest. Its key is derived from `AUTH_SECRET`, owner id, and computer id,
+  so forks quarantine the unreadable inherited archive and begin with a fresh
+  browser profile.
+- The hosted quota ledger atomically caps create/fork at three computers and
+  gates explicit wake, run, write, upload, and preview-wake paths against 100
+  AWAKE hours per UTC month. Recurring alarms checkpoint long intervals and
+  split them at month boundaries. Provider egress is still not attributable and
+  therefore is not presented as an enforced limit.
+- Vault names are visible while values remain write-only. Wake materializes only
+  that computer's vault values into the supervisor, and each run starts with an
+  empty environment plus ordinary process ergonomics and explicitly named
+  values. `MARI_*` and `AWS_*` cannot be stored or requested.
+- Account-scoped R2 roots, temporary exact-object/prefix credentials, rotation
+  before expiry, a lazy empty base manifest, strict permanent deletion, wake and
+  incident visibility, usage/limit UI, ordered layout persistence, connection
+  recovery, and WebSocket input queuing are part of the integrated v0.1.
+
+Box remains implemented as an experimental provider, not a hosted scheduler.
+The observed API can archive and resume but cannot delete, and archived boxes
+retain storage for their lifetime. Enabling it would violate Mari's permanent
+delete and honest-COLD contracts. The driver therefore fails closed unless a
+retained-resource test is explicitly authorized; hosted execution remains in
+the isolated Cloudflare computer until Box offers bounded deletion or an
+equivalent disposable resource.

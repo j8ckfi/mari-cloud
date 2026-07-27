@@ -38,19 +38,25 @@
 // editor gets SAVED BACK, which turns a storage fault into data loss.
 // ---------------------------------------------------------------------------
 
-import { decodeManifest, type Manifest, type ManifestEntry } from '@mari/shared';
+import { decodeManifest, encodeCbor, type Manifest, type ManifestEntry } from '@mari/shared';
 import { decompress as zstdDecompress } from 'fzstd';
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { tenantStoreParentRoot } from './r2-credentials';
 
-/** Store object keys (contracts.md §9). */
-export function manifestKey(id: string): string {
-  return `manifests/${id}.cbor`;
+function inRoot(root: string, key: string): string {
+  return root === '' ? key : `${root.replace(/\/+$/, '')}/${key}`;
+}
+
+/** Store object keys (contracts.md §9). `root` is the opaque per-account
+ * namespace in hosted S3/R2 deployments. */
+export function manifestKey(id: string, root = ''): string {
+  return inRoot(root, `manifests/${id}.cbor`);
 }
 
 /** Chunk key: `chunks/{id[0..2]}/{id}` — the 2-hex prefix shards the keyspace. */
-export function chunkKey(id: string): string {
-  return `chunks/${id.slice(0, 2)}/${id}`;
+export function chunkKey(id: string, root = ''): string {
+  return inRoot(root, `chunks/${id.slice(0, 2)}/${id}`);
 }
 
 /** A content address is 64 lowercase hex characters (contracts.md §3). */
@@ -203,9 +209,10 @@ export async function getChunk(
   store: R2Bucket,
   id: string,
   expectedLen?: number,
+  root = '',
 ): Promise<Uint8Array> {
   if (!CONTENT_ADDRESS.test(id)) throw new ChunkIdMalformed(id);
-  const obj = await store.get(chunkKey(id));
+  const obj = await store.get(chunkKey(id, root));
   if (obj === null) throw new ChunkMissing(id);
   return decodeChunkBody(new Uint8Array(await obj.arrayBuffer()), id, expectedLen);
 }
@@ -288,11 +295,76 @@ export class NotAFile extends Error {}
 export class FileTooLarge extends Error {}
 
 /** Load and decode the manifest at `id` from R2, or throw `ManifestNotFound`. */
-export async function loadManifest(store: R2Bucket, id: string): Promise<Manifest> {
-  const obj = await store.get(manifestKey(id));
+export async function loadManifest(store: R2Bucket, id: string, root = ''): Promise<Manifest> {
+  const obj = await store.get(manifestKey(id, root));
   if (obj === null) throw new ManifestNotFound(id);
   const bytes = new Uint8Array(await obj.arrayBuffer());
   return decodeManifest(bytes);
+}
+
+/**
+ * Copy one legacy/global base manifest and its referenced chunks into an
+ * account namespace if that namespace does not have it yet.
+ *
+ * This is the only intentional global read in the hosted storage path. The id
+ * comes from the operator-controlled `BASE_MANIFEST` or from a computer's
+ * already-owned D1/DO head; clients cannot choose it. All subsequent supervisor
+ * writes and control-plane reads stay inside `root`.
+ */
+export async function ensureManifestNamespace(
+  store: R2Bucket,
+  id: string,
+  root: string,
+): Promise<void> {
+  if (root === '' || (await store.head(manifestKey(id, root))) !== null) return;
+
+  const sourceRoot = tenantStoreParentRoot(root);
+  if (sourceRoot === null) {
+    throw new Error('refusing to bootstrap a manifest into an invalid tenant namespace');
+  }
+  const source = await store.get(manifestKey(id, sourceRoot));
+  if (source === null) throw new ManifestNotFound(id);
+  const manifestBytes = new Uint8Array(await source.arrayBuffer());
+  const manifest = decodeManifest(manifestBytes);
+  const chunks = [
+    ...new Set(
+      manifest.entries.flatMap((entry) => entry.chunks.map((chunk) => chunk.chunk)),
+    ),
+  ];
+
+  // Keep R2 fan-out bounded. Base images can contain many chunks and a wake
+  // must not create an unbounded Promise.all in a Durable Object invocation.
+  for (let i = 0; i < chunks.length; i += 32) {
+    await Promise.all(
+      chunks.slice(i, i + 32).map(async (chunk) => {
+        const targetKey = chunkKey(chunk, root);
+        if ((await store.head(targetKey)) !== null) return;
+        const body = await store.get(chunkKey(chunk, sourceRoot));
+        if (body === null) throw new ChunkMissing(chunk);
+        await store.put(targetKey, await body.arrayBuffer());
+      }),
+    );
+  }
+  // Publish the manifest last: its presence means every referenced chunk is
+  // already available in the account namespace.
+  await store.put(manifestKey(id, root), manifestBytes);
+}
+
+/** Hosted default base for the production image's intentionally empty `/work`.
+ * It is content-addressed and deterministic (`created_at: 0`), so every account
+ * begins from the same operator-authored manifest even when no manual
+ * `BASE_MANIFEST` var has been provisioned yet. */
+export async function ensureEmptyBaseManifest(store: R2Bucket, root = ''): Promise<string> {
+  const bytes = encodeCbor({
+    version: 1,
+    parent: null,
+    created_at: 0,
+    entries: [],
+  } satisfies Manifest);
+  const id = manifestIdOf(bytes);
+  const key = manifestKey(id, root);
+  if ((await store.head(key)) === null) await store.put(key, bytes);
+  return id;
 }
 
 /** Normalize a browse path to an absolute, slash-collapsed, no-trailing-slash
@@ -399,6 +471,7 @@ export async function readFile(
   store: R2Bucket,
   manifest: Manifest,
   filePath: string,
+  root = '',
 ): Promise<Uint8Array> {
   const entry = findEntry(manifest, filePath);
   if (!entry) throw new PathNotFound(normalizePath(filePath));
@@ -419,7 +492,7 @@ export async function readFile(
     // `getChunk` refuses any chunk whose verified plaintext is not `ref.len`.
     let plain = fetched.get(ref.chunk);
     if (plain === undefined) {
-      plain = await getChunk(store, ref.chunk, ref.len);
+      plain = await getChunk(store, ref.chunk, ref.len, root);
       fetched.set(ref.chunk, plain);
     } else if (plain.length !== ref.len) {
       // The same chunk named with two different lengths: one of them is a lie.

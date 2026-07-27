@@ -6,6 +6,7 @@ import { AttachClient, asDoToClient, attachUrl, type SocketLike } from '../src/w
 /** A controllable fake WebSocket recording everything the client sends. */
 class FakeSocket implements SocketLike {
   binaryType = '';
+  readyState = 0;
   sent: ClientToDo[] = [];
   onopen: ((ev: unknown) => void) | null = null;
   onclose: ((ev: unknown) => void) | null = null;
@@ -16,6 +17,7 @@ class FakeSocket implements SocketLike {
   constructor(readonly url: string) {}
 
   send(data: ArrayBufferView | ArrayBuffer): void {
+    if (this.readyState !== 1) throw new DOMException('Still connecting', 'InvalidStateError');
     const bytes =
       data instanceof ArrayBuffer
         ? new Uint8Array(data)
@@ -25,16 +27,19 @@ class FakeSocket implements SocketLike {
 
   close(): void {
     this.closed = true;
+    this.readyState = 3;
   }
 
   // test drivers
   open(): void {
+    this.readyState = 1;
     this.onopen?.({});
   }
   deliver(msg: unknown): void {
     this.onmessage?.({ data: encodeCbor(msg) });
   }
   fail(): void {
+    this.readyState = 3;
     this.onclose?.({});
   }
 }
@@ -115,6 +120,32 @@ describe('AttachClient', () => {
     t.client.input(new Uint8Array([0x6c, 0x73])); // "ls"
     const msg = t.last().sent.find((m) => m.t === 'input');
     expect(msg).toEqual({ t: 'input', run: 'run-1', bytes: new Uint8Array([0x6c, 0x73]) });
+  });
+
+  it('queues input while connecting and flushes it after attach', () => {
+    const t = setup();
+    t.client.connect();
+    expect(() => t.client.input(new Uint8Array([0x65, 0x63, 0x68, 0x6f]))).not.toThrow();
+    expect(t.last().sent).toEqual([]);
+    t.last().open();
+    expect(t.last().sent.map((m) => m.t)).toEqual(['attach', 'input']);
+    expect(t.last().sent[1]).toEqual({
+      t: 'input',
+      run: 'run-1',
+      bytes: new Uint8Array([0x65, 0x63, 0x68, 0x6f]),
+    });
+  });
+
+  it('retains input across reconnect and flushes it once', () => {
+    const t = setup();
+    t.client.connect();
+    t.last().open();
+    t.last().fail();
+    t.client.input(new Uint8Array([1, 2, 3]));
+    t.timers.runAll();
+    t.client.input(new Uint8Array([4, 5]));
+    t.last().open();
+    expect(t.last().sent.map((m) => m.t)).toEqual(['attach', 'input', 'input']);
   });
 
   it('applies a grid snapshot and tracks its base offset', () => {

@@ -105,6 +105,32 @@ describe('BrowserPreviewPane', () => {
     );
   });
 
+  it('keeps the preview capability when opening the noVNC service path', async () => {
+    stub(() => json(PREVIEW));
+    const user = userEvent.setup();
+    const path = '/vnc.html?autoconnect=1&path=websockify';
+    render(
+      <BrowserPreviewPane
+        computer="c1"
+        spec={{ kind: 'preview', port: 3000 }}
+        path={path}
+      />,
+    );
+    const frame = await waitFor(() => screen.getByTestId('preview-frame'));
+    const first = new URL(frame.getAttribute('src') as string);
+    expect(first.pathname).toBe('/vnc.html');
+    expect(first.searchParams.get('autoconnect')).toBe('1');
+    expect(first.searchParams.get('path')).toBe('websockify');
+    expect(first.searchParams.get('mari_preview')).toBe('p1.999.deadbeef');
+
+    await user.click(screen.getByTestId('preview-reload'));
+    await waitFor(() => {
+      const stable = new URL(screen.getByTestId('preview-frame').getAttribute('src') as string);
+      expect(stable.pathname).toBe('/vnc.html');
+      expect(stable.searchParams.has('mari_preview')).toBe(false);
+    });
+  });
+
   it('says why there is no preview instead of showing a blank pane', async () => {
     stub(() => json({ error: 'not_found' }, 404));
     render(<BrowserPreviewPane computer="c1" spec={{ kind: 'preview', port: 3000 }} />);

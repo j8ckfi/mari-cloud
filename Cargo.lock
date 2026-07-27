@@ -1079,6 +1079,7 @@ dependencies = [
  "clap",
  "futures-util",
  "glob",
+ "libc",
  "mari-core",
  "mari-proto",
  "opendal",

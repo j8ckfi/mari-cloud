@@ -105,12 +105,12 @@ describe('materialize (spec §3.5)', () => {
     expect(handle.entrypoint).toEqual(['/bin/sh', '-c', 'sleep 1']);
   });
 
-  it('copies the env onto the handle (a later mutation of the spec cannot change it)', async () => {
+  it('never persists startup env or secrets on the durable handle', async () => {
     const { provider } = makeProvider();
     const mutable = { ...MARID_ENV } as Record<string, string>;
     const handle = await provider.materialize(spec({ env: mutable }));
-    mutable.MARI_TOKEN = 'rotated';
-    expect(handle.env.MARI_TOKEN).toBe('tok-secret');
+    expect(handle).not.toHaveProperty('env');
+    expect(JSON.stringify(handle)).not.toContain('tok-secret');
   });
 
   it('destroys the previous generation first when the single instance slot is occupied', async () => {

@@ -12,7 +12,7 @@
 // start an interactive shell run, then open the pane bound to the run id the
 // control plane returned.
 
-import { startRun } from '../api/client';
+import { ApiError, startRun } from '../api/client';
 import { shortRunId } from './state';
 import { uiStore } from '../store/ui';
 
@@ -46,10 +46,16 @@ export async function openShellTerminal(): Promise<string | null> {
     s().openRunTerminal(computer, runId);
     s().setNotice(`Terminal · run ${shortRunId(runId)}`);
     return runId;
-  } catch {
+  } catch (err) {
     // A failure has to be visible: the old behaviour's whole problem was a pane
     // that looked fine and did nothing.
-    s().setNotice('Could not start a shell run.');
+    if (err instanceof ApiError && err.details['error'] === 'limit_compute') {
+      const used = Number(err.details['usedMs'] ?? 0) / 3_600_000;
+      const cap = Number(err.details['capMs'] ?? 0) / 3_600_000;
+      s().setNotice(`Monthly compute limit reached (${used.toFixed(1)} / ${cap.toFixed(1)} h).`);
+    } else {
+      s().setNotice('Could not start a shell run.');
+    }
     return null;
   }
 }

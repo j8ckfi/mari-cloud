@@ -11,15 +11,20 @@ import type {
   DiffResponse,
   DirListing,
   FleetResponse,
+  IncidentsResponse,
   LayoutResponse,
+  LimitsResponse,
   PreviewResponse,
   ReviewResponse,
   RunListResponse,
+  SecretNamesResponse,
   SnapshotResponse,
   StartRunRequest,
   StartRunResponse,
   StopRunResponse,
   UploadResponse,
+  UsageResponse,
+  WakeOutcome,
   WriteFileResponse,
 } from './types';
 import type { SerializedLayout } from '../wm/serialize';
@@ -33,6 +38,8 @@ export class ApiError extends Error {
     message: string,
     readonly status: number,
     readonly url: string,
+    /** Parsed server refusal body (quota codes/numbers, never assumed present). */
+    readonly details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = 'ApiError';
@@ -69,7 +76,9 @@ function noteAuth<T extends { status: number }>(res: T): T {
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${API_BASE}${path}`;
   const res = noteAuth(await fetch(url, { signal, headers: { accept: 'application/json' } }));
-  if (!res.ok) throw new ApiError(`GET ${path} → ${res.status}`, res.status, url);
+  if (!res.ok) {
+    throw new ApiError(`GET ${path} → ${res.status}`, res.status, url, await errorDetails(res));
+  }
   return (await res.json()) as T;
 }
 
@@ -85,8 +94,21 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
   );
-  if (!res.ok) throw new ApiError(`POST ${path} → ${res.status}`, res.status, url);
+  if (!res.ok) {
+    throw new ApiError(`POST ${path} → ${res.status}`, res.status, url, await errorDetails(res));
+  }
   return (await res.json()) as T;
+}
+
+async function errorDetails(res: Response): Promise<Record<string, unknown>> {
+  try {
+    const value = (await res.json()) as unknown;
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 /** URL-safe computer segment. */
@@ -288,4 +310,152 @@ export function fetchPreview(
   signal?: AbortSignal,
 ): Promise<PreviewResponse> {
   return getJson<PreviewResponse>(`/computers/${seg(id)}/preview?port=${port}`, signal);
+}
+
+// ---- lifecycle honesty: incidents + explicit wake -------------------------
+
+/**
+ * A computer's incident log: what Mari had to do that nobody asked for
+ * (substrate lost, final snapshot missed, …). Content-free kinds; the interface
+ * supplies the prose. A deployment without the route answers 404, and the
+ * caller hides the surface — `null` here means "no such surface", never
+ * "no incidents".
+ */
+export async function fetchIncidents(
+  id: string,
+  signal?: AbortSignal,
+): Promise<IncidentsResponse | null> {
+  try {
+    const res = await getJson<Partial<IncidentsResponse>>(`/computers/${seg(id)}/incidents`, signal);
+    // Defensive: an unexpected body shape must render as "nothing", not throw.
+    return Array.isArray(res.incidents) ? { incidents: res.incidents } : null;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * Wake a computer explicitly. The route is honest in every outcome (spec 8.3),
+ * so this DECODES rather than throws: 200 is `ok`, 202 is `retrying` with the
+ * time the DO will try again, and 503 is `refused` with the reason (e.g.
+ * `substrate_not_configured`) and the state the computer actually landed in.
+ * Only transport failures and auth reject.
+ */
+export async function wakeComputer(id: string): Promise<WakeOutcome> {
+  const url = `${API_BASE}/computers/${seg(id)}/wake`;
+  const res = noteAuth(
+    await fetch(url, { method: 'POST', headers: { accept: 'application/json' } }),
+  );
+  if (res.status === 401 || res.status === 404) {
+    throw new ApiError(`POST wake → ${res.status}`, res.status, url);
+  }
+  const body = (await readJsonOr(res, {})) as {
+    state?: string;
+    epoch?: number;
+    error?: string;
+    retrying?: boolean;
+    retryAt?: number;
+  };
+  if (res.ok) {
+    return {
+      outcome: 'ok',
+      state: (body.state ?? 'waking') as Extract<WakeOutcome, { outcome: 'ok' }>['state'],
+      epoch: body.epoch,
+    };
+  }
+  if (res.status === 202 || body.retrying === true) {
+    return {
+      outcome: 'retrying',
+      state: (body.state ?? 'cold') as Extract<WakeOutcome, { outcome: 'retrying' }>['state'],
+      retryAt: typeof body.retryAt === 'number' ? body.retryAt : null,
+      error: body.error ?? 'wake_retrying',
+    };
+  }
+  return {
+    outcome: 'refused',
+    state: (body.state ?? null) as Extract<WakeOutcome, { outcome: 'refused' }>['state'],
+    error: body.error ?? 'wake_failed',
+  };
+}
+
+// ---- credential vault (spec 10.1) -----------------------------------------
+//
+// Names travel; values are WRITE-ONLY. `GET` lists names, `PUT` stores a value
+// that no response will ever echo back, `DELETE` rotates a name out. The
+// supervisor injects the values into runs as environment variables; they never
+// appear in an HTTP response, an event, or a journal.
+
+/** The computer's secret NAMES (never values). */
+export function fetchSecretNames(id: string, signal?: AbortSignal): Promise<SecretNamesResponse> {
+  return getJson<SecretNamesResponse>(`/computers/${seg(id)}/secrets`, signal);
+}
+
+/** Store (or rotate) one secret. The value is never readable back. */
+export async function putSecret(id: string, name: string, value: string): Promise<void> {
+  const url = `${API_BASE}/computers/${seg(id)}/secrets/${seg(name)}`;
+  const res = noteAuth(
+    await fetch(url, {
+      method: 'PUT',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ value }),
+    }),
+  );
+  if (!res.ok) {
+    const body = (await readJsonOr(res, {})) as { error?: string };
+    throw new ApiError(body.error ?? `PUT secret → ${res.status}`, res.status, url);
+  }
+}
+
+/** Delete one secret by name. */
+export async function deleteSecret(id: string, name: string): Promise<void> {
+  const url = `${API_BASE}/computers/${seg(id)}/secrets/${seg(name)}`;
+  const res = noteAuth(await fetch(url, { method: 'DELETE', headers: { accept: 'application/json' } }));
+  if (!res.ok) throw new ApiError(`DELETE secret → ${res.status}`, res.status, url);
+}
+
+// ---- usage + limits (spec 8.2 / 10.3 surfaces; hidden-if-absent) ----------
+//
+// Both endpoints are landing alongside this client. `null` means the
+// deployment does not serve the endpoint (404), and the caller hides the
+// surface entirely — the meter must never render zeros it did not measure.
+
+/** One computer's metered usage, or null when the deployment has no meter. */
+export async function fetchUsage(id: string, signal?: AbortSignal): Promise<UsageResponse | null> {
+  try {
+    const res = await getJson<Partial<UsageResponse>>(`/computers/${seg(id)}/usage`, signal);
+    if (typeof res.awakeMs !== 'number' || typeof res.estimatedUsd !== 'number') return null;
+    return { awakeMs: res.awakeMs, boxMs: typeof res.boxMs === 'number' ? res.boxMs : 0, estimatedUsd: res.estimatedUsd };
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+/** The account's compute limits, or null when the deployment has none. */
+export async function fetchLimits(signal?: AbortSignal): Promise<LimitsResponse | null> {
+  try {
+    const res = await getJson<Partial<LimitsResponse>>('/me/limits', signal);
+    const capOk = res.computeSecondsCap === null || typeof res.computeSecondsCap === 'number';
+    const maxOk = res.maxComputers === null || typeof res.maxComputers === 'number';
+    if (
+      !capOk ||
+      !maxOk ||
+      typeof res.computeSecondsUsed !== 'number' ||
+      typeof res.computers !== 'number' ||
+      typeof res.period !== 'string'
+    ) {
+      return null;
+    }
+    return {
+      computeSecondsCap: res.computeSecondsCap as number | null,
+      computeSecondsUsed: res.computeSecondsUsed,
+      maxComputers: res.maxComputers as number | null,
+      computers: res.computers,
+      period: res.period,
+    };
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
 }

@@ -214,7 +214,9 @@ describe('/api/events (spec 6.2 attention transport)', () => {
 
     // A state transition reaches the same stream (spec 8.2 fleet liveness).
     await stub.sleepNow();
-    const state = await stream.waitForEvent((e) => e['type'] === 'state' && e['state'] === 'warm');
+    const state = await stream.waitForEvent(
+      (e) => e['type'] === 'state' && e['computer'] === id && e['state'] === 'warm',
+    );
     expect(state['computer']).toBe(id);
 
     // Sequence numbers are strictly increasing across the whole stream.

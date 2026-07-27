@@ -14,7 +14,7 @@ function coldComputer(over: Partial<FleetComputer> = {}): FleetComputer {
     activeRuns: 0,
     attention: 2,
     changedFiles: 7,
-    cost: { currency: 'USD', accrued: 1234, ratePerHour: 0, window: 'month to date' },
+    cost: { currency: 'USD', accrued: 12.34, ratePerHour: 0, window: 'month to date' },
     manifestHead: 'abcd',
     updatedAt: 1_700_000_000,
     ...over,

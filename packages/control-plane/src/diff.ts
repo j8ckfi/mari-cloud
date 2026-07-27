@@ -147,11 +147,15 @@ export async function diffManifestIds(
   store: R2Bucket,
   fromId: string,
   toId: string,
+  root = '',
 ): Promise<ManifestDiff> {
   if (fromId === toId) {
-    const only = await loadManifest(store, fromId);
+    const only = await loadManifest(store, fromId, root);
     return diffManifests(only, only);
   }
-  const [from, to] = await Promise.all([loadManifest(store, fromId), loadManifest(store, toId)]);
+  const [from, to] = await Promise.all([
+    loadManifest(store, fromId, root),
+    loadManifest(store, toId, root),
+  ]);
   return diffManifests(from, to);
 }

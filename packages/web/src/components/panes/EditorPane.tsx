@@ -4,7 +4,7 @@ import { EditorState, Prec } from '@codemirror/state';
 import { markdown } from '@codemirror/lang-markdown';
 import { basicSetup } from 'codemirror';
 import { useQueryClient } from '@tanstack/react-query';
-import { fetchFileText, writeFile, startRun } from '../../api/client';
+import { ApiError, fetchFileText, writeFile, startRun } from '../../api/client';
 import { queryKeys } from '../../api/queries';
 import { briefArgv, dirnameOf } from '../../runs/command';
 import { setActiveEditor } from '../../store/pane-actions';
@@ -46,12 +46,17 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState<string>('');
   const [computerState, setComputerState] = useState<ComputerState | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const openRunTerminal = useUiStore((s) => s.openRunTerminal);
   const qc = useQueryClient();
 
   const save = async (): Promise<boolean> => {
     const view = viewRef.current;
-    if (!view) return false;
+    if (!view || loadFailed) {
+      if (loadFailed) setStatus('Load failed — retry before saving, so remote content is not overwritten.');
+      return false;
+    }
     setStatus('Saving…');
     try {
       const res = await writeFile(computer, spec.path, view.state.doc.toString());
@@ -135,15 +140,23 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
     };
 
     setStatus('');
+    setLoadFailed(false);
+    viewRef.current?.destroy();
+    viewRef.current = null;
     fetchFileText(computer, spec.path)
       .then((text) => {
         build(text);
         setStatus('');
         setDirty(false);
       })
-      .catch(() => {
-        build(`# ${spec.path}\n\n`);
-        setStatus('New file');
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && err.status === 404) {
+          build(`# ${spec.path}\n\n`);
+          setStatus('New file');
+          return;
+        }
+        setLoadFailed(true);
+        setStatus('Load failed — nothing is editable until you retry.');
       });
 
     return () => {
@@ -152,7 +165,7 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
       viewRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [computer, spec.path]);
+  }, [computer, spec.path, loadAttempt]);
 
   return (
     <div className="editor" data-testid="editor-pane">
@@ -170,11 +183,21 @@ export function EditorPane({ computer, spec }: { computer: string; spec: EditorP
         <span className="hint" data-testid="editor-status">
           {status}
         </span>
-        <button type="button" onClick={() => void save()} data-testid="editor-save">
+        {loadFailed && (
+          <button
+            type="button"
+            onClick={() => setLoadAttempt((n) => n + 1)}
+            data-testid="editor-load-retry"
+          >
+            Retry load
+          </button>
+        )}
+        <button type="button" disabled={loadFailed} onClick={() => void save()} data-testid="editor-save">
           Save
         </button>
         <button
           type="button"
+          disabled={loadFailed}
           onClick={() => void runBrief()}
           data-testid="editor-run-brief"
           title="Save this document and start it as a run"

@@ -8,14 +8,29 @@
 // a background refetch runs — it must not mount a spinner.
 
 import { QueryClient, useQuery, type UseQueryResult } from '@tanstack/react-query';
-import { fetchComputer, fetchDir, fetchFleet, fetchLayout, fetchRunDiff, fetchRuns } from './client';
+import {
+  fetchComputer,
+  fetchDir,
+  fetchFleet,
+  fetchIncidents,
+  fetchLayout,
+  fetchLimits,
+  fetchRunDiff,
+  fetchRuns,
+  fetchSecretNames,
+  fetchUsage,
+} from './client';
 import type {
   ComputerDetail,
   DiffResponse,
   DirListing,
   FleetResponse,
+  IncidentsResponse,
   LayoutResponse,
+  LimitsResponse,
   RunListResponse,
+  SecretNamesResponse,
+  UsageResponse,
 } from './types';
 
 export function makeQueryClient(): QueryClient {
@@ -41,6 +56,10 @@ export const queryKeys = {
   layout: (id: string) => ['layout', id] as const,
   runs: (id: string) => ['runs', id] as const,
   runDiff: (id: string, run: string) => ['run-diff', id, run] as const,
+  incidents: (id: string) => ['incidents', id] as const,
+  secrets: (id: string) => ['secrets', id] as const,
+  usage: (id: string) => ['usage', id] as const,
+  limits: ['limits'] as const,
 };
 
 export function useFleet(): UseQueryResult<FleetResponse> {
@@ -85,6 +104,53 @@ export function useRuns(id: string | null): UseQueryResult<RunListResponse> {
     queryFn: ({ signal }) => fetchRuns(id as string, signal),
     enabled: id !== null,
     refetchInterval: 15_000,
+  });
+}
+
+/**
+ * A computer's incident log (what Mari had to do that nobody asked for).
+ * `data === null` means the deployment has no incident route — hide the
+ * surface, don't render an empty one. Polled slowly; incidents are rare and
+ * durable.
+ */
+export function useIncidents(id: string | null): UseQueryResult<IncidentsResponse | null> {
+  return useQuery({
+    queryKey: queryKeys.incidents(id ?? ''),
+    queryFn: ({ signal }) => fetchIncidents(id as string, signal),
+    enabled: id !== null,
+    refetchInterval: 30_000,
+  });
+}
+
+/** A computer's secret NAMES (spec 10.1 — values never travel). */
+export function useSecretNames(id: string | null): UseQueryResult<SecretNamesResponse> {
+  return useQuery({
+    queryKey: queryKeys.secrets(id ?? ''),
+    queryFn: ({ signal }) => fetchSecretNames(id as string, signal),
+    enabled: id !== null,
+  });
+}
+
+/**
+ * A computer's metered usage. `data === null` means the deployment has no
+ * meter (404) and the surface hides cleanly (spec 8.2 renders it only when
+ * something real was measured).
+ */
+export function useUsage(id: string | null): UseQueryResult<UsageResponse | null> {
+  return useQuery({
+    queryKey: queryKeys.usage(id ?? ''),
+    queryFn: ({ signal }) => fetchUsage(id as string, signal),
+    enabled: id !== null,
+    refetchInterval: 30_000,
+  });
+}
+
+/** The account's compute limits, or null when the deployment has none. */
+export function useLimits(): UseQueryResult<LimitsResponse | null> {
+  return useQuery({
+    queryKey: queryKeys.limits,
+    queryFn: ({ signal }) => fetchLimits(signal),
+    refetchInterval: 60_000,
   });
 }
 

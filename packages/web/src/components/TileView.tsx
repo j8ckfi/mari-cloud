@@ -12,12 +12,10 @@ import { PaneHost } from './panes/PaneHost';
 export function TileView({
   node,
   computer,
-  user,
   focusedId,
 }: {
   node: WmNode;
   computer: string;
-  user: string;
   focusedId: string | null;
 }) {
   if (node.type === 'pane') {
@@ -26,25 +24,20 @@ export function TileView({
         paneId={node.id}
         pane={node.pane}
         computer={computer}
-        user={user}
         focused={node.id === focusedId}
       />
     );
   }
-  return (
-    <Split node={node} computer={computer} user={user} focusedId={focusedId} />
-  );
+  return <Split node={node} computer={computer} focusedId={focusedId} />;
 }
 
 function Split({
   node,
   computer,
-  user,
   focusedId,
 }: {
   node: Extract<WmNode, { type: 'split' }>;
   computer: string;
-  user: string;
   focusedId: string | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -74,7 +67,7 @@ function Split({
   return (
     <div className={`tile-split ${node.axis}`} ref={ref} data-testid="tile-split" data-axis={node.axis}>
       <div style={{ flex: `0 0 ${pct}`, minWidth: 0, minHeight: 0, display: 'flex' }}>
-        <TileView node={node.a} computer={computer} user={user} focusedId={focusedId} />
+        <TileView node={node.a} computer={computer} focusedId={focusedId} />
       </div>
       <div
         className="tile-gutter"
@@ -84,7 +77,7 @@ function Split({
         data-testid="tile-gutter"
       />
       <div style={{ flex: '1 1 0', minWidth: 0, minHeight: 0, display: 'flex' }}>
-        <TileView node={node.b} computer={computer} user={user} focusedId={focusedId} />
+        <TileView node={node.b} computer={computer} focusedId={focusedId} />
       </div>
     </div>
   );

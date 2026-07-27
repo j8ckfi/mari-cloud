@@ -35,10 +35,10 @@
   "containers": [
     {
       "class_name": "ComputerDO",
-      // `ctx/Dockerfile` is deploy/Dockerfile.mari with ONE build flag added
-      // (`--features s3`) and the store's endpoint/credentials as ENV. The suite
-      // asserts the diff is exactly that, so the thesis runs against the
-      // production base image rather than a lookalike.
+      // LEGACY HARNESS: `ctx/Dockerfile` is assembled from the production image
+      // plus facade credentials. Production itself now has S3 + TLS and receives
+      // tenant-scoped temporary credentials at materialize; this scratch image
+      // does not prove that production credential path.
       "image": "./ctx/Dockerfile",
       "image_build_context": "./ctx",
       "instance_type": "standard-1",
@@ -86,10 +86,9 @@
 
     // ---- what the DO hands `marid` at materialize (spec 3.5) ---------------
     "COMPUTER_ROOT": "/work",
-    // The supervisor dials back over PLAIN ws:// on purpose: `marid` has no TLS
-    // backend compiled in (crates/marid/Cargo.toml pulls tokio-tungstenite with
-    // no TLS feature, and reqwest resolves with no TLS backend at all), so
-    // wss:// cannot connect today. workers.dev serves http/ws on port 80.
+    // Scratch-only plain WebSocket origin. Production marid has TLS and hosted
+    // containers use wss://app.mari.sh; this workers.dev harness does not cover
+    // that channel.
     "SUPERVISOR_URL_BASE": "__WS_ORIGIN__",
     // The chunk store as the SUPERVISOR sees it: path-style S3 against the
     // facade in src/worker.ts, backed by the scratch R2 bucket that the control

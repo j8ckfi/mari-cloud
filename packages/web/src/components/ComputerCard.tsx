@@ -1,10 +1,18 @@
 import type { ComputerState } from '@mari/shared';
 import type { FleetComputer } from '../api/types';
 
-/** Format a cost meter's accrued amount (minor units) as a currency string. */
+/** The control-plane contract is currency major units (USD dollars), not cents. */
 export function formatCost(accrued: number, currency: string): string {
-  const symbol = currency === 'USD' ? '$' : '';
-  return `${symbol}${(accrued / 100).toFixed(2)}`;
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    }).format(accrued);
+  } catch {
+    return `${currency} ${accrued.toFixed(4)}`;
+  }
 }
 
 /**
@@ -55,6 +63,7 @@ export function ComputerCard({
       data-attention={attention}
       onClick={() => onOpen(c.id)}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           onOpen(c.id);

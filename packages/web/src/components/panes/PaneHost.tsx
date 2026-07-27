@@ -6,6 +6,8 @@ import { EditorPane } from './EditorPane';
 import { BrowserPreviewPane } from './BrowserPreviewPane';
 import { RunsPane } from './RunsPane';
 import { DiffPane } from './DiffPane';
+import { VaultPane } from './VaultPane';
+import { ComputerBrowserPane } from './ComputerBrowserPane';
 
 /** Renders one leaf pane: a header plus the type-specific body. */
 export function PaneHost({
@@ -17,16 +19,6 @@ export function PaneHost({
   paneId: string;
   pane: PaneSpec;
   computer: string;
-  /**
-   * INERT. The preview pane used to compose its own hostname from this label,
-   * which the shell filled in from `VITE_USER ?? 'user'` — a build-time guess
-   * that was wrong on every deployment. The per-user host label is derived from
-   * the OWNER's account by the control plane and now arrives with the preview
-   * URL itself (`GET /api/computers/:id/preview`), so nothing reads this. It is
-   * still accepted so the layout's prop chain keeps compiling; whoever next
-   * touches `Shell.tsx` should delete the chain.
-   */
-  user?: string;
   focused: boolean;
 }) {
   const focusPane = useUiStore((s) => s.focusPane);
@@ -65,8 +57,10 @@ export function PaneHost({
         {pane.kind === 'files' && <FilesPane computer={computer} spec={pane} />}
         {pane.kind === 'editor' && <EditorPane computer={computer} spec={pane} />}
         {pane.kind === 'preview' && <BrowserPreviewPane computer={computer} spec={pane} />}
+        {pane.kind === 'browser' && <ComputerBrowserPane computer={computer} spec={pane} />}
         {pane.kind === 'runs' && <RunsPane computer={computer} />}
         {pane.kind === 'diff' && <DiffPane computer={computer} spec={pane} />}
+        {pane.kind === 'vault' && <VaultPane computer={computer} />}
       </div>
     </div>
   );

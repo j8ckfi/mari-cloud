@@ -81,6 +81,15 @@ export interface Env {
   /** WARM -> COLD idle threshold, ms (default 30 min). */
   COLD_IDLE_MS?: string;
 
+  // ---- per-user quotas (spec 10.3; src/limits.ts owns the policy) ----------
+
+  /** Computers one account may hold. Unset: 3 on a production environment,
+   *  unlimited elsewhere. `<= 0` means explicitly unlimited. */
+  LIMIT_MAX_COMPUTERS?: string;
+  /** AWAKE compute-hours one account may spend per UTC month. Unset: 100 on a
+   *  production environment, unlimited elsewhere. `<= 0` means unlimited. */
+  LIMIT_COMPUTE_HOURS?: string;
+
   // ---- liveness and recovery (computer-do.ts) ------------------------------
   // A substrate evicts an instance and tells nobody; these four numbers are how
   // long Mari waits before it stops believing its own record of AWAKE.
@@ -113,6 +122,28 @@ export interface Env {
   COMPUTER_ROOT?: string;
   /** Chunk store URI as the SUPERVISOR sees it, e.g. `fs:///store` (`MARI_STORE`). */
   STORE_URI?: string;
+  /** Cloudflare account id used to derive the R2 S3 endpoint and mint temporary
+   *  per-computer R2 credentials for an `s3://` hosted store. */
+  CF_ACCOUNT_ID?: string;
+  /** SECRET — parent R2 access-key id used only to mint scoped temporary
+   *  credentials for one computer generation. */
+  R2_PARENT_ACCESS_KEY_ID?: string;
+  /** SECRET — Cloudflare API token paired with the parent R2 key; never forwarded
+   *  to a computer. */
+  R2_PARENT_API_TOKEN?: string;
+  /** Optional TTL for temporary R2 credentials, seconds. */
+  R2_TEMP_TTL_SECONDS?: string;
+  /** SECRET fallback — static R2 S3 access key id, injected only when the scoped
+   *  temporary-credential path is unavailable. */
+  R2_ACCESS_KEY_ID?: string;
+  /** SECRET fallback — static R2 S3 secret access key. */
+  R2_SECRET_ACCESS_KEY?: string;
+  /** Development-only opt-in for injecting the static bucket-wide pair. Hosted
+   * deployments must leave this unset and mint tenant-scoped credentials. */
+  ALLOW_STATIC_R2_CREDENTIALS?: string;
+  /** Optional explicit S3 endpoint for R2-compatible stores; production derives
+   *  this from `CF_ACCOUNT_ID`. */
+  R2_ENDPOINT?: string;
   /** WebSocket origin a materialized computer dials back on; the DO appends
    *  `/supervisor/{computer}` (`MARI_CONTROL_URL`). Must be reachable FROM the
    *  container, so never `localhost`. */

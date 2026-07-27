@@ -74,6 +74,7 @@ describe('credential vault (spec 10.1)', () => {
     // ...and marid's own configuration is intact beside it.
     expect(env.MARI_COMPUTER_ID).toBe(id);
     expect(env.MARI_TOKEN).toMatch(/.+/);
+    expect(Buffer.from(env.MARI_BROWSER_PROFILE_KEY as string, 'base64')).toHaveLength(32);
 
     // A run started with no explicit envNames names the vault's variables, so the
     // supervisor injects them into the child (contracts.md §5.2: NAMES only).
@@ -93,7 +94,14 @@ describe('credential vault (spec 10.1)', () => {
 
   it('refuses a name that would shadow marid’s own configuration', async () => {
     const id = await createComputer(cookie, 'vault-guard');
-    for (const name of ['MARI_TOKEN', 'MARI_EPOCH', 'MARI_ROOT']) {
+    for (const name of [
+      'MARI_TOKEN',
+      'MARI_EPOCH',
+      'MARI_ROOT',
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'AWS_SESSION_TOKEN',
+    ]) {
       const res = await SELF.fetch(`${HOST}/api/computers/${id}/secrets/${name}`, {
         method: 'PUT',
         headers: { Cookie: cookie, 'content-type': 'application/json' },

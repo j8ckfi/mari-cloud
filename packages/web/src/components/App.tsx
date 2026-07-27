@@ -6,6 +6,7 @@ import { installHotkeys } from '../hotkeys';
 import { openShellTerminal } from '../runs/shell';
 import { useUiStore } from '../store/ui';
 import { connectEvents, useEventsStore } from '../store/events';
+import { useWakeStore } from '../lifecycle/wake';
 import { betterAuthApi } from '../auth/better-auth';
 import type { AuthApi } from '../auth/api';
 import type { Account } from '../auth/machine';
@@ -30,7 +31,8 @@ export function App({ api = betterAuthApi }: { api?: AuthApi } = {}) {
   const onSessionEnd = useCallback(() => {
     queryClient.clear();
     useEventsStore.getState().reset();
-    useUiStore.getState().goFleet();
+    useWakeStore.getState().resetWakeNotices();
+    useUiStore.getState().resetForSession();
   }, [queryClient]);
 
   return (
@@ -85,6 +87,10 @@ function AuthedApp({
     // updates badges immediately, and the invalidations below let the durable
     // control-plane views catch up without the interface ever waiting on them.
     const offEvents = connectEvents({
+      onOpen: () => {
+        // Reconcile state accumulated while SSE was reconnecting.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.fleet });
+      },
       onEvent: (event) => {
         if (event.type === 'run' || event.type === 'attention') {
           void queryClient.invalidateQueries({ queryKey: queryKeys.runs(event.computer) });
