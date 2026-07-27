@@ -158,18 +158,16 @@ export class CloudflareSubstrateError extends Error {
  * Cloudflare handle. `id` is the computer id: the instance has no separate
  * address, because it belongs to the computer's own Durable Object.
  *
- * It carries the startup options so {@link CloudflareProvider.wake} and
- * {@link CloudflareProvider.exec} can reconstruct everything they need from the
- * handle alone (provider.ts's rule — a driver instance does not outlive a
- * request). `env` therefore includes `MARI_TOKEN`: it is persisted in the same DO
- * storage that already holds that token, and a driver MUST NOT log it.
+ * It deliberately does NOT carry startup env. Handles are persisted in Durable
+ * Object metadata, and putting the fencing token, R2 session key, and vault
+ * values in a handle duplicates every secret at rest. This substrate declares
+ * `supportsWarm=false`, so a later generation is always materialized with fresh
+ * configuration rather than reconstructed from a persisted handle.
  */
 export interface CloudflareHandle extends SubstrateHandle {
   readonly substrate: typeof CLOUDFLARE_SUBSTRATE;
   /** Entrypoint override, or `null` to use the image's own (marid). */
   readonly entrypoint: readonly string[] | null;
-  /** marid's whole configuration, as handed to `start()`. Secret. */
-  readonly env: Readonly<Record<string, string>>;
   /** The wake epoch this instance was started with, when the env carried one. */
   readonly epoch: number | null;
   /** Ports the caller asked for. Recorded only: Cloudflare needs no publish
@@ -313,6 +311,9 @@ export class CloudflareProvider implements SubstrateProvider {
   readonly supportsWarm = false;
 
   readonly #cfg: CloudflareConfig;
+  /** Startup config exists only in this live provider activation. It supports a
+   * direct same-activation wake test, never durable reconstruction. */
+  readonly #startup = new Map<string, ContainerStartupOptions>();
 
   constructor(config: CloudflareConfig) {
     this.#cfg = config;
@@ -349,6 +350,7 @@ export class CloudflareProvider implements SubstrateProvider {
     }
 
     await this.#startAndAwaitReady(container, startup, spec.computer);
+    this.#startup.set(spec.computer, startup);
     this.#armExitWatch(container, spec.computer, epochOf(spec.env));
 
     return {
@@ -356,7 +358,6 @@ export class CloudflareProvider implements SubstrateProvider {
       computer: spec.computer,
       id: spec.computer,
       entrypoint: spec.cmd ? [...spec.cmd] : null,
-      env: { ...spec.env },
       epoch: epochOf(spec.env),
       ports: [...(spec.ports ?? [])],
     };
@@ -418,12 +419,13 @@ export class CloudflareProvider implements SubstrateProvider {
   async wake(handle: SubstrateHandle): Promise<void> {
     isCloudflareHandle(handle);
     const container = this.#container();
-    const startup: ContainerStartupOptions = {
-      enableInternet: true,
-      env: { ...handle.env },
-      labels: labelsFor(handle.computer, handle.epoch),
-      ...(handle.entrypoint ? { entrypoint: [...handle.entrypoint] } : {}),
-    };
+    const startup = this.#startup.get(handle.computer);
+    if (!startup) {
+      throw new CloudflareSubstrateError(
+        'not_running',
+        'Cloudflare startup configuration is intentionally not persisted; materialize a fresh generation',
+      );
+    }
     await this.#startAndAwaitReady(container, startup, handle.computer);
     this.#armExitWatch(container, handle.computer, handle.epoch);
   }

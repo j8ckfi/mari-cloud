@@ -398,9 +398,41 @@ impl RunManager {
         let mut cmd = CommandBuilder::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.cwd(&cwd);
+        // portable-pty's CommandBuilder starts with std::env::vars_os(). A run
+        // must not inherit the supervisor's fencing token, R2 session
+        // credential, or every vault value merely because they configure PID 1.
+        // Start from an empty environment, restore only ordinary process
+        // ergonomics, then add the vault names explicitly requested by the
+        // control plane.
+        cmd.env_clear();
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "TZ",
+            "TMPDIR",
+            "COLORTERM",
+        ] {
+            if let Ok(val) = std::env::var(name) {
+                cmd.env(name, val);
+            }
+        }
+        for (name, val) in std::env::vars() {
+            if name.starts_with("LC_") || name.starts_with("XDG_") {
+                cmd.env(name, val);
+            }
+        }
         // Inject vault variables by name from the supervisor's environment; the
         // values never traveled in the StartRun message (spec 10.1).
         for name in &env_names {
+            if name.starts_with("MARI_") || name.starts_with("AWS_") {
+                warn!(%run, env = %name, "refusing supervisor-reserved run environment name");
+                continue;
+            }
             if let Ok(val) = std::env::var(name) {
                 cmd.env(name, val);
             }

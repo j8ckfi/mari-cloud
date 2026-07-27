@@ -39,6 +39,8 @@ export interface EventStreamOptions {
   url?: string;
   onEvent(event: MariEvent): void;
   onOpen?(): void;
+  /** Called when a source fails and the explicit retry window begins. */
+  onDisconnect?(): void;
   /** Called for a payload that failed validation (dropped, not thrown). */
   onInvalid?(data: string): void;
   factory?: EventSourceFactory;
@@ -101,6 +103,7 @@ export class EventStream {
       // EventSource may or may not recover on its own; drop it and retry
       // ourselves so the behaviour is the same in every browser.
       this.#dropSocket();
+      this.#opts.onDisconnect?.();
       if (!this.#closed) this.#scheduleReconnect();
     };
   }

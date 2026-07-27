@@ -8,11 +8,10 @@
 // accounting from substrate price sheets"). Nothing here gates a wake and
 // nothing here talks to a payment system.
 //
-// WRITERS. The accumulation functions are called from ComputerDO on state
-// transitions — that file is contended this phase, so the exact call sites are
-// specified in docs/obs-hooks.md rather than patched here. Until the hooks
-// land, the table is simply empty and the endpoint reports zeros, which is the
-// truthful reading of "nothing has been metered yet".
+// WRITERS. ComputerDO closes and records every AWAKE interval on lifecycle
+// transitions and recurring alarm checkpoints, and records each completed run
+// once. The exact call sites and failure semantics are pinned in
+// docs/obs-hooks.md.
 //
 // SCHEMA OWNERSHIP. `usage_ledger` is created here (idempotent ensure) and by
 // migrations/0003_usage.sql for the hosted DB; test/usage.test.ts pins the two
@@ -25,6 +24,7 @@ import { makeAuth } from './auth';
 import { getOwnedComputer } from './db/fleet';
 import { makeLogger } from './obs';
 import type { Env } from './types';
+import { splitUsagePeriods } from './limits';
 
 // ---------------------------------------------------------------------------
 // Price constants — docs/costs.md is the source; change them THERE first.
@@ -133,6 +133,21 @@ export async function recordAwakeStretch(
   await upsert(db, computerId, usagePeriod(at), clamped, 0, 0, at);
 }
 
+/** Record an AWAKE interval into the UTC month(s) where it occurred. */
+export async function recordAwakeInterval(
+  db: D1Database,
+  computerId: string,
+  startedAt: number,
+  endedAt: number,
+): Promise<void> {
+  const slices = splitUsagePeriods(startedAt, endedAt);
+  if (slices.length === 0) return;
+  await ensureUsageSchema(db);
+  for (const slice of slices) {
+    await upsert(db, computerId, slice.period, slice.ms, 0, 0, endedAt);
+  }
+}
+
 /**
  * Record one completed run: run count +1, plus its execution time into
  * `boxMs` — box-substrate active time is execution-seconds only
@@ -163,6 +178,23 @@ export async function noteAwakeStretch(
   } catch (err) {
     hookLog.warn('usage_write_failed', {
       kind: 'awake_stretch',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Never-rejecting interval-aware variant used by ComputerDO. */
+export async function noteAwakeInterval(
+  db: D1Database,
+  computerId: string | null,
+  startedAt: number,
+  endedAt: number,
+): Promise<void> {
+  try {
+    await recordAwakeInterval(db, computerId ?? 'unknown', startedAt, endedAt);
+  } catch (err) {
+    hookLog.warn('usage_write_failed', {
+      kind: 'awake_interval',
       error: err instanceof Error ? err.message : String(err),
     });
   }

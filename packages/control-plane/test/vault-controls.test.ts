@@ -93,7 +93,14 @@ describe('credential vault (spec 10.1)', () => {
 
   it('refuses a name that would shadow marid’s own configuration', async () => {
     const id = await createComputer(cookie, 'vault-guard');
-    for (const name of ['MARI_TOKEN', 'MARI_EPOCH', 'MARI_ROOT']) {
+    for (const name of [
+      'MARI_TOKEN',
+      'MARI_EPOCH',
+      'MARI_ROOT',
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'AWS_SESSION_TOKEN',
+    ]) {
       const res = await SELF.fetch(`${HOST}/api/computers/${id}/secrets/${name}`, {
         method: 'PUT',
         headers: { Cookie: cookie, 'content-type': 'application/json' },

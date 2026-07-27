@@ -31,6 +31,8 @@ export interface AttachHandlers {
 /** Minimal WebSocket surface, so tests can inject a fake. */
 export interface SocketLike {
   binaryType: string;
+  /** Mirrors WebSocket.readyState (CONNECTING=0, OPEN=1, CLOSING=2, CLOSED=3). */
+  readonly readyState: number;
   send(data: ArrayBufferView | ArrayBuffer): void;
   close(): void;
   onopen: ((ev: unknown) => void) | null;
@@ -55,6 +57,8 @@ export interface AttachOptions {
   /** Injectable timers, for deterministic tests. */
   setTimeoutFn?: (fn: () => void, ms: number) => number;
   clearTimeoutFn?: (handle: number) => void;
+  /** Maximum terminal input retained while the socket is connecting/reconnecting. */
+  maxQueuedInputBytes?: number;
 }
 
 const defaultSocketFactory: SocketFactory = (url) => {
@@ -69,7 +73,11 @@ interface ResolvedAttachOptions extends AttachOptions {
   socketFactory: SocketFactory;
   setTimeoutFn: (fn: () => void, ms: number) => number;
   clearTimeoutFn: (handle: number) => void;
+  maxQueuedInputBytes: number;
 }
+
+const SOCKET_OPEN = 1;
+const DEFAULT_MAX_QUEUED_INPUT_BYTES = 64 * 1024;
 
 export class AttachClient {
   #opts: ResolvedAttachOptions;
@@ -84,6 +92,9 @@ export class AttachClient {
   #appliedOffset = 0;
   /** Whether a grid snapshot has ever been applied (first attach vs. re-attach). */
   #sawGrid = false;
+  /** Bounded input typed during a cold wake or reconnect. */
+  #queuedInput: Uint8Array[] = [];
+  #queuedInputBytes = 0;
 
   constructor(opts: AttachOptions) {
     this.#opts = {
@@ -92,6 +103,7 @@ export class AttachClient {
       socketFactory: defaultSocketFactory,
       setTimeoutFn: (fn, ms) => setTimeout(fn, ms) as unknown as number,
       clearTimeoutFn: (h) => clearTimeout(h),
+      maxQueuedInputBytes: DEFAULT_MAX_QUEUED_INPUT_BYTES,
       ...opts,
     };
     this.#run = opts.run;
@@ -114,6 +126,7 @@ export class AttachClient {
     ws.onopen = () => {
       this.#backoff = this.#opts.backoffMs; // reset backoff on a clean open
       this.#sendRaw({ t: 'attach', run: this.#run, cols: this.#cols, rows: this.#rows });
+      this.#flushQueuedInput();
       this.#opts.handlers.onOpen?.();
     };
     ws.onmessage = (ev) => this.#onMessage(ev.data);
@@ -127,7 +140,8 @@ export class AttachClient {
 
   /** Send terminal input bytes (client -> DO -> supervisor PTY). */
   input(bytes: Uint8Array): void {
-    this.#sendRaw({ t: 'input', run: this.#run, bytes });
+    if (bytes.length === 0) return;
+    if (!this.#sendRaw({ t: 'input', run: this.#run, bytes })) this.#queueInput(bytes);
   }
 
   /** Resize the attached viewport. Remembered for reconnect. */
@@ -158,12 +172,50 @@ export class AttachClient {
       this.#ws.close();
       this.#ws = null;
     }
+    this.#queuedInput = [];
+    this.#queuedInputBytes = 0;
   }
 
-  #sendRaw(msg: ClientToDo): void {
+  /** A WebSocket object exists while CONNECTING, but real browsers throw
+   * InvalidStateError from send() until readyState is OPEN. */
+  #sendRaw(msg: ClientToDo): boolean {
     const ws = this.#ws;
-    if (ws === null) return;
-    ws.send(encodeCbor(msg));
+    if (ws === null || ws.readyState !== SOCKET_OPEN) return false;
+    try {
+      ws.send(encodeCbor(msg));
+      return true;
+    } catch (err) {
+      this.#opts.handlers.onError?.(err);
+      return false;
+    }
+  }
+
+  #queueInput(bytes: Uint8Array): void {
+    const cap = Math.max(0, this.#opts.maxQueuedInputBytes);
+    if (cap === 0) return;
+    const copy = bytes.length > cap ? bytes.slice(bytes.length - cap) : bytes.slice();
+    this.#queuedInput.push(copy);
+    this.#queuedInputBytes += copy.length;
+    while (this.#queuedInputBytes > cap && this.#queuedInput.length > 0) {
+      const overflow = this.#queuedInputBytes - cap;
+      const first = this.#queuedInput[0] as Uint8Array;
+      if (first.length <= overflow) {
+        this.#queuedInput.shift();
+        this.#queuedInputBytes -= first.length;
+      } else {
+        this.#queuedInput[0] = first.slice(overflow);
+        this.#queuedInputBytes -= overflow;
+      }
+    }
+  }
+
+  #flushQueuedInput(): void {
+    while (this.#queuedInput.length > 0) {
+      const bytes = this.#queuedInput[0] as Uint8Array;
+      if (!this.#sendRaw({ t: 'input', run: this.#run, bytes })) return;
+      this.#queuedInput.shift();
+      this.#queuedInputBytes -= bytes.length;
+    }
   }
 
   #onMessage(data: unknown): void {

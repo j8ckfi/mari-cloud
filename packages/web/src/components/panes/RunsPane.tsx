@@ -52,7 +52,15 @@ export function RunsPane({ computer }: { computer: string }) {
       </div>
 
       <div className="runs-list" data-testid="runs-list">
-        {rows.length === 0 && (
+        {runsQ.isError && rows.length === 0 && (
+          <div className="empty-note" role="alert" data-testid="runs-error">
+            Could not read run history. No run was deleted.
+            <button type="button" onClick={() => void runsQ.refetch()}>
+              Retry
+            </button>
+          </div>
+        )}
+        {!runsQ.isError && rows.length === 0 && (
           <div className="empty-note" data-testid="runs-empty">
             No runs yet. Open a terminal (<kbd>⌥R</kbd>) and run something.
           </div>

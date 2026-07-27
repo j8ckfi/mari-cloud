@@ -1,8 +1,8 @@
 import { useCallback, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useUiStore } from '../store/ui';
-import { queryKeys, useFleet } from '../api/queries';
-import { createComputer } from '../api/client';
+import { queryKeys, useFleet, useLimits } from '../api/queries';
+import { ApiError, createComputer } from '../api/client';
 import { useEventsStore } from '../store/events';
 import { allAttention, attentionFor, badgeCount } from '../events/reducer';
 import { FleetHome } from './FleetHome';
@@ -11,10 +11,6 @@ import { CommandPalette } from './CommandPalette';
 import { AccountMenu } from './AccountMenu';
 import type { CommandRegistry } from '../palette/registry';
 import type { Account } from '../auth/machine';
-
-/** Current user handle for preview hostnames; the control plane sets the real
- *  one, this is the dev/default fallback (must be a valid DNS label field). */
-const USER = (import.meta.env.VITE_USER as string | undefined) ?? 'user';
 
 /**
  * The app shell: a top bar with the fleet button and one tab per workspace
@@ -59,6 +55,8 @@ export function Shell({
 
   const queryClient = useQueryClient();
   const fleet = useFleet();
+  const limitsQ = useLimits();
+  const streamConnected = useEventsStore((s) => s.connected);
   const events = useEventsStore((s) => s.model);
   const computers = fleet.data?.computers ?? [];
   const idsKey = computers.map((c) => c.id).join(',');
@@ -71,15 +69,31 @@ export function Shell({
    * failed in words, in the same place every other command reports itself.
    */
   const newComputer = useCallback(async (): Promise<void> => {
+    const limits = limitsQ.data;
+    if (
+      limits !== null &&
+      limits !== undefined &&
+      limits.maxComputers !== null &&
+      limits.computers >= limits.maxComputers
+    ) {
+      setNotice(`Computer limit reached (${limits.computers} / ${limits.maxComputers}).`);
+      return;
+    }
     try {
       const created = await createComputer();
       await queryClient.invalidateQueries({ queryKey: queryKeys.fleet });
       setNotice(`Created ${created.name} · deep sleep`);
       openComputer(created.id);
-    } catch {
-      setNotice('Could not create a computer — the control plane did not accept the request.');
+    } catch (err) {
+      if (err instanceof ApiError && err.details['error'] === 'limit_computers') {
+        setNotice(
+          `Computer limit reached (${String(err.details['computers'] ?? '?')} / ${String(err.details['maxComputers'] ?? '?')}).`,
+        );
+      } else {
+        setNotice('Could not create a computer — the control plane did not accept the request.');
+      }
     }
-  }, [openComputer, queryClient, setNotice]);
+  }, [limitsQ.data, openComputer, queryClient, setNotice]);
 
   // Spec 8.1: every pointer action is a command too, so the first computer can
   // be created from Cmd+K with no mouse.
@@ -185,6 +199,11 @@ export function Shell({
           })}
         </div>
         <span className="spacer" />
+        {!streamConnected && (
+          <span className="sync-state error" data-testid="events-reconnecting">
+            Live updates reconnecting
+          </span>
+        )}
         {/* Plain-text outcome of the last palette command (never a spinner). */}
         <span className="hint" data-testid="notice">
           {notice}
@@ -215,7 +234,7 @@ export function Shell({
             onRetry={() => void fleet.refetch()}
           />
         ) : (
-          <Workspace computer={active} user={USER} />
+          <Workspace key={active} computer={active} />
         )}
       </div>
 

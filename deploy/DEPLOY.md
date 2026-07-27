@@ -62,7 +62,10 @@ Production is configured for the real hosted substrate:
   inside `tenants/<sha256(owner)>/`: per-computer journal/runs/state/heat plus
   chunks/manifests shared **only by that account's computers**. The supervisor's
   `MARI_STORE` is rewritten to the same opaque tenant root, so another account's
-  objects are neither addressable nor listable.
+  objects are neither addressable nor listable. The default session lifetime is
+  24 hours (`R2_TEMP_TTL_SECONDS` may be set from 900 to 604800 seconds);
+  `ComputerDO` cleanly snapshots and rotates the generation before expiry rather
+  than letting an active computer lose durable writes.
 - A new hosted computer gets a deterministic empty manifest immediately when
   `BASE_MANIFEST` is unset. The fleet/operator base manifest remains at the
   bucket root; on first wake the control plane lazily copies that manifest and

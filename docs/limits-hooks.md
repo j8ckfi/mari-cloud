@@ -42,10 +42,9 @@ computer Durable Object:
 - run creation (it may implicitly wake);
 - file write and upload (they enqueue work and may implicitly wake).
 
-Preview proxy traffic can also wake a computer, but v0.1 does not yet apply the
-monthly compute gate on that host-routed path. Treat that as a documented quota
-coverage gap, not as unmetered billing: the resulting AWAKE interval is still
-checkpointed into the ledger.
+Preview proxy traffic passes the same gate after capability/session
+authorization and before the computer Durable Object is addressed. A valid
+preview capability therefore cannot bypass the denial-of-wallet ceiling.
 
 The gate is not a kill switch. It does not stop an already-AWAKE computer or an
 already-running command, and it does not prevent non-wake reads. The ordinary

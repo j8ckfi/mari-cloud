@@ -15,6 +15,7 @@ import {
 } from './preview';
 import { healthz, makeLogger, routeTemplate, withRequestId } from './obs';
 import { tryUsageRoute } from './usage';
+import { canWake } from './limits';
 import type { Env } from './types';
 
 const app = createApp();
@@ -140,6 +141,20 @@ async function tryWakeProxy(request: Request, env: Env): Promise<Response | null
   }
 
   if (!authorized) return previewRefused(401, 'preview_unauthorized');
+
+  // The proxy calls ComputerDO.wake() below. Apply the same account compute
+  // ceiling as POST /wake and run/file triggers before addressing the DO, so a
+  // preview capability cannot bypass the denial-of-wallet gate.
+  const wakeGate = await canWake(env.DB, env, row.userId);
+  if (!wakeGate.ok) {
+    return new Response('compute limit reached\n', {
+      status: 403,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-mari-preview': wakeGate.reason,
+      },
+    });
+  }
 
   // A capability that arrived in the query string becomes a cookie for this
   // preview host and is redirected out of the URL, so the iframe's subsequent

@@ -9,51 +9,46 @@
 // materialize time, so the values live in the supervisor's process environment
 // for one generation and nowhere else.
 //
-// THE CREDENTIALS ARE PER-COMPUTER AND SHORT-LIVED, NOT A FLEET KEY. Every
+// THE CREDENTIALS ARE PER-ACCOUNT AND SHORT-LIVED, NOT A FLEET KEY. Every
 // materialize mints a scoped credential via Cloudflare's temporary-access API
 // (`POST accounts/{account_id}/r2/temp-access-credentials` — request/response
 // shape verified against Cloudflare's published OpenAPI schema, which also gives
 // `ttlSeconds` its `maximum: 604800`). The scope is `object-read-write` on the
-// prefixes this computer legitimately touches (contracts.md §9 plus marid's own
-// durable-state keys, crates/marid/src/state.rs):
+// prefixes this computer legitimately touches inside an opaque per-account
+// namespace (contracts.md §9 plus marid's own durable-state keys,
+// crates/marid/src/state.rs):
 //
-//   journal/{computer}/   runs/{computer}/   state/{computer}/
-//   heat/{computer}.cbor  chunks/            manifests/
+//   tenants/{sha256(owner)}/journal/{computer}/
+//   tenants/{sha256(owner)}/runs/{computer}/
+//   tenants/{sha256(owner)}/state/{computer}/
+//   tenants/{sha256(owner)}/heat/{computer}.cbor
+//   tenants/{sha256(owner)}/chunks/
+//   tenants/{sha256(owner)}/manifests/
 //
-// The per-computer prefixes are the tenancy boundary: a leaked credential for
-// computer A cannot read B's journal (terminal output — routinely
-// secret-bearing), B's run records, or B's head history. `chunks/` and
-// `manifests/` are deliberately SHARED — they are content-addressed, every
-// manifest references chunks written by other computers (that is the whole
-// base-image dedup argument, spec §2), and R2's prefix scoping has no way to
-// express "the chunks your manifests reach". The residual risk is stated in
-// decisions.md rather than papered over: a computer's credential can read any
-// chunk/manifest it can NAME (ids are unguessable blake3s, but `ListObjects`
-// within the prefix enumerates them) and can write garbage under either prefix
-// (harmless to integrity — both sides verify blake3 on read and a wrong body
-// under a right key is detected — but it is spend). `base/` is EXCLUDED on
-// purpose: only the control plane reads/writes base pointers, via its R2
-// binding, and handing computers write access to `base/` would let one tenant
-// repoint the fleet's shared base image.
+// The opaque ACCOUNT root is the tenancy boundary. Chunks and manifests remain
+// shared by that owner's computers (forks therefore retain content-addressed
+// deduplication), but no credential can list, read, overwrite, or DELETE another
+// account's objects. Giving every tenant the old fleet-global `chunks/` and
+// `manifests/` prefixes was not a residual risk: object-read-write includes
+// ListObjects and DeleteObject, so it was both cross-tenant disclosure and
+// fleet-wide data-loss authority.
 //
-// The FALLBACK — static `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` Worker
-// secrets injected as-is — exists so a deploy is not hostage to the temp-cred
-// API being reachable, but it is a bucket-wide key in every computer's
-// environment and this module says so on every use. Configure the parent-token
-// pair instead.
+// A static `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` fallback is accepted only
+// when `ALLOW_STATIC_R2_CREDENTIALS=1`, for a private local MinIO-style
+// environment. Hosted deployments must mint scoped credentials; quietly
+// injecting a bucket-wide key into a tenant process is never a safe fallback.
 
 /** Permission granted to a minted credential: object CRUD within the scoped
  *  prefixes, no bucket administration. One of the API's four enum values. */
 export const R2_TEMP_PERMISSION = 'object-read-write';
 
-/** The API's own ceiling for `ttlSeconds` (OpenAPI `maximum: 604800` — 7 days),
- *  and our default: mint the longest-lived credential the platform allows,
- *  because the credential's lifetime bounds the SESSION's, not the attacker's
- *  (scope does that). A container generation that outlives its credential —
- *  seven days AWAKE/WARM without a cold materialize — starts failing store
- *  writes (snapshots, journal segments) until its next cold wake re-mints;
- *  decisions.md documents that window. */
+/** The API's own ceiling for `ttlSeconds` (OpenAPI `maximum: 604800` — 7 days). */
 export const R2_TEMP_TTL_MAX_SECONDS = 604_800;
+
+/** Hosted default: one day. ComputerDO rotates a generation before this
+ * expires, so credentials do not remain valid for Cloudflare's maximum window
+ * and an active computer never silently loses durable writes on day seven. */
+export const R2_TEMP_TTL_DEFAULT_SECONDS = 86_400;
 
 /** Floor for a configured TTL: the API's documented default. A credential
  *  shorter than a plausible session is worse than the risk it mitigates. */
@@ -84,6 +79,8 @@ export interface StoreCredentialEnv {
   R2_SECRET_ACCESS_KEY?: string;
   /** Optional explicit S3 endpoint (dev/MinIO); defaults from CF_ACCOUNT_ID. */
   R2_ENDPOINT?: string;
+  /** Development-only opt-in for the bucket-wide static pair. */
+  ALLOW_STATIC_R2_CREDENTIALS?: string;
 }
 
 /** A store credential could not be composed. Thrown from the materialize path,
@@ -104,6 +101,37 @@ export function parseS3StoreUri(uri: string): { bucket: string; root: string } |
     throw new StoreCredentialError(`s3 store URI has no bucket: ${JSON.stringify(uri)}`);
   }
   return { bucket, root };
+}
+
+/** Opaque, deterministic account namespace. Hashing avoids putting an auth
+ * subject (email/provider id/slashes) into an object key or log. */
+export async function tenantStoreRoot(ownerId: string, root = ''): Promise<string> {
+  if (ownerId === '') throw new StoreCredentialError('owner id is required for an S3 store');
+  const digest = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ownerId)),
+  );
+  const opaque = [...digest].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const tenant = `tenants/${opaque}`;
+  return root === '' ? tenant : `${root.replace(/\/+$/, '')}/${tenant}`;
+}
+
+/** Recover the operator-authored root that contains a tenant namespace.
+ * Returns `null` for anything that is not exactly the output shape of
+ * `tenantStoreRoot`; callers must not turn an arbitrary string into a
+ * fleet-global read. */
+export function tenantStoreParentRoot(tenantRoot: string): string | null {
+  const normalized = tenantRoot.replace(/^\/+|\/+$/g, '');
+  const match = /^(?:(.*)\/)?tenants\/[0-9a-f]{64}$/.exec(normalized);
+  if (!match) return null;
+  return match[1] ?? '';
+}
+
+/** Rewrite `s3://bucket[/root]` so a supervisor sees only its account's
+ * namespace. Non-S3 development stores are unchanged. */
+export async function tenantStoreUri(uri: string, ownerId: string): Promise<string> {
+  const parsed = parseS3StoreUri(uri);
+  if (parsed === null) return uri;
+  return `s3://${parsed.bucket}/${await tenantStoreRoot(ownerId, parsed.root)}`;
 }
 
 /** Mirror of mari-core's `check_computer_id`: the id becomes a store-key
@@ -139,11 +167,18 @@ export function storeCredentialPrefixes(computer: string, root = ''): string[] {
   return [
     `chunks/`,
     `manifests/`,
-    `heat/${computer}.cbor`,
     `journal/${computer}/`,
     `runs/${computer}/`,
     `state/${computer}/`,
   ].map(withRoot);
+}
+
+/** Exact objects in a computer's credential scope. Cloudflare's API has an
+ * `objects` field precisely for this; passing the heat key as a prefix also
+ * authorized ids beginning with the same string. */
+export function storeCredentialObjects(computer: string, root = ''): string[] {
+  checkComputerId(computer);
+  return [root === '' ? `heat/${computer}.cbor` : `${root}/heat/${computer}.cbor`];
 }
 
 /** What the temp-credential API answers with (unwrapped `result`). */
@@ -159,7 +194,7 @@ const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
  *  DOM signature. */
 export type FetchLike = (
   input: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 /**
@@ -176,6 +211,7 @@ export async function mintTempCredentials(
     parentAccessKeyId: string;
     bucket: string;
     prefixes: string[];
+    objects: string[];
     ttlSeconds: number;
   },
   fetchImpl: FetchLike,
@@ -193,6 +229,7 @@ export async function mintTempCredentials(
       permission: R2_TEMP_PERMISSION,
       ttlSeconds: opts.ttlSeconds,
       prefixes: opts.prefixes,
+      objects: opts.objects,
     }),
   });
   const text = await res.text();
@@ -238,7 +275,8 @@ export async function mintTempCredentials(
 /** The configured TTL, clamped to the API's own bounds. */
 export function tempCredentialTtlSeconds(env: StoreCredentialEnv): number {
   const raw = Number(env.R2_TEMP_TTL_SECONDS);
-  const wanted = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : R2_TEMP_TTL_MAX_SECONDS;
+  const wanted =
+    Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : R2_TEMP_TTL_DEFAULT_SECONDS;
   return Math.min(Math.max(wanted, R2_TEMP_TTL_MIN_SECONDS), R2_TEMP_TTL_MAX_SECONDS);
 }
 
@@ -292,17 +330,35 @@ export async function composeStoreEnv(
     env.R2_PARENT_API_TOKEN !== undefined &&
     env.R2_PARENT_API_TOKEN !== '';
   if (canMint) {
-    const minted = await mintTempCredentials(
-      {
-        accountId: env.CF_ACCOUNT_ID as string,
-        apiToken: env.R2_PARENT_API_TOKEN as string,
-        parentAccessKeyId: env.R2_PARENT_ACCESS_KEY_ID as string,
-        bucket: parsed.bucket,
-        prefixes: storeCredentialPrefixes(computer, parsed.root),
-        ttlSeconds: tempCredentialTtlSeconds(env),
-      },
-      fetchImpl,
-    );
+    if (!/(^|\/)tenants\/[0-9a-f]{64}$/.test(parsed.root)) {
+      throw new StoreCredentialError(
+        'refusing to mint an R2 credential outside an opaque per-account tenants/<sha256> root',
+      );
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort('R2 credential mint timed out'), 15_000);
+    let minted: MintedCredentials;
+    try {
+      minted = await mintTempCredentials(
+        {
+          accountId: env.CF_ACCOUNT_ID as string,
+          apiToken: env.R2_PARENT_API_TOKEN as string,
+          parentAccessKeyId: env.R2_PARENT_ACCESS_KEY_ID as string,
+          bucket: parsed.bucket,
+          prefixes: storeCredentialPrefixes(computer, parsed.root),
+          objects: storeCredentialObjects(computer, parsed.root),
+          ttlSeconds: tempCredentialTtlSeconds(env),
+        },
+        (input, init) => fetchImpl(input, { ...init, signal: controller.signal }),
+      );
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new StoreCredentialError('temp-access-credentials timed out after 15000ms');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     return {
       ...base,
       AWS_ACCESS_KEY_ID: minted.accessKeyId,
@@ -316,12 +372,12 @@ export async function composeStoreEnv(
     env.R2_ACCESS_KEY_ID !== '' &&
     env.R2_SECRET_ACCESS_KEY !== undefined &&
     env.R2_SECRET_ACCESS_KEY !== '';
-  if (hasStatic) {
+  if (hasStatic && env.ALLOW_STATIC_R2_CREDENTIALS === '1') {
     // The loud part of the loud fallback: every single materialize says a
     // bucket-wide key just entered a tenant's environment.
     console.warn(
       `mari: STATIC R2 credentials injected for computer=${computer} — this key is ` +
-        'bucket-wide, not scoped to the computer. Configure R2_PARENT_ACCESS_KEY_ID + ' +
+        'bucket-wide, not scoped to the tenant. Configure R2_PARENT_ACCESS_KEY_ID + ' +
         'R2_PARENT_API_TOKEN so per-computer temporary credentials are minted instead ' +
         '(deploy/DEPLOY.md).',
     );
@@ -334,7 +390,7 @@ export async function composeStoreEnv(
 
   throw new StoreCredentialError(
     `STORE_URI is ${JSON.stringify(uri)} but no R2 credentials are configured: set the ` +
-      'R2_PARENT_ACCESS_KEY_ID + R2_PARENT_API_TOKEN secrets (preferred, per-computer ' +
-      'scoped) or R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY (static fallback)',
+      'R2_PARENT_ACCESS_KEY_ID + R2_PARENT_API_TOKEN secrets (scoped); the static pair is ' +
+      'development-only and additionally requires ALLOW_STATIC_R2_CREDENTIALS=1',
   );
 }

@@ -45,6 +45,22 @@ const MAX_STRING_FIELD = 256;
 /** Nesting depth cap; beyond it the value is summarized, never walked. */
 const MAX_DEPTH = 6;
 
+const SECRET_IN_STRING: readonly RegExp[] = [
+  /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  /\b(?:sk-[A-Za-z0-9_-]{12,}|box_[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/gi,
+  /\bAKIA[A-Z0-9]{12,}\b/g,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+  /\b(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi,
+];
+
+function redactString(input: string): string {
+  let out = input;
+  for (const pattern of SECRET_IN_STRING) out = out.replace(pattern, REDACTED);
+  return out.length > MAX_STRING_FIELD
+    ? `${out.slice(0, MAX_STRING_FIELD)}…[+${out.length - MAX_STRING_FIELD}]`
+    : out;
+}
+
 export function shouldRedactKey(key: string): boolean {
   return REDACT_KEY_PATTERNS.some((p) => p.test(key));
 }
@@ -57,9 +73,7 @@ export function shouldRedactKey(key: string): boolean {
 export function redact(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined) return value;
   if (typeof value === 'string') {
-    return value.length > MAX_STRING_FIELD
-      ? `${value.slice(0, MAX_STRING_FIELD)}…[+${value.length - MAX_STRING_FIELD}]`
-      : value;
+    return redactString(value);
   }
   if (typeof value === 'number' || typeof value === 'boolean') return value;
   if (typeof value === 'bigint') return value.toString();
@@ -201,14 +215,10 @@ function matchTemplate(template: string, segments: string[]): boolean {
   return parts.length === segments.length;
 }
 
-/** A path segment that looks like an identifier (32-hex computer/run ids,
- *  UUIDs, or any long opaque token) — collapsed in the fallback sanitizer. */
-const ID_SEGMENT = /^([0-9a-f]{16,}|[0-9a-fA-F-]{32,}|[A-Za-z0-9_-]{24,})$/;
-
 /**
- * The template for a pathname, or a low-cardinality sanitized form for a path
- * no template matches (id-like segments collapsed, length capped). Never
- * returns the raw path of an unknown route.
+ * The template for a pathname, or `/unknown`. Unknown segments can contain
+ * tenant content (including a short secret name), so preserving "safe-looking"
+ * pieces is still a leak and unbounded-cardinality logging.
  */
 export function routeTemplate(pathname: string): string {
   const segments = pathname.split('/').filter((s) => s !== '');
@@ -216,9 +226,7 @@ export function routeTemplate(pathname: string): string {
   for (const t of ROUTE_TEMPLATES) {
     if (matchTemplate(t, segments)) return t;
   }
-  const sanitized = segments.slice(0, 6).map((s) => (ID_SEGMENT.test(s) ? ':id' : s));
-  const suffix = segments.length > 6 ? '/*' : '';
-  return `/${sanitized.join('/')}${suffix}`;
+  return '/unknown';
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +261,10 @@ export interface HealthzEnv {
   STORE: { head(key: string): Promise<unknown> };
   COMPUTER?: { idFromName(name: string): unknown; get(id: never): unknown };
   VERSION?: string;
+  STORE_URI?: string;
+  CF_ACCOUNT_ID?: string;
+  R2_PARENT_ACCESS_KEY_ID?: string;
+  R2_PARENT_API_TOKEN?: string;
 }
 
 export interface HealthzOptions {
@@ -278,7 +290,8 @@ async function bounded<T>(work: Promise<T>, ms: number, label: string): Promise<
  *  not tenant-shaped, but the cap holds either way. */
 function failureDetail(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  return msg.length > 200 ? `${msg.slice(0, 200)}…` : msg;
+  const safe = redactString(msg);
+  return safe.length > 200 ? `${safe.slice(0, 200)}…` : safe;
 }
 
 /**
@@ -330,12 +343,26 @@ export async function healthz(env: HealthzEnv, opts: HealthzOptions = {}): Promi
     detail['do'] = 'no COMPUTER binding (Node entry probes its own substrate elsewhere)';
   }
 
-  const ok = d1 === 'ok' && r2 === 'ok';
+  let storeConfig: 'ok' | 'fail' | 'not_required' = 'not_required';
+  if (env.STORE_URI?.startsWith('s3://')) {
+    const configured =
+      Boolean(env.CF_ACCOUNT_ID) &&
+      Boolean(env.R2_PARENT_ACCESS_KEY_ID) &&
+      Boolean(env.R2_PARENT_API_TOKEN);
+    storeConfig = configured ? 'ok' : 'fail';
+    if (!configured) {
+      detail['storeConfig'] =
+        's3 store requires CF_ACCOUNT_ID, R2_PARENT_ACCESS_KEY_ID, and R2_PARENT_API_TOKEN';
+    }
+  }
+
+  const ok = d1 === 'ok' && r2 === 'ok' && storeConfig !== 'fail';
   const body = {
     ok,
     version: env.VERSION ?? CONTROL_PLANE_VERSION,
     d1,
     r2,
+    storeConfig,
     do: doStatus,
     time: Date.now(),
     ...(Object.keys(detail).length > 0 ? { detail } : {}),

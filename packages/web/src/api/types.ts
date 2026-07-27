@@ -18,7 +18,7 @@ import type { SerializedLayout } from '../wm/serialize';
  *  (decisions.md), independent of billing — a placeholder wired to the shape. */
 export interface CostMeter {
   currency: string;
-  /** Accrued cost in the current window, in `currency` minor units → number. */
+  /** Accrued cost in currency major units (USD dollars), not minor units/cents. */
   accrued: number;
   /** Current burn rate while AWAKE, per hour. Zero when not AWAKE. */
   ratePerHour: number;
@@ -181,7 +181,8 @@ export type IncidentKind =
   | 'final_snapshot_missed'
   | 'destroy_failed'
   | 'wake_abandoned'
-  | 'recovery_exhausted';
+  | 'recovery_exhausted'
+  | 'credential_rotation';
 
 /** One recorded incident, newest first in the listing. */
 export interface IncidentRecord {
@@ -213,9 +214,13 @@ export interface UsageResponse {
 
 /** `GET /api/me/limits` (spec 10.3 surface, landing this phase). */
 export interface LimitsResponse {
-  computeSecondsCap: number;
+  /** Null means explicitly unlimited. */
+  computeSecondsCap: number | null;
   computeSecondsUsed: number;
-  maxComputers: number;
+  /** Null means explicitly unlimited. */
+  maxComputers: number | null;
+  computers: number;
+  period: string;
 }
 
 /**

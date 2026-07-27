@@ -3,6 +3,26 @@
 use marid::Config;
 use tracing::error;
 
+#[cfg(target_os = "linux")]
+fn protect_supervisor_environment() -> std::io::Result<()> {
+    // Run children share the container's uid in v0. Linux gates
+    // /proc/<pid>/environ with ptrace access; making PID 1 non-dumpable denies
+    // same-uid readers that lack CAP_SYS_PTRACE (the hosted container drops it).
+    // Together with RunManager's env_clear this keeps fencing/store/vault values
+    // out of both inherited env and /proc inspection.
+    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn protect_supervisor_environment() -> std::io::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -12,6 +32,11 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if let Err(err) = protect_supervisor_environment() {
+        error!("cannot protect supervisor environment from process inspection: {err}");
+        std::process::exit(1);
+    }
 
     let config = Config::from_args();
     let result = marid::run(config).await;

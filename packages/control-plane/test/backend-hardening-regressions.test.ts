@@ -31,6 +31,7 @@ import {
   composeStoreEnv,
   storeCredentialObjects,
   storeCredentialPrefixes,
+  tenantStoreParentRoot,
   tenantStoreRoot,
   tenantStoreUri,
 } from '../src/r2-credentials';
@@ -185,6 +186,39 @@ describe('namespaced manifest bootstrap', () => {
     );
   });
 
+  it('bootstraps from the configured operator root, not the bucket root', async () => {
+    const operatorRoot = `operator/${unique('base')}`;
+    const tenantRoot = await tenantStoreRoot(unique('rooted-owner'), operatorRoot);
+    const text = new TextEncoder().encode('rooted base\n');
+    const chunk = chunkIdOf(text);
+    const manifest: Manifest = {
+      version: 1,
+      parent: null,
+      created_at: 1_700_000_001,
+      entries: [
+        {
+          path: '/ROOTED.md',
+          kind: 'file',
+          mode: 0o100644,
+          size: text.length,
+          symlink_target: null,
+          chunks: [{ chunk, len: text.length }],
+        },
+      ],
+    };
+    const cbor = encodeCbor(manifest);
+    const id = manifestIdOf(cbor);
+    await env.STORE.put(chunkKey(chunk, operatorRoot), toArrayBuffer(encodeChunkBody(text)));
+    await env.STORE.put(manifestKey(id, operatorRoot), toArrayBuffer(cbor));
+
+    expect(tenantStoreParentRoot(tenantRoot)).toBe(operatorRoot);
+    await ensureManifestNamespace(env.STORE, id, tenantRoot);
+    const copied = await loadManifest(env.STORE, id, tenantRoot);
+    expect(new TextDecoder().decode(await readFile(env.STORE, copied, '/ROOTED.md', tenantRoot))).toBe(
+      'rooted base\n',
+    );
+  });
+
   it('creates one deterministic empty hosted base and can publish it per tenant', async () => {
     const first = await ensureEmptyBaseManifest(env.STORE);
     const second = await ensureEmptyBaseManifest(env.STORE);
@@ -195,6 +229,16 @@ describe('namespaced manifest bootstrap', () => {
     const root = await tenantStoreRoot(unique('empty-owner'));
     await ensureManifestNamespace(env.STORE, first, root);
     expect((await loadManifest(env.STORE, first, root)).entries).toEqual([]);
+  });
+
+  it('creates the deterministic empty base inside a configured operator root', async () => {
+    const operatorRoot = `operator/${unique('empty')}`;
+    const id = await ensureEmptyBaseManifest(env.STORE, operatorRoot);
+    expect((await loadManifest(env.STORE, id, operatorRoot)).entries).toEqual([]);
+
+    const tenantRoot = await tenantStoreRoot(unique('rooted-empty-owner'), operatorRoot);
+    await ensureManifestNamespace(env.STORE, id, tenantRoot);
+    expect((await loadManifest(env.STORE, id, tenantRoot)).entries).toEqual([]);
   });
 });
 

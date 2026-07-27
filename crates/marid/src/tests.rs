@@ -200,6 +200,43 @@ async fn real_pty_run_captures_exact_bytes_and_exit_three() {
     assert_eq!(state.journal.snapshot_bytes(), marker.as_bytes());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_environment_does_not_inherit_supervisor_process_variables() {
+    let root = tempfile::tempdir().unwrap();
+    let jdir = tempfile::tempdir().unwrap();
+    let store = fs_store(root.path());
+    let (m, mut rx) = build_manager(
+        root.path(),
+        jdir.path(),
+        store,
+        Duration::from_secs(30),
+        4096,
+    );
+    let run = RunId::new("run-env-isolation");
+    let state = m
+        .start_run(
+            run.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "test -z \"${CARGO_MANIFEST_DIR:-}\" && printf ENV-CLEAN".into(),
+            ],
+            vec![],
+            root.path().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    let msgs = collect_until(
+        &mut rx,
+        |m| matches!(m, SupervisorMessage::RunCompleted { run: r, .. } if *r == run),
+        Duration::from_secs(15),
+    )
+    .await;
+    let (exit, _, _) = run_completed(&msgs, &run).expect("run must complete");
+    assert_eq!(*exit, ExitStatus::Exited { code: 0 });
+    assert_eq!(state.journal.snapshot_bytes(), b"ENV-CLEAN");
+}
+
 // ---------------------------------------------------------------------------
 // 2. Snapshot/diff/restore: the run's changes are exactly the diff, and the
 //    pre-run manifest restores byte-identically.
@@ -864,11 +901,10 @@ async fn huge_argv_never_reaches_logs_and_spawn_failure_fails_only_that_run() {
     // (Exited 127). Either way the contract holds: a terminal, non-success
     // completion for THIS run, and a daemon that keeps serving.
     assert!(
-        cp.wait_until(Duration::from_secs(10), |s| s
-            .run_completed
-            .iter()
-            .any(|(r, exit, ..)| *r == run && *exit != ExitStatus::Exited { code: 0 }))
-            .await,
+        cp.wait_until(Duration::from_secs(10), |s| s.run_completed.iter().any(
+            |(r, exit, ..)| *r == run && *exit != ExitStatus::Exited { code: 0 }
+        ))
+        .await,
         "an unspawnable run must complete with a failure status"
     );
 
@@ -942,11 +978,10 @@ async fn missing_binary_fails_run_with_completion_and_daemon_survives() {
         cwd: root.path().to_str().unwrap().to_string(),
     });
     assert!(
-        cp.wait_until(Duration::from_secs(10), |s| s
-            .run_completed
-            .iter()
-            .any(|(r, exit, ..)| *r == run && *exit == ExitStatus::Exited { code: 127 }))
-            .await,
+        cp.wait_until(Duration::from_secs(10), |s| s.run_completed.iter().any(
+            |(r, exit, ..)| *r == run && *exit == ExitStatus::Exited { code: 127 }
+        ))
+        .await,
         "a missing binary must fail the run with exit 127, not the daemon"
     );
 

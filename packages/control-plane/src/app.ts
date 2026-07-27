@@ -20,6 +20,8 @@ import {
   NotAFile,
   FileTooLarge,
   ChunkReadError,
+  ensureEmptyBaseManifest,
+  ensureManifestNamespace,
 } from './manifest-store';
 import { changedCount, diffManifestIds, type ManifestDiff } from './diff';
 import { costMeter } from './pricing';
@@ -32,6 +34,7 @@ import {
 } from './runs';
 import {
   insertComputer,
+  insertComputerWithinLimit,
   getOwnedComputer,
   listComputers,
   renameComputer,
@@ -49,7 +52,8 @@ import {
   previewUrlFor,
   previewUserLabel,
 } from './preview';
-import { canCreateComputer, canWake, limitsSummary } from './limits';
+import { canCreateComputer, canWake, limitsSummary, planLimits } from './limits';
+import { parseS3StoreUri, tenantStoreRoot } from './r2-credentials';
 
 function newComputerId(): string {
   return crypto.randomUUID().replace(/-/g, '');
@@ -64,6 +68,43 @@ function stubFor(env: Env, id: string) {
   return env.COMPUTER.get(env.COMPUTER.idFromName(id));
 }
 
+/** Object-key root for this account. Local `fs://`/test stores keep the legacy
+ * root; every hosted S3/R2 read is constrained to the same opaque namespace as
+ * the supervisor's temporary credential. */
+async function accountStoreRoot(env: Env, userId: string): Promise<string> {
+  const parsed = parseS3StoreUri(env.STORE_URI ?? '');
+  return parsed === null ? '' : tenantStoreRoot(userId, parsed.root);
+}
+
+async function deleteObjectPrefix(store: R2Bucket, prefix: string): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const page = await store.list({ prefix, cursor, limit: 1000 });
+    const keys = page.objects.map((object) => object.key);
+    if (keys.length > 0) await store.delete(keys);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}
+
+/** Remove mutable, computer-specific store records. Account-shared manifests
+ * and chunks are deliberately retained because another fork may reference them;
+ * a later account-level GC can reclaim content proven unreachable. */
+async function deleteComputerStoreData(
+  store: R2Bucket,
+  roots: readonly string[],
+  computerId: string,
+): Promise<void> {
+  for (const candidate of new Set(roots)) {
+    const key = (suffix: string) => (candidate === '' ? suffix : `${candidate}/${suffix}`);
+    await Promise.all([
+      deleteObjectPrefix(store, key(`journal/${computerId}/`)),
+      deleteObjectPrefix(store, key(`runs/${computerId}/`)),
+      deleteObjectPrefix(store, key(`state/${computerId}/`)),
+      store.delete(key(`heat/${computerId}.cbor`)),
+    ]);
+  }
+}
+
 /**
  * Changed-files count for the fleet card (spec 8.2): the diff of the current
  * head against the previous head, computed from the two manifests alone. A
@@ -75,13 +116,14 @@ async function changedFilesCount(
   cache: Map<string, number>,
   prev: string | null,
   head: string | null,
+  root = '',
 ): Promise<number> {
   if (!prev || !head || prev === head) return 0;
   const key = `${prev}->${head}`;
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
   try {
-    const n = changedCount((await diffManifestIds(store, prev, head)).summary);
+    const n = changedCount((await diffManifestIds(store, prev, head, root)).summary);
     cache.set(key, n);
     return n;
   } catch {
@@ -115,7 +157,13 @@ async function computerDetail(env: Env, row: ComputerRow) {
     attentionCount: snap.attention.length,
     activeRuns: snap.activeRunIds.length,
     activeRunIds: snap.activeRunIds,
-    changedFiles: await changedFilesCount(env.STORE, new Map(), snap.prevHead, head),
+    changedFiles: await changedFilesCount(
+      env.STORE,
+      new Map(),
+      snap.prevHead,
+      head,
+      await accountStoreRoot(env, row.userId),
+    ),
     cost: costMeter(snap.substrate, snap.awakeSeconds, snap.state),
     runs,
   };
@@ -357,6 +405,7 @@ export function createApp(env?: Env): Hono<AppEnv> {
   app.get('/api/fleet', async (c) => {
     const rows = await listComputers(c.env.DB, c.get('user').id);
     const diffCache = new Map<string, number>();
+    const storeRoot = await accountStoreRoot(c.env, c.get('user').id);
     const computers = await Promise.all(
       rows.map(async (r) => {
         // `describe` is a pure read of the computer's own coordination point: it
@@ -371,7 +420,13 @@ export function createApp(env?: Env): Hono<AppEnv> {
           activeRuns: snap.activeRunIds.length,
           activeRunIds: snap.activeRunIds,
           attention: snap.attention.length,
-          changedFiles: await changedFilesCount(c.env.STORE, diffCache, snap.prevHead, head),
+          changedFiles: await changedFilesCount(
+            c.env.STORE,
+            diffCache,
+            snap.prevHead,
+            head,
+            storeRoot,
+          ),
           cost: costMeter(snap.substrate, snap.awakeSeconds, snap.state),
           manifestHead: head,
           // Last state/head change; a computer that never moved shows when it
@@ -430,8 +485,33 @@ export function createApp(env?: Env): Hono<AppEnv> {
     // snapshotted it, so a first-run user's very first computer looked broken.
     // The head is a manifest ID only — spec 9.1's "a fork transfers no bulk
     // data" applies here for the same reason: shared chunks, no copy.
-    const head = c.env.BASE_MANIFEST ?? null;
-    const row = await insertComputer(c.env.DB, { id, name, userId: c.get('user').id, head });
+    const parsedStore = parseS3StoreUri(c.env.STORE_URI ?? '');
+    const head =
+      c.env.BASE_MANIFEST ??
+      (parsedStore === null
+        ? null
+        : await ensureEmptyBaseManifest(c.env.STORE, parsedStore.root));
+    if (head) {
+      const root = await accountStoreRoot(c.env, c.get('user').id);
+      if (root) await ensureManifestNamespace(c.env.STORE, head, root);
+    }
+    const createInput = { id, name, userId: c.get('user').id, head };
+    const cap = planLimits(c.env).maxComputers;
+    const row =
+      cap === null
+        ? await insertComputer(c.env.DB, createInput)
+        : await insertComputerWithinLimit(c.env.DB, createInput, cap);
+    if (!row) {
+      const current = await limitsSummary(c.env.DB, c.env, c.get('user').id);
+      return c.json(
+        {
+          error: 'limit_computers',
+          computers: current.computers,
+          maxComputers: current.maxComputers,
+        },
+        403,
+      );
+    }
     await stubFor(c.env, id).initFromManifest(id, head);
     return c.json({ id: row.id, name: row.name, state: row.state, head: row.head }, 201);
   });
@@ -452,7 +532,26 @@ export function createApp(env?: Env): Hono<AppEnv> {
   });
 
   app.delete('/api/computers/:id', async (c) => {
-    const ok = await deleteComputer(c.env.DB, c.req.param('id'), c.get('user').id);
+    const id = c.req.param('id');
+    const row = await getOwnedComputer(c.env.DB, id, c.get('user').id);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    const teardown = await stubFor(c.env, id).deletePermanently(id);
+    if (!teardown.ok) {
+      return c.json({ error: teardown.error, retryable: true }, 503);
+    }
+    try {
+      const parsedStore = parseS3StoreUri(c.env.STORE_URI ?? '');
+      await deleteComputerStoreData(
+        c.env.STORE,
+        [parsedStore?.root ?? '', await accountStoreRoot(c.env, row.userId)],
+        id,
+      );
+    } catch {
+      // Keep the owned D1 row so this id remains retryable and does not free a
+      // quota slot while secret-bearing mutable objects still exist.
+      return c.json({ error: 'store_delete_failed', retryable: true }, 503);
+    }
+    const ok = await deleteComputer(c.env.DB, id, c.get('user').id);
     if (!ok) return c.json({ error: 'not_found' }, 404);
     return c.json({ ok: true });
   });
@@ -571,18 +670,38 @@ export function createApp(env?: Env): Hono<AppEnv> {
 
     // Source head is authoritative in the DO (may be ahead of the D1 mirror).
     const srcHead = (await stubFor(c.env, src.id).describe(src.id)).head ?? src.head;
+    if (srcHead) {
+      const root = await accountStoreRoot(c.env, src.userId);
+      if (root) await ensureManifestNamespace(c.env.STORE, srcHead, root);
+    }
 
     const id = newComputerId();
     const name = (body.name ?? `${src.name} (fork)`).toString().slice(0, 200);
-    const row = await insertComputer(c.env.DB, {
+    const forkInput = {
       id,
       name,
       userId: c.get('user').id,
       parentComputer: src.id,
       head: srcHead,
-      state: 'cold',
+      state: 'cold' as const,
       excludeGlobs: src.excludeGlobs,
-    });
+    };
+    const cap = planLimits(c.env).maxComputers;
+    const row =
+      cap === null
+        ? await insertComputer(c.env.DB, forkInput)
+        : await insertComputerWithinLimit(c.env.DB, forkInput, cap);
+    if (!row) {
+      const current = await limitsSummary(c.env.DB, c.env, c.get('user').id);
+      return c.json(
+        {
+          error: 'limit_computers',
+          computers: current.computers,
+          maxComputers: current.maxComputers,
+        },
+        403,
+      );
+    }
     await insertLineage(c.env.DB, id, src.id);
     // Seed the fork's DO head; NO chunk copy (spec 9.1 transfers no bulk data).
     await stubFor(c.env, id).initFromManifest(id, srcHead);
@@ -649,11 +768,13 @@ export function createApp(env?: Env): Hono<AppEnv> {
     const name = c.req.param('name');
     // The name becomes an environment variable in the supervisor's process
     // (spec 10.1, see ComputerDO#maridEnv), so it must BE one — and it must not be
-    // able to shadow marid's own configuration, which carries the fencing token.
+    // able to shadow marid's own configuration or its scoped store credential.
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) {
       return c.json({ error: 'bad_name', name }, 400);
     }
-    if (name.startsWith('MARI_')) return c.json({ error: 'reserved_name', name }, 400);
+    if (name.startsWith('MARI_') || name.startsWith('AWS_')) {
+      return c.json({ error: 'reserved_name', name }, 400);
+    }
     await setSecret(c.env.DB, row.id, name, body.value);
     // The value is never echoed back, not even the one just written.
     return c.json({ ok: true, name });
@@ -870,7 +991,12 @@ export function createApp(env?: Env): Hono<AppEnv> {
       );
     }
     try {
-      const diff = await diffManifestIds(c.env.STORE, base, head);
+      const diff = await diffManifestIds(
+        c.env.STORE,
+        base,
+        head,
+        await accountStoreRoot(c.env, row.userId),
+      );
       const entries = toDiffEntries(diff);
       return c.json({
         runId,
@@ -940,6 +1066,7 @@ export function createApp(env?: Env): Hono<AppEnv> {
       }
     }
     const path = normalizePath(rel);
+    const storeRoot = await accountStoreRoot(c.env, row.userId);
 
     // A computer with no manifest at all — created before a base image existed,
     // or one whose first snapshot has not happened yet — has an EMPTY filesystem,
@@ -954,10 +1081,10 @@ export function createApp(env?: Env): Hono<AppEnv> {
     }
 
     try {
-      const manifest = await loadManifest(c.env.STORE, head);
+      const manifest = await loadManifest(c.env.STORE, head, storeRoot);
       const entry = findEntry(manifest, path);
       if (entry && entry.kind === 'file') {
-        const bytes = await readFile(c.env.STORE, manifest, path);
+        const bytes = await readFile(c.env.STORE, manifest, path, storeRoot);
         return new Response(toArrayBuffer(bytes), {
           status: 200,
           headers: {
@@ -1004,12 +1131,13 @@ export function createApp(env?: Env): Hono<AppEnv> {
     if (!head) return c.json({ error: 'no_manifest' }, 404);
 
     const path = normalizePath(new URL(c.req.url).searchParams.get('path') ?? '');
+    const storeRoot = await accountStoreRoot(c.env, row.userId);
     try {
-      const manifest = await loadManifest(c.env.STORE, head);
+      const manifest = await loadManifest(c.env.STORE, head, storeRoot);
       const entry = findEntry(manifest, path);
       if (!entry) return c.json({ error: 'not_found', path }, 404);
       if (entry.kind !== 'file') return c.json({ error: 'not_a_file', path }, 400);
-      const bytes = await readFile(c.env.STORE, manifest, path);
+      const bytes = await readFile(c.env.STORE, manifest, path, storeRoot);
       return new Response(toArrayBuffer(bytes), {
         status: 200,
         headers: {

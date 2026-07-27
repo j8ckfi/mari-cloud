@@ -58,6 +58,11 @@ const COPY: Record<IncidentKind, IncidentCopy> = {
     body: 'Mari tried to recover this computer several times without a supervisor ever connecting. It has been left in deep sleep at its last snapshot, with queued work preserved — nothing was discarded.',
     action: 'Check that the substrate is healthy, then start a run to try again.',
   },
+  credential_rotation: {
+    title: 'The computer renewed its storage access',
+    body: 'Mari cleanly snapshotted and stopped this generation before its scoped storage credential expired. The computer is in deep sleep at that snapshot; no work was discarded.',
+    action: 'Start a run or open a terminal when you want to wake it with a fresh credential.',
+  },
 };
 
 const FALLBACK: IncidentCopy = {

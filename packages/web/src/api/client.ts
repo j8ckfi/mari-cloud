@@ -38,6 +38,8 @@ export class ApiError extends Error {
     message: string,
     readonly status: number,
     readonly url: string,
+    /** Parsed server refusal body (quota codes/numbers, never assumed present). */
+    readonly details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = 'ApiError';
@@ -74,7 +76,9 @@ function noteAuth<T extends { status: number }>(res: T): T {
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${API_BASE}${path}`;
   const res = noteAuth(await fetch(url, { signal, headers: { accept: 'application/json' } }));
-  if (!res.ok) throw new ApiError(`GET ${path} → ${res.status}`, res.status, url);
+  if (!res.ok) {
+    throw new ApiError(`GET ${path} → ${res.status}`, res.status, url, await errorDetails(res));
+  }
   return (await res.json()) as T;
 }
 
@@ -90,8 +94,21 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
   );
-  if (!res.ok) throw new ApiError(`POST ${path} → ${res.status}`, res.status, url);
+  if (!res.ok) {
+    throw new ApiError(`POST ${path} → ${res.status}`, res.status, url, await errorDetails(res));
+  }
   return (await res.json()) as T;
+}
+
+async function errorDetails(res: Response): Promise<Record<string, unknown>> {
+  try {
+    const value = (await res.json()) as unknown;
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 /** URL-safe computer segment. */
@@ -419,13 +436,23 @@ export async function fetchUsage(id: string, signal?: AbortSignal): Promise<Usag
 export async function fetchLimits(signal?: AbortSignal): Promise<LimitsResponse | null> {
   try {
     const res = await getJson<Partial<LimitsResponse>>('/me/limits', signal);
-    if (typeof res.computeSecondsCap !== 'number' || typeof res.computeSecondsUsed !== 'number') {
+    const capOk = res.computeSecondsCap === null || typeof res.computeSecondsCap === 'number';
+    const maxOk = res.maxComputers === null || typeof res.maxComputers === 'number';
+    if (
+      !capOk ||
+      !maxOk ||
+      typeof res.computeSecondsUsed !== 'number' ||
+      typeof res.computers !== 'number' ||
+      typeof res.period !== 'string'
+    ) {
       return null;
     }
     return {
-      computeSecondsCap: res.computeSecondsCap,
+      computeSecondsCap: res.computeSecondsCap as number | null,
       computeSecondsUsed: res.computeSecondsUsed,
-      maxComputers: typeof res.maxComputers === 'number' ? res.maxComputers : 0,
+      maxComputers: res.maxComputers as number | null,
+      computers: res.computers,
+      period: res.period,
     };
   } catch (err) {
     if (err instanceof ApiError && err.status === 404) return null;

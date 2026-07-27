@@ -3,9 +3,9 @@
 // instance sets defaults. A private instance sets its own."
 //
 // This module is the ONE implementation of the policy: plan resolution from the
-// environment, the D1 usage ledger, and the check functions the routes (and the
-// Durable Object, once the lead wires docs/limits-hooks.md) call. app.ts wires
-// the refusals; nothing here talks to a substrate or a Durable Object, so a
+// environment, the D1 usage ledger, and the check functions the routes and the
+// Durable Object call. app.ts wires the refusals and ComputerDO records closed
+// AWAKE intervals; nothing here talks to a substrate or a Durable Object, so a
 // refused request costs no substrate call — the same property the wake-proxy
 // authorization relies on (decisions.md SEC-03: refuse BEFORE the DO is
 // addressed).
@@ -97,6 +97,26 @@ export function currentPeriod(now: number = Date.now()): string {
   return `${y}-${m}`;
 }
 
+/** Split a half-open UTC interval across calendar months so usage is charged to
+ * the month in which it actually occurred, not whichever month happened to
+ * contain the exit transition. */
+export function splitUsagePeriods(
+  startedAt: number,
+  endedAt: number,
+): { period: string; ms: number }[] {
+  let cursor = Math.max(0, Math.floor(startedAt));
+  const end = Math.max(cursor, Math.floor(endedAt));
+  const slices: { period: string; ms: number }[] = [];
+  while (cursor < end) {
+    const d = new Date(cursor);
+    const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+    const sliceEnd = Math.min(end, next);
+    slices.push({ period: currentPeriod(cursor), ms: sliceEnd - cursor });
+    cursor = sliceEnd;
+  }
+  return slices;
+}
+
 /**
  * The usage-ledger DDL. It lives HERE and in `migrations/0002_limits.sql`
  * (test/limits.test.ts pins the two together, the same discipline
@@ -154,6 +174,30 @@ export async function accumulateUsage(
     )
     .bind(userId, currentPeriod(now), awakeMs, boxMs, now)
     .run();
+}
+
+/** Add a closed AWAKE interval to the exact UTC month(s) it spans. */
+export async function accumulateAwakeInterval(
+  db: D1Database,
+  userId: string,
+  startedAt: number,
+  endedAt: number,
+): Promise<void> {
+  const slices = splitUsagePeriods(startedAt, endedAt);
+  if (slices.length === 0) return;
+  await ensureLimitsSchema(db);
+  for (const slice of slices) {
+    await db
+      .prepare(
+        `INSERT INTO usage_period (userId, period, awakeMs, boxMs, updatedAt)
+         VALUES (?, ?, ?, 0, ?)
+         ON CONFLICT(userId, period) DO UPDATE SET
+           awakeMs = awakeMs + excluded.awakeMs,
+           updatedAt = excluded.updatedAt`,
+      )
+      .bind(userId, slice.period, slice.ms, endedAt)
+      .run();
+  }
 }
 
 /** The user's accumulated usage for one period (default: the current one). */

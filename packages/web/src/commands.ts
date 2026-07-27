@@ -91,6 +91,13 @@ export function coreCommands(): Command[] {
       keywords: ['run', 'list', 'jobs', 'tasks'],
       run: () => s().addPane({ kind: 'runs' }),
     },
+    {
+      id: 'pane.new.vault',
+      title: 'Open credential vault',
+      group: 'Pane',
+      keywords: ['secret', 'api key', 'credentials', 'anthropic', 'openai'],
+      run: () => s().addPane({ kind: 'vault' }),
+    },
 
     // ---- Runs (spec 5) ----
     {

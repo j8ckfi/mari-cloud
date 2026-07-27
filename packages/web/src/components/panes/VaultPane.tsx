@@ -115,7 +115,15 @@ export function VaultPane({ computer }: { computer: string }) {
       </p>
 
       <div className="vault-list" data-testid="vault-list">
-        {names.length === 0 && (
+        {secretsQ.isError && (
+          <div className="empty-note" role="alert" data-testid="vault-error-state">
+            Could not read secret names. Stored values remain write-only and unchanged.
+            <button type="button" onClick={() => void secretsQ.refetch()}>
+              Retry
+            </button>
+          </div>
+        )}
+        {!secretsQ.isError && names.length === 0 && (
           <div className="hint" data-testid="vault-empty">
             No secrets yet.
           </div>

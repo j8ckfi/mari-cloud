@@ -153,7 +153,7 @@ beforeAll(async () => {
   }
   if (!(await imageExists(BASE_IMAGE))) {
     const build = await docker(
-      ['build', '-f', 'deploy/Dockerfile.marid', '-t', BASE_IMAGE, REPO_ROOT],
+      ['build', '-f', `${REPO_ROOT}/deploy/Dockerfile.marid`, '-t', BASE_IMAGE, REPO_ROOT],
       1_800_000,
     );
     if (build.code !== 0) {

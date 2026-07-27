@@ -160,8 +160,10 @@ Each one keeps the spec-pure path behind an interface; see *v0 deviations* in
 - **The grid at a past time of a run** (spec 7.6). The journal is complete and
   the control plane replays it to an attaching client, but there is no
   time-travel view over it.
-- **CPU-hour and egress limits** (spec 10.3). Nothing enforces a cap. A run that
-  spins for a week on your own Docker daemon will do exactly that.
+- **Egress limits** (spec 10.3). Hosted v0.1 enforces an atomic computer-count
+  cap and a monthly AWAKE compute-hour cap on explicit wakes, runs, writes,
+  uploads, and preview wakes. It cannot yet attribute provider egress to an
+  account, so it does not pretend to enforce an egress ceiling.
 - **Client-side encryption of chunks with per-user keys** (spec 10.4). The spec
   calls it an option; it is not implemented, so a hosted instance can read a
   user's computer.

@@ -40,7 +40,7 @@ export const eventsStore = useEventsStore;
  * overrides — notably `factory` — let a test drive the stream without a server.
  */
 export function connectEvents(overrides: Partial<EventStreamOptions> = {}): () => void {
-  const { onEvent: after, ...rest } = overrides;
+  const { onEvent: after, onOpen: afterOpen, onDisconnect: afterDisconnect, ...rest } = overrides;
   const stream = new EventStream({
     ...rest,
     onEvent: (event) => {
@@ -49,7 +49,11 @@ export function connectEvents(overrides: Partial<EventStreamOptions> = {}): () =
     },
     onOpen: () => {
       useEventsStore.getState().setConnected(true);
-      overrides.onOpen?.();
+      afterOpen?.();
+    },
+    onDisconnect: () => {
+      useEventsStore.getState().setConnected(false);
+      afterDisconnect?.();
     },
   });
   stream.connect();
